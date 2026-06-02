@@ -214,8 +214,8 @@ class VideoProcessor:
 
         cmd.extend([
             "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "19",
+            "-preset", "veryslow",
+            "-crf", "26",
             "-pix_fmt", "yuv420p",
             "-x264-params", X264_PARAMS,
             "-an",  # 无音频
@@ -290,7 +290,7 @@ class VideoProcessor:
         filter_str = ",".join(filters)
 
         return (f'ffmpeg -i "{input_path}" -vf "{filter_str}" '
-                f'-c:v libx264 -preset medium -crf 19 -pix_fmt yuv420p '
+                f'-c:v libx264 -preset veryslow -crf 26 -pix_fmt yuv420p '
                 f'-x264-params "{X264_PARAMS}" '
                 f'-an "{output_path}"')
 
