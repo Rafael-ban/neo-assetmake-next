@@ -14,6 +14,18 @@ from utils.file_utils import get_app_dir
 
 logger = logging.getLogger(__name__)
 
+X264_PARAMS = (
+    "partitions=all"
+    ":rc-lookahead=90"
+    ":bframes=12:b-adapt=2"
+    ":me=umh:subme=9:merange=48"
+    ":no-fast-pskip=1:direct=auto:weightb=1"
+    ":keyint=300:min-keyint=5:ref=3"
+    ":chroma-qp-offset=-3"
+    ":aq-mode=3:aq-strength=0.7:trellis=2"
+    ":deblock=0,0:psy-rd=0.5,0.12"
+)
+
 
 def find_ffmpeg() -> str:
     """查找安装目录中的ffmpeg（仅限应用自带，避免多版本冲突）"""
@@ -201,15 +213,11 @@ class VideoProcessor:
             cmd.extend(["-vf", ",".join(filters)])
 
         cmd.extend([
-            "-c:v", "h264_nvenc",
-            "-preset", "p7",
-            "-qp", "26",
-            "-rc", "constqp",
-            "-spatial-aq", "1",
-            "-temporal-aq", "1",
-            "-g", "320",
-            "-bf", "4",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "19",
             "-pix_fmt", "yuv420p",
+            "-x264-params", X264_PARAMS,
             "-an",  # 无音频
             output_path
         ])
@@ -282,7 +290,8 @@ class VideoProcessor:
         filter_str = ",".join(filters)
 
         return (f'ffmpeg -i "{input_path}" -vf "{filter_str}" '
-                f'-c:v h264_nvenc -preset p7 -qp 26 -rc constqp -spatial-aq 1 -temporal-aq 1 -g 320 -bf 4  -refs 4 -pix_fmt yuv420p '
+                f'-c:v libx264 -preset medium -crf 19 -pix_fmt yuv420p '
+                f'-x264-params "{X264_PARAMS}" '
                 f'-an "{output_path}"')
 
     def get_resolution_info(self, resolution: str) -> Dict[str, Any]:
