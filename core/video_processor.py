@@ -16,14 +16,14 @@ logger = logging.getLogger(__name__)
 
 X264_PARAMS = (
     "partitions=all"
-    ":rc-lookahead=90"
-    ":bframes=12:b-adapt=2"
+    ":rc-lookahead=150"
+    ":bframes=16:b-adapt=2"
     ":me=umh:subme=9:merange=48"
-    ":no-fast-pskip=1:direct=auto:weightb=1"
-    ":keyint=300:min-keyint=5:ref=3"
+    ":no-fast-pskip=1:direct=auto:no-weightb=0"
+    ":keyint=300:min-keyint=5:ref=16"
     ":chroma-qp-offset=-3"
-    ":aq-mode=3:aq-strength=0.7:trellis=2"
-    ":deblock=0,0:psy-rd=0.5,0.12"
+    ":aq-mode=1:aq-strength=0.6:trellis=2"
+    ":deblock=1,1:psy-rd=0.4,0"
 )
 
 

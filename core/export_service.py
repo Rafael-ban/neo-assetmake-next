@@ -393,7 +393,6 @@ class ExportWorker(QThread):
             "-preset", preset,
             "-crf", str(crf_value),
             "-profile:v", "high",
-            "-level", "4.0",
             "-pix_fmt", "yuv420p",
             "-x264-params", X264_PARAMS,
             "-an",
