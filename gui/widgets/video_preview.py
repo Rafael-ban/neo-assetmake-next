@@ -416,7 +416,7 @@ class VideoPreviewWidget(QWidget):
 
         info = VideoProcessor(self._media_toolchain.mpv_path).get_video_info(path)
         if info is None:
-            self.video_label.setText("Unable to load video metadata")
+            self.video_label.setText("无法加载视频元数据")
             return False
 
         self._stop_reader_thread()

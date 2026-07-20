@@ -74,8 +74,9 @@ class MainWindow(QMainWindow):
 
         self._auto_save_service = AutoSaveService()
         self._crash_recovery_service = CrashRecoveryService()
-        self._crash_recovery_service.initialize(
-            os.path.join(self._app_dir, ".recovery"))
+        # Pass the app dir directly; CrashRecoveryService.initialize() appends the single
+        # ".recovery" itself (passing an already-suffixed path produced .recovery\.recovery).
+        self._crash_recovery_service.initialize(self._app_dir)
         # Register every autosave with crash-recovery. AutoSaveService writes backups to
         # <project>/.autosave (or the temp dir) while CrashRecoveryService only scans
         # <app>/.recovery — without this pointer nothing is recoverable after a crash.
@@ -1176,6 +1177,7 @@ class MainWindow(QMainWindow):
         self.video_preview.set_target_resolution(target_w, target_h)
         self.intro_preview.set_target_resolution(target_w, target_h)
 
+        load_failures: list[str] = []
         if self._config.loop.file:
             file_path = self._config.loop.file
             if not os.path.isabs(file_path):
@@ -1187,7 +1189,8 @@ class MainWindow(QMainWindow):
                     self._load_loop_image(file_path)
                 else:
                     logger.info(f"尝试加载循环视频: {file_path}")
-                    self.video_preview.load_video(file_path)
+                    if not self.video_preview.load_video(file_path):
+                        load_failures.append("循环视频")
             else:
                 logger.warning(f"循环素材文件不存在: {file_path}")
 
@@ -1197,7 +1200,15 @@ class MainWindow(QMainWindow):
                 intro_path = os.path.join(self._base_dir, intro_path)
             if os.path.exists(intro_path):
                 logger.info(f"尝试加载入场视频: {intro_path}")
-                self.intro_preview.load_video(intro_path)
+                if not self.intro_preview.load_video(intro_path):
+                    load_failures.append("入场视频")
+
+        if load_failures:
+            QMessageBox.warning(
+                self, "部分素材加载失败",
+                "以下素材无法获取视频元数据（请确认 mpv 与文件可用）：\n"
+                + "、".join(load_failures),
+            )
 
         self._update_title()
         self.status_bar.showMessage(f"已打开: {self._project_path}")
@@ -2626,7 +2637,11 @@ class MainWindow(QMainWindow):
                     self.video_preview.load_static_image_from_file(path)
                 else:
                     logger.info("加载视频文件...")
-                    self.video_preview.load_video(path)
+                    if not self.video_preview.load_video(path):
+                        QMessageBox.warning(
+                            self, "加载失败",
+                            "无法获取视频元数据，请确认 mpv 与文件可用。")
+                        return
 
                 logger.info("将时间轴连接到video_preview")
                 self._connect_timeline_to_preview(self.video_preview)
