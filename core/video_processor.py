@@ -213,16 +213,21 @@ class _MpvMetadataSession:
             self.close()
 
     def _connect_socket(self) -> None:
-        time.sleep(0.2)
-        for _ in range(75):
-            if self.socket is None:
-                self.socket = QLocalSocket()
+        # mpv creates its \\.\pipe\<name> IPC server a short, variable time AFTER the
+        # process starts. On Windows, connecting to a not-yet-existent named pipe fails
+        # synchronously (ServerNotFoundError -> UnconnectedState), so waitForConnected()
+        # returns immediately WITHOUT consuming its timeout. Retry on a real wall-clock
+        # deadline with a sleep between attempts; otherwise every retry burns in
+        # microseconds and the probe fails whenever mpv needs more than the initial delay
+        # to create the pipe (cold start / AV scan / non-ASCII path).
+        self.socket = QLocalSocket()
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline:
             self.socket.connectToServer(self.ipc_server)
             if self.socket.waitForConnected(200):
                 return
             self.socket.abort()
-            self.socket.deleteLater()
-            self.socket = None
+            time.sleep(0.1)
         raise RuntimeError("mpv JSON IPC connection was not established")
 
     def _wait_for_file_loaded(self) -> None:
