@@ -252,6 +252,7 @@ class ExportService(QObject):
         loop_video_params: Optional[VideoExportParams] = None,
         intro_video_params: Optional[VideoExportParams] = None,
         loop_image_path: Optional[str] = None,
+        loop_image_params: Optional[VideoExportParams] = None,
     ) -> None:
         if self.is_exporting:
             self.export_failed.emit("An export task is already running")
@@ -266,7 +267,19 @@ class ExportService(QObject):
         if overlay_mat is not None:
             tasks.append(ExportTask(ExportType.OVERLAY, "overlay.argb", overlay_mat))
 
-        if loop_image_path is not None:
+        if loop_image_params is not None:
+            # Full parameters from the preview: crop box (rotated space),
+            # rotation and duration all reach the encode. The bare-path branch
+            # below used to hardcode cropbox=(0,0,0,0)/end_frame=30, silently
+            # discarding the user's framing for image loops.
+            if not self.media_pipeline_available:
+                self.export_failed.emit(self._missing_media_tools_message())
+                return
+            loop_image_params.resolution = resolution
+            loop_image_params.is_image = True
+            tasks.append(ExportTask(ExportType.LOOP_VIDEO, "loop.mp4", loop_image_params))
+        elif loop_image_path is not None:
+            # Legacy bare-path fallback (API compatibility): full-frame image loop.
             if not self.media_pipeline_available:
                 self.export_failed.emit(self._missing_media_tools_message())
                 return

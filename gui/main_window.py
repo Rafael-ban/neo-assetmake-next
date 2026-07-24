@@ -1431,6 +1431,7 @@ class MainWindow(QMainWindow):
             loop_video_params=export_data.get('loop_video_params'),
             intro_video_params=export_data.get('intro_video_params'),
             loop_image_path=export_data.get('loop_image_path'),
+            loop_image_params=export_data.get('loop_image_params'),
         )
 
         self._export_dialog.exec()
@@ -3752,8 +3753,28 @@ class MainWindow(QMainWindow):
             loop_image_path = getattr(self, '_loop_image_path', "") or \
                 self._resolve_media_path(self._config.loop.file)
             if loop_image_path and os.path.exists(loop_image_path):
-                data['loop_image_path'] = loop_image_path
                 data['is_loop_image'] = True
+                # 带上预览的裁剪框(旋转后空间)/旋转/时长——旧路径只传裸路径,
+                # 导出服务硬编码 cropbox=(0,0,0,0),图片循环的取景被静默丢弃。
+                loop_state = self._collect_preview_media_state(
+                    self.video_preview,
+                    self._config.loop.file,
+                    default_to_full=True,
+                    is_image=True,
+                )
+                if loop_state:
+                    data['loop_image_params'] = VideoExportParams(
+                        video_path=loop_state['path'],
+                        cropbox=loop_state['cropbox'],
+                        start_frame=loop_state['start_frame'],
+                        end_frame=loop_state['end_frame'],
+                        fps=loop_state['fps'],
+                        resolution=self._config.screen.value,
+                        is_image=True,
+                        rotation=loop_state['rotation'],
+                    )
+                else:
+                    data['loop_image_path'] = loop_image_path
             else:
                 # The loop asset is required. Fail loudly (caught by _on_export's
                 # try/except -> show_error + return) instead of silently dropping it and

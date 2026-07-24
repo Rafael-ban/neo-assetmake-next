@@ -46,6 +46,23 @@ class MediaToolchainTests(unittest.TestCase):
         self.assertEqual(x264[-1], "-")
         self.assertNotIn("ffmpeg", " ".join(vspipe + x264).lower())
 
+    def test_x264_signals_smpte170m_colour_in_vui(self):
+        # x264-7mod defaults are --colorprim/--transfer/--colormatrix "undef" and
+        # --range "auto" (x264-7mod --fullhelp); an untagged sub-HD stream is
+        # decoded as BT.601 by convention (H.273), so the pipeline must tag what
+        # it actually converted to.
+        from core.media_pipeline import build_x264_command
+
+        x264 = build_x264_command("x264-7mod.exe", "out.264")
+        for flag, value in (
+            ("--colormatrix", "smpte170m"),
+            ("--colorprim", "smpte170m"),
+            ("--transfer", "smpte170m"),
+            ("--range", "tv"),
+        ):
+            self.assertIn(flag, x264)
+            self.assertEqual(x264[x264.index(flag) + 1], value)
+
     def test_discovers_lsmash_muxer_when_mp4box_is_absent(self):
         from core.media_tools import MediaToolchain
 
@@ -145,7 +162,29 @@ class VapourSynthScriptTests(unittest.TestCase):
         self.assertIn("core.resize.Bicubic", script)
         self.assertIn("core.std.AddBorders", script)
         self.assertIn("format=vs.YUV420P8", script)
+        # Video sources are normalized to SMPTE 170M: unspecified _Matrix (2)
+        # gets the H.273 resolution heuristic stamped, then resize converts.
+        self.assertIn("matrix_s='170m'", script)
+        self.assertIn("_Matrix", script)
         self.assertNotIn("ffmpeg", script.lower())
+
+    def test_video_script_never_emits_empty_trim(self):
+        from core.media_pipeline import write_vpy_script
+
+        params = VideoExportParams(
+            video_path=r"C:\media\loop.mp4",
+            cropbox=(0, 0, 0, 0),
+            start_frame=5,
+            end_frame=5,  # degenerate trim: clip[5:5] would be an EMPTY clip
+            fps=30.0,
+            resolution="360x640",
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = Path(temp_dir) / "loop.vpy"
+            write_vpy_script(script_path, params)
+            script = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("clip = clip[5:6]", script)
 
     def test_writes_image_loop_script(self):
         from core.media_pipeline import write_vpy_script
@@ -170,6 +209,37 @@ class VapourSynthScriptTests(unittest.TestCase):
         self.assertNotIn("length=30", script)
         self.assertIn("width=480", script)
         self.assertIn("height=854", script)
+        # RGB->YUV conversion matrix must match the smpte170m VUI tags (sub-HD
+        # targets decode as BT.601 by convention; the old '709' produced a
+        # visible colour shift on export).
+        self.assertIn("matrix_s='170m'", script)
+        self.assertNotIn("matrix_s='709'", script)
+
+    def test_image_loop_script_applies_crop_and_rotation(self):
+        # The crop/rotation blocks used to live only in the video branch, so an
+        # image loop silently ignored the user's framing. They are shared now.
+        from core.media_pipeline import write_vpy_script
+
+        params = VideoExportParams(
+            video_path=r"C:\media\bg.png",
+            cropbox=(10, 20, 100, 200),
+            start_frame=0,
+            end_frame=30,
+            fps=30.0,
+            resolution="360x640",
+            is_image=True,
+            rotation=90,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            script_path = Path(temp_dir) / "image.vpy"
+            write_vpy_script(script_path, params)
+            script = script_path.read_text(encoding="utf-8")
+
+        self.assertIn("core.std.Transpose", script)
+        self.assertIn("core.std.FlipHorizontal", script)
+        self.assertIn("core.std.CropAbs", script)
+        # Loop AFTER rotate/crop: one processed frame duplicated.
+        self.assertLess(script.index("CropAbs"), script.index("std.Loop"))
 
 
 class EncoderRunTests(unittest.TestCase):
