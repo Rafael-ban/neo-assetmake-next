@@ -98,6 +98,10 @@ class MainWindow(QMainWindow):
         # 页面切换时记录正在播放的视频预览器，以便返回素材页时恢复
         self._videos_were_playing: list = []
 
+        # 异步加载失败聚合(短窗口内多个预览失败只弹一个警告框)
+        self._pending_load_failures: list = []
+        self._load_failure_flush_scheduled = False
+
         self._setup_ui()
         self._setup_menu()
         self._setup_shortcuts()
@@ -659,6 +663,8 @@ class MainWindow(QMainWindow):
             self._on_playback_changed)
         self.video_preview.rotation_changed.connect(
             self._on_loop_rotation_changed)
+        self.video_preview.load_failed.connect(
+            lambda msg: self._on_preview_load_failed("循环视频", msg))
 
         self.btn_firmware.clicked.connect(self._on_sidebar_firmware)
         self.btn_material.clicked.connect(self._on_sidebar_material)
@@ -674,6 +680,8 @@ class MainWindow(QMainWindow):
             self._on_intro_playback_changed)
         self.intro_preview.rotation_changed.connect(
             self._on_intro_rotation_changed)
+        self.intro_preview.load_failed.connect(
+            lambda msg: self._on_preview_load_failed("入场视频", msg))
 
         self._connect_timeline_to_preview(self.intro_preview)
 
@@ -1203,10 +1211,12 @@ class MainWindow(QMainWindow):
                 if not self.intro_preview.load_video(intro_path):
                     load_failures.append("入场视频")
 
+        # load_video 现在是异步受理:返回 False 仅代表同步拒绝(文件/mpv 缺失),
+        # 元数据探测失败会经 load_failed 信号进入 _on_preview_load_failed 聚合弹窗。
         if load_failures:
             QMessageBox.warning(
                 self, "部分素材加载失败",
-                "以下素材无法获取视频元数据（请确认 mpv 与文件可用）：\n"
+                "以下素材无法开始加载（请确认 mpv 与文件可用）：\n"
                 + "、".join(load_failures),
             )
 
@@ -2637,10 +2647,12 @@ class MainWindow(QMainWindow):
                     self.video_preview.load_static_image_from_file(path)
                 else:
                     logger.info("加载视频文件...")
+                    # 同步拒绝(文件/mpv 缺失)即时弹窗;探测失败会经
+                    # load_failed 信号弹窗,预览区同时显示错误文案。
                     if not self.video_preview.load_video(path):
                         QMessageBox.warning(
                             self, "加载失败",
-                            "无法获取视频元数据，请确认 mpv 与文件可用。")
+                            "无法开始加载视频，请确认 mpv 与文件可用。")
                         return
 
                 logger.info("将时间轴连接到video_preview")
@@ -3049,6 +3061,9 @@ class MainWindow(QMainWindow):
     def _probe_video_metadata(
         self, video_path: str
     ) -> tuple[int, int, int, float]:
+        # 刻意保持同步:仅在导出时对"已配置但预览未加载"的媒体兜底探测
+        # (_collect_preview_media_state 优先复用预览缓存),导出本就是阻塞
+        # 模态流程;预览路径的探测已改为 MetadataProbeWorker 异步执行。
         from core.video_processor import VideoProcessor
         from core.media_tools import MediaToolchain
 
@@ -3538,6 +3553,26 @@ class MainWindow(QMainWindow):
         self._loop_in_out = (0, total_frames - 1)
         self.status_bar.showMessage(f"视频已加载: {total_frames} 帧, {fps:.1f} FPS")
 
+    def _on_preview_load_failed(self, which: str, message: str):
+        """异步视频加载失败(元数据探测/启动失败信号)——聚合后弹一次警告。"""
+        logger.warning("%s加载失败: %s", which, message)
+        if which not in self._pending_load_failures:
+            self._pending_load_failures.append(which)
+        self.status_bar.showMessage(f"{which}加载失败: {message}")
+        if not self._load_failure_flush_scheduled:
+            self._load_failure_flush_scheduled = True
+            QTimer.singleShot(600, self._flush_load_failures)
+
+    def _flush_load_failures(self):
+        self._load_failure_flush_scheduled = False
+        failures, self._pending_load_failures = self._pending_load_failures, []
+        if failures:
+            QMessageBox.warning(
+                self, "素材加载失败",
+                "以下素材无法获取视频元数据（请确认 mpv 与文件可用）：\n"
+                + "、".join(failures),
+            )
+
     def _on_frame_changed(self, frame: int):
         """帧变更"""
         if self._is_timeline_bound_to(self.video_preview):
@@ -3963,7 +3998,9 @@ class MainWindow(QMainWindow):
             if preview is None:
                 continue
             try:
-                preview.clear()
+                # App-quit path: the event loop is stopping, async kill-escalation
+                # timers would never fire — use the bounded blocking teardown.
+                preview.clear(sync_shutdown=True)
             except Exception as exc:
                 logger.debug("preview shutdown failed: %s", exc)
 

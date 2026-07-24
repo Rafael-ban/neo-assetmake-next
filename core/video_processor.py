@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from PyQt6.QtCore import QProcess
+from PyQt6.QtCore import QProcess, QThread, pyqtSignal
 from PyQt6.QtNetwork import QLocalSocket
 
 from core.media_tools import MediaToolchain
@@ -168,6 +168,41 @@ class VideoProcessor:
         except Exception as exc:
             logger.error("mpv metadata probe failed for %s: %s", input_path, exc)
             return None
+
+
+class MetadataProbeWorker(QThread):
+    """Run the blocking mpv metadata probe off the GUI thread.
+
+    ``_MpvMetadataSession`` is constructed and used entirely inside ``run()``,
+    so its QProcess/QLocalSocket live on this worker thread and their blocking
+    ``waitFor*`` calls (PyQt6 QtNetwork.pyi:202-205 QLocalSocket.waitForConnected/
+    waitForReadyRead/waitForBytesWritten; QtCore.pyi:6985-6988 QProcess.
+    waitForStarted/waitForFinished — all block the *calling* thread) can no
+    longer stall the GUI event loop. Worst case for a dead pipe is ~46s of
+    accumulated timeouts, which previously froze the whole UI per video load.
+    """
+
+    result = pyqtSignal(object)  # VideoInfo
+    failed = pyqtSignal(str)
+
+    def __init__(self, mpv_path: str, input_path: str, parent=None) -> None:
+        super().__init__(parent)
+        self._mpv_path = mpv_path
+        self.input_path = input_path
+        self.epoch = -1  # set by the owner to correlate results to a load
+
+    def run(self) -> None:  # executed on the worker thread
+        try:
+            if not Path(self.input_path).exists():
+                self.failed.emit(f"文件不存在: {self.input_path}")
+                return
+            properties = _MpvMetadataSession(self._mpv_path).probe(self.input_path)
+            self.result.emit(parse_mpv_video_info(properties))
+        except Exception as exc:
+            logger.error(
+                "mpv metadata probe failed for %s: %s", self.input_path, exc
+            )
+            self.failed.emit(str(exc))
 
 
 class _MpvMetadataSession:

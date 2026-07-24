@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import QLabel, QSizePolicy, QStackedWidget, QVBoxLayout, QW
 from qfluentwidgets import CaptionLabel, setCustomStyleSheet
 
 from core.media_tools import MediaToolchain
-from core.video_processor import VideoProcessor
+from core.video_processor import MetadataProbeWorker
 
 if TYPE_CHECKING:
     from config.epconfig import EPConfig
@@ -43,6 +43,25 @@ if TYPE_CHECKING:
 # the GUI thread via QTimer, so these never block the UI.
 _MPV_IPC_MAX_ATTEMPTS = 100
 _MPV_IPC_RETRY_MS = 100
+
+# QProcess instances detached during async teardown: they must outlive the
+# widget until their `finished` signal releases them, otherwise C++-side
+# destruction of a still-running QProcess kills the app.
+_DYING_MPV_PROCESSES: list = []
+
+# In-flight metadata probe workers. A superseded load drops the widget's own
+# reference to its worker; without this keep-alive the unparented QThread's
+# wrapper gets garbage-collected while the thread is still running, which
+# destroys the C++ QThread mid-run and aborts the process.
+_ACTIVE_PROBE_WORKERS: list = []
+
+
+def _release_probe_worker(worker):
+    try:
+        _ACTIVE_PROBE_WORKERS.remove(worker)
+    except ValueError:
+        return  # already released
+    worker.deleteLater()
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +116,7 @@ class VideoPreviewWidget(QWidget):
     frame_changed = pyqtSignal(int)
     playback_state_changed = pyqtSignal(bool)
     video_loaded = pyqtSignal(int, float)
+    load_failed = pyqtSignal(str)  # async metadata probe / mpv launch failure
     rotation_changed = pyqtSignal(int)
 
     DRAG_NONE = 0
@@ -127,6 +147,16 @@ class VideoPreviewWidget(QWidget):
         self._mpv_request_id = 0  # monotonically increasing JSON-IPC request_id
         self._mpv_reply_callbacks: dict = {}  # request_id -> on_reply callable
         self._screenshot_refresh_timer: Optional[QTimer] = None
+        # Load-generation token: bumped by every new load/clear. Deferred
+        # continuations (probe results, IPC connect retries, screenshot
+        # retries) capture it at schedule time and no-op when stale, so a
+        # slow continuation from load A can never corrupt load B's session.
+        self._load_epoch = 0
+        self._probe_worker: Optional[MetadataProbeWorker] = None
+        # IPC connect retry runs on a child QTimer + bound-method slot, so the
+        # timer dies with the widget and can never fire into a deleted object.
+        self._ipc_retry_timer: Optional[QTimer] = None
+        self._ipc_retry_epoch = 0
         self._media_toolchain = MediaToolchain.discover()
         self._has_video = False
         self._loop_frame: Optional[np.ndarray] = None
@@ -196,8 +226,8 @@ class VideoPreviewWidget(QWidget):
         )
         layout.addWidget(self.info_label)
 
-    def _stop_reader_thread(self):
-        self._stop_mpv_process()
+    def _stop_reader_thread(self, sync_shutdown: bool = False):
+        self._stop_mpv_process(sync=sync_shutdown)
         if self._reader_thread is not None:
             try:
                 self._reader_thread.request_stop()
@@ -207,8 +237,16 @@ class VideoPreviewWidget(QWidget):
             self._reader_thread = None
         self._has_video = False
 
-    def _stop_mpv_process(self):
-        # QProcess/QLocalSocket are owned by the GUI thread and torn down here.
+    def _stop_mpv_process(self, sync: bool = False):
+        """Tear down the mpv session.
+
+        Reload/clear paths run ASYNCHRONOUSLY: `quit` is sent, the process is
+        detached, and kill-escalation runs on timers — the GUI thread never
+        calls the blocking `QProcess.waitForFinished` (QtCore.pyi:6985), which
+        used to freeze the UI up to ~6.1s on every video switch. ``sync=True``
+        is reserved for window-close/app-quit, where the event loop is about
+        to stop and timers would never fire.
+        """
         socket = self._mpv_socket
         process = self._mpv_process
         # Best-effort graceful quit while the socket is still connected.
@@ -223,20 +261,59 @@ class VideoPreviewWidget(QWidget):
         self._mpv_reply_callbacks = {}
         if self._screenshot_refresh_timer is not None:
             self._screenshot_refresh_timer.stop()
+        if self._ipc_retry_timer is not None:
+            self._ipc_retry_timer.stop()
         try:
             if socket is not None:
                 socket.disconnectFromServer()
                 socket.abort()
                 socket.deleteLater()
-            if process is not None:
+        except Exception as exc:
+            logger.debug("mpv socket shutdown failed: %s", exc)
+        if process is None:
+            return
+        try:
+            if process.state() == QProcess.ProcessState.NotRunning:
+                process.deleteLater()
+                return
+            if sync:
                 if process.state() != QProcess.ProcessState.NotRunning:
                     process.waitForFinished(3000)
                 if process.state() != QProcess.ProcessState.NotRunning:
                     process.kill()
                     process.waitForFinished(3000)
                 process.deleteLater()
+                return
         except Exception as exc:
             logger.debug("mpv shutdown failed: %s", exc)
+            return
+        # Async detach: `quit` was already sent; release on `finished`, and
+        # escalate to kill if mpv lingers. No GUI-thread blocking involved.
+        # Un-parent the process first — a dying process must outlive this
+        # widget, and cascade-deleting a running QProcess with the widget
+        # would fire Qt warnings / kill semantics at an uncontrolled time.
+        process.setParent(None)
+        _DYING_MPV_PROCESSES.append(process)
+
+        def _release(*_args):
+            try:
+                _DYING_MPV_PROCESSES.remove(process)
+            except ValueError:
+                return  # already released
+            process.deleteLater()
+
+        process.finished.connect(_release)
+
+        def _kill_if_running():
+            try:
+                if process in _DYING_MPV_PROCESSES and \
+                        process.state() != QProcess.ProcessState.NotRunning:
+                    process.kill()
+            except RuntimeError:
+                pass  # C++ object already gone
+
+        QTimer.singleShot(1500, _kill_if_running)
+        QTimer.singleShot(4000, _kill_if_running)
 
     def _send_mpv_command(self, command: list, on_reply=None):
         if self._mpv_socket is None or \
@@ -409,7 +486,21 @@ class VideoPreviewWidget(QWidget):
         if self._mpv_ipc_attempts >= _MPV_IPC_MAX_ATTEMPTS:
             self._on_mpv_launch_failed("mpv IPC connection failed after multiple attempts")
             return
-        QTimer.singleShot(_MPV_IPC_RETRY_MS, self._try_mpv_ipc_connect)
+        # Capture the load epoch: if the user loads another video during the
+        # retry window, the stale timer must not connect to (and hijack) the
+        # NEW session's socket — `_mpv_process is not None` alone passes
+        # wrongly in that case because the new load already created a process.
+        self._ipc_retry_epoch = self._load_epoch
+        if self._ipc_retry_timer is None:
+            self._ipc_retry_timer = QTimer(self)
+            self._ipc_retry_timer.setSingleShot(True)
+            self._ipc_retry_timer.timeout.connect(self._on_ipc_retry_due)
+        self._ipc_retry_timer.start(_MPV_IPC_RETRY_MS)
+
+    def _on_ipc_retry_due(self):
+        if self._ipc_retry_epoch != self._load_epoch:
+            return  # a newer load owns the mpv session now
+        self._try_mpv_ipc_connect()
 
     def _on_mpv_process_error(self, error):
         """QProcess 层错误。只有启动失败才当作 launch 失败，避免停止时的误报。"""
@@ -425,8 +516,9 @@ class VideoPreviewWidget(QWidget):
         self._display_stack.setCurrentIndex(0)
         self.video_label.setText(f"mpv launch failed: {error_msg}")
 
-        # 标记加载失败
+        # 标记加载失败并对外可见(此时 video_loaded 可能已发出)
         self._has_video = False
+        self.load_failed.emit(error_msg)
 
     def set_target_resolution(self, width: int, height: int):
         if self.target_width == width and self.target_height == height:
@@ -439,6 +531,15 @@ class VideoPreviewWidget(QWidget):
             self._refresh_display()
 
     def load_video(self, path: str) -> bool:
+        """Begin loading a video (asynchronous).
+
+        Returns True when the load was *accepted*; the metadata probe then runs
+        on a worker thread and the outcome arrives via ``video_loaded`` /
+        ``load_failed``. Returns False only for synchronous rejections (file or
+        mpv missing). The probe's blocking ``waitFor*`` chain used to run right
+        here on the GUI thread, freezing the UI for up to tens of seconds per
+        load (QtNetwork.pyi:202-205, QtCore.pyi:6985-6988 — blocking calls).
+        """
         logger.info("Loading video with mpv: %s", path)
         if not os.path.exists(path):
             self.video_label.setText(f"File not found: {path}")
@@ -449,14 +550,46 @@ class VideoPreviewWidget(QWidget):
             self.video_label.setText("mpv not found")
             return False
 
-        info = VideoProcessor(self._media_toolchain.mpv_path).get_video_info(path)
-        if info is None:
-            self.video_label.setText("无法加载视频元数据")
-            return False
-
+        self._load_epoch += 1
+        epoch = self._load_epoch
         self._stop_reader_thread()
         self.pause()
         self._loop_frame = None
+        self._has_video = False
+        self.current_frame = None
+        self._display_stack.setCurrentIndex(0)
+        self.video_label.setText("正在加载视频元数据…")
+
+        # No parent: a parented QThread would be cascade-deleted with the
+        # widget while possibly still running (fatal). The worker keeps itself
+        # alive until `finished` -> deleteLater; the bound-method connections
+        # below auto-disconnect if this widget's C++ side goes away first.
+        worker = MetadataProbeWorker(self._media_toolchain.mpv_path, path)
+        worker.epoch = epoch
+        self._probe_worker = worker
+        worker.result.connect(self._on_probe_worker_result)
+        worker.failed.connect(self._on_probe_worker_failed)
+        # Keep-alive until the thread actually finishes: `self._probe_worker`
+        # alone is not enough, a superseding load overwrites it immediately.
+        _ACTIVE_PROBE_WORKERS.append(worker)
+        worker.finished.connect(lambda w=worker: _release_probe_worker(w))
+        worker.start()
+        return True
+
+    def _on_probe_worker_result(self, info):
+        worker = self.sender()
+        self._on_probe_finished(
+            getattr(worker, "epoch", -1), getattr(worker, "input_path", ""), info
+        )
+
+    def _on_probe_worker_failed(self, message: str):
+        worker = self.sender()
+        self._on_probe_failed(getattr(worker, "epoch", -1), message)
+
+    def _on_probe_finished(self, epoch: int, path: str, info):
+        if epoch != self._load_epoch:
+            return  # superseded by a newer load/clear
+        self._probe_worker = None
         self.video_path = path
         self.video_fps = info.fps or 30.0
         self.video_width = max(1, info.width)
@@ -469,14 +602,18 @@ class VideoPreviewWidget(QWidget):
         self._has_video = True
         self._init_cropbox()
         self._update_info_label()
-
-        if not self._start_mpv_preview(path):
-            self._has_video = False
-            self.current_frame = None
-            return False
-
+        self._start_mpv_preview(path)
         self.video_loaded.emit(self.total_frames, self.video_fps)
-        return True
+
+    def _on_probe_failed(self, epoch: int, message: str):
+        if epoch != self._load_epoch:
+            return
+        self._probe_worker = None
+        self._has_video = False
+        self.current_frame = None
+        self._display_stack.setCurrentIndex(0)
+        self.video_label.setText("无法加载视频元数据")
+        self.load_failed.emit(message or "无法获取视频元数据")
 
     def load_static_image_from_file(self, image_path: str) -> bool:
         if not HAS_CV2:
@@ -525,6 +662,7 @@ class VideoPreviewWidget(QWidget):
         return True
 
     def _load_static_frame(self, frame: np.ndarray) -> bool:
+        self._load_epoch += 1  # invalidate pending probe/retry continuations
         self.pause()
         self._stop_reader_thread()
         self._loop_frame = None
@@ -745,7 +883,9 @@ class VideoPreviewWidget(QWidget):
         self._send_mpv_command(["seek", seconds, "absolute+exact"])
         self._schedule_screenshot_refresh()
 
-    def request_screenshot(self, callback=None, _attempts_left: int = 5) -> bool:
+    def request_screenshot(
+        self, callback=None, _attempts_left: int = 5, _epoch: Optional[int] = None
+    ) -> bool:
         """Read the current mpv frame back into ``current_frame`` via a temp PNG.
 
         mpv renders into its own child window, so the widget never sees pixels
@@ -754,7 +894,14 @@ class VideoPreviewWidget(QWidget):
         fires once the reply arrives. Returns False when no mpv IPC session is
         available (callback still fires with None).
         """
-        if not HAS_CV2 or self._mpv_process is None or not self._mpv_ipc_connected:
+        if _epoch is None:
+            _epoch = self._load_epoch
+        if (
+            not HAS_CV2
+            or self._mpv_process is None
+            or not self._mpv_ipc_connected
+            or _epoch != self._load_epoch
+        ):
             if callback is not None:
                 callback(None)
             return False
@@ -789,11 +936,15 @@ class VideoPreviewWidget(QWidget):
                 # mpv rejects screenshot commands with "error running command"
                 # until the file has finished loading (observed right after
                 # IPC connect on the bundled mpv v0.41) — retry briefly
-                # instead of failing the capture.
-                QTimer.singleShot(
-                    200,
-                    lambda: self.request_screenshot(callback, _attempts_left - 1),
-                )
+                # instead of failing the capture. The retry carries the load
+                # epoch so it can never capture a *different* video's frame.
+                def _retry():
+                    try:
+                        self.request_screenshot(callback, _attempts_left - 1, _epoch)
+                    except RuntimeError:
+                        pass  # widget C++ side destroyed while the timer was pending
+
+                QTimer.singleShot(200, _retry)
                 return
             if frame is not None:
                 self.current_frame = frame
@@ -1057,12 +1208,15 @@ class VideoPreviewWidget(QWidget):
         self._refresh_display()
 
     def closeEvent(self, event):
-        self.clear()
+        # Window teardown: the event loop is going away, so use the blocking
+        # (bounded) shutdown — async kill-escalation timers would never fire.
+        self.clear(sync_shutdown=True)
         super().closeEvent(event)
 
-    def clear(self):
+    def clear(self, sync_shutdown: bool = False):
+        self._load_epoch += 1  # invalidate pending probe/retry continuations
         self.pause()
-        self._stop_reader_thread()
+        self._stop_reader_thread(sync_shutdown=sync_shutdown)
         self._loop_frame = None
         self.video_path = ""
         self.total_frames = 0

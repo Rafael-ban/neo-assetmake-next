@@ -117,7 +117,7 @@ class MpvAffinityTests(unittest.TestCase):
         for m in ("_stop_mpv_process", "_make_mpv_ipc_server", "_send_mpv_command",
                   "_on_mpv_process_error", "_on_mpv_process_started", "_try_mpv_ipc_connect",
                   "_on_mpv_ipc_connected", "_on_mpv_ipc_error", "_on_mpv_launch_failed",
-                  "_start_mpv_preview"):
+                  "_on_ipc_retry_due", "_start_mpv_preview"):
             setattr(holder, m, types.MethodType(getattr(cls, m), holder))
         holder._mpv_process = None
         holder._mpv_socket = None
@@ -125,6 +125,9 @@ class MpvAffinityTests(unittest.TestCase):
         holder._mpv_ipc_attempts = 0
         holder._mpv_reply_callbacks = {}
         holder._screenshot_refresh_timer = None
+        holder._ipc_retry_timer = None
+        holder._ipc_retry_epoch = 0
+        holder._load_epoch = 0
         holder._rotation = 0
         holder._mpv_page_index = 0
         holder._display_stack = types.SimpleNamespace(setCurrentIndex=lambda i: None)
