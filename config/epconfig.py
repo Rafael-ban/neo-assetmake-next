@@ -279,6 +279,82 @@ class Overlay:
 
 
 @dataclass
+class EditorTrackState:
+    """单轨(循环/入场)的编辑器状态。
+
+    仅存在于项目文件,导出包的 epconfig.json 会剥离(见 EPConfig.to_dict)。
+    crop 为旋转后空间的像素 [x, y, w, h];in/out 为帧索引(-1 = 未设置)。
+    """
+    crop: Optional[List[int]] = None
+    rotation: int = 0
+    in_frame: int = -1
+    out_frame: int = -1
+
+    def is_default(self) -> bool:
+        return (
+            self.crop is None
+            and self.rotation == 0
+            and self.in_frame < 0
+            and self.out_frame < 0
+        )
+
+    def to_dict(self) -> dict:
+        result: Dict[str, Any] = {}
+        if self.crop is not None:
+            result["crop"] = [int(v) for v in self.crop]
+        if self.rotation:
+            result["rotation"] = int(self.rotation)
+        if self.in_frame >= 0:
+            result["in_frame"] = int(self.in_frame)
+        if self.out_frame >= 0:
+            result["out_frame"] = int(self.out_frame)
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> "EditorTrackState":
+        if not isinstance(data, dict):
+            return cls()
+        crop = data.get("crop")
+        if isinstance(crop, (list, tuple)) and len(crop) == 4:
+            crop = [int(v) for v in crop]
+        else:
+            crop = None
+        return cls(
+            crop=crop,
+            rotation=int(data.get("rotation", 0) or 0),
+            in_frame=int(data.get("in_frame", -1)),
+            out_frame=int(data.get("out_frame", -1)),
+        )
+
+
+@dataclass
+class EditorState:
+    """编辑器状态(裁剪框/旋转/入出点),挂在项目 epconfig.json 的 editor 键下。"""
+    loop: EditorTrackState = field(default_factory=EditorTrackState)
+    intro: EditorTrackState = field(default_factory=EditorTrackState)
+
+    def is_default(self) -> bool:
+        return self.loop.is_default() and self.intro.is_default()
+
+    def to_dict(self) -> dict:
+        result: Dict[str, Any] = {}
+        if not self.loop.is_default():
+            result["loop"] = self.loop.to_dict()
+        if not self.intro.is_default():
+            result["intro"] = self.intro.to_dict()
+        return result
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> "EditorState":
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            loop=EditorTrackState.from_dict(data.get("loop")),
+            intro=EditorTrackState.from_dict(data.get("intro")),
+        )
+
+
+@dataclass
 class EPConfig:
     """epconfig.json 完整数据模型"""
     version: int = 1
@@ -292,6 +368,7 @@ class EPConfig:
     transition_in: Transition = field(default_factory=Transition)
     transition_loop: Transition = field(default_factory=Transition)
     overlay: Overlay = field(default_factory=Overlay)
+    editor: EditorState = field(default_factory=EditorState)
 
     def to_dict(self, normalize_paths: bool = False) -> dict:
         """转换为可序列化的字典
@@ -329,6 +406,13 @@ class EPConfig:
         overlay_dict = self.overlay.to_dict(normalize_paths=normalize_paths)
         if overlay_dict:
             result["overlay"] = overlay_dict
+
+        # editor 状态只进项目文件(normalize_paths=False = save_to_file 路径),
+        # 导出包(normalize_paths=True)剥离:包内 epconfig.json 是设备契约
+        # (schemas/epconfig.schema.json),设备固件解析器无法验证其对未知键的
+        # 容忍度,故不携带任何编辑器私有数据。
+        if not normalize_paths and not self.editor.is_default():
+            result["editor"] = self.editor.to_dict()
 
         return result
 
@@ -376,7 +460,8 @@ class EPConfig:
             intro=IntroConfig.from_dict(data.get("intro")),
             transition_in=Transition.from_dict(data.get("transition_in")),
             transition_loop=Transition.from_dict(data.get("transition_loop")),
-            overlay=Overlay.from_dict(data.get("overlay"))
+            overlay=Overlay.from_dict(data.get("overlay")),
+            editor=EditorState.from_dict(data.get("editor")),
         )
         # from_string above stays lenient (defaults) so the app keeps working; record the
         # raw invalid values here so validate_config can surface them as errors.

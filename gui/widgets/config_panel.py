@@ -606,6 +606,11 @@ class ConfigPanel(QWidget):
         self._updating = True
 
         try:
+            # 先无条件把过渡/叠加子控件重置为默认值。下面的按需应用只在
+            # "配置里有值"时写控件——不重置的话,上一个项目留下的残值会在
+            # 本项目下一次 update_config_from_ui 时被写进配置(跨项目污染)。
+            self._reset_transition_and_overlay_widgets()
+
             self.edit_uuid.setText(config.uuid)
             self.edit_name.setText(config.name)
             self.edit_description.setPlainText(config.description)
@@ -703,6 +708,37 @@ class ConfigPanel(QWidget):
 
         finally:
             self._updating = False
+
+    def _reset_transition_and_overlay_widgets(self):
+        """把过渡/叠加子控件重置为 dataclass 默认值(仅在 _updating 保护内调用)。"""
+        for combo in (self.combo_trans_in_type, self.combo_trans_loop_type):
+            idx = combo.findData(TransitionType.NONE.value)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        default_opts = TransitionOptions()
+        self.spin_trans_in_duration.setValue(default_opts.duration)
+        self.edit_trans_in_color.setText(default_opts.background_color)
+        self.edit_trans_in_image.setText("")
+        self.spin_trans_loop_duration.setValue(default_opts.duration)
+        self.edit_trans_loop_color.setText(default_opts.background_color)
+        self.edit_trans_loop_image.setText("")
+
+        ark = ArknightsOverlayOptions()
+        self.spin_ark_appear.setValue(ark.appear_time)
+        self.edit_ark_name.setText(ark.operator_name)
+        self.edit_ark_top_left_rhodes.setText("")
+        self.edit_ark_top_right_bar_text.setText("")
+        self.edit_ark_code.setText(ark.operator_code)
+        self.edit_ark_barcode.setText(ark.barcode_text)
+        self.edit_ark_aux.setPlainText(ark.aux_text)
+        self.edit_ark_staff.setText(ark.staff_text)
+        self.edit_ark_color.setText(ark.color)
+        self.edit_ark_class_icon.setText("")
+        self.edit_ark_logo.setText("")
+
+        img = ImageOverlayOptions()
+        self.spin_img_appear.setValue(img.appear_time)
+        self.spin_img_duration.setValue(img.duration)
+        self.edit_img_overlay.setText("")
 
     def get_config(self) -> Optional[EPConfig]:
         """获取配置"""

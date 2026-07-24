@@ -20,7 +20,7 @@ from config.constants import (
 )
 from gui.widgets.drop_overlay import DropOverlayWidget
 from gui.styles import COLOR_TEXT_PRIMARY, COLOR_BG_ELEVATED, COLOR_BORDER, hex_with_alpha
-from config.epconfig import EPConfig, CONFIG_FILENAME
+from config.epconfig import EPConfig, EditorTrackState, CONFIG_FILENAME
 from qfluentwidgets import (
     PushButton, PrimaryPushButton, ToolButton, TransparentToolButton,
     TabWidget, SegmentedWidget,
@@ -101,6 +101,13 @@ class MainWindow(QMainWindow):
         # 异步加载失败聚合(短窗口内多个预览失败只弹一个警告框)
         self._pending_load_failures: list = []
         self._load_failure_flush_scheduled = False
+
+        # editor-state(裁剪/旋转/入出点)同步与恢复:
+        # - 打开项目时加载过程会先 emit 默认裁剪框,期间挂起同步防污染/防误标脏;
+        # - 加载完成后按打开前的拷贝恢复到预览/时间轴。
+        self._editor_sync_suspended: set = set()
+        self._pending_editor_restore: dict = {}
+        self._restoring_editor_state = False
 
         self._setup_ui()
         self._setup_menu()
@@ -664,9 +671,13 @@ class MainWindow(QMainWindow):
         self.video_preview.rotation_changed.connect(
             self._on_loop_rotation_changed)
         self.video_preview.load_failed.connect(
-            lambda msg: self._on_preview_load_failed("循环视频", msg))
+            lambda msg: self._on_preview_load_failed(
+                "循环视频", msg, self.video_preview))
         self.video_preview.crop_mode_changed.connect(
             lambda on: self._on_preview_crop_mode_changed(self.video_preview, on))
+        # 裁剪框变化写入 config.editor(此前从未连接:关闭即静默丢失)
+        self.video_preview.cropbox_changed.connect(
+            lambda *a: self._on_editor_state_changed(self.video_preview))
 
         self.btn_firmware.clicked.connect(self._on_sidebar_firmware)
         self.btn_material.clicked.connect(self._on_sidebar_material)
@@ -683,9 +694,12 @@ class MainWindow(QMainWindow):
         self.intro_preview.rotation_changed.connect(
             self._on_intro_rotation_changed)
         self.intro_preview.load_failed.connect(
-            lambda msg: self._on_preview_load_failed("入场视频", msg))
+            lambda msg: self._on_preview_load_failed(
+                "入场视频", msg, self.intro_preview))
         self.intro_preview.crop_mode_changed.connect(
             lambda on: self._on_preview_crop_mode_changed(self.intro_preview, on))
+        self.intro_preview.cropbox_changed.connect(
+            lambda *a: self._on_editor_state_changed(self.intro_preview))
         self.timeline.crop_mode_toggled.connect(self._on_toggle_crop_mode)
 
         self._connect_timeline_to_preview(self.intro_preview)
@@ -1137,6 +1151,11 @@ class MainWindow(QMainWindow):
         self.basic_config_panel.set_config(self._config, self._base_dir)
         self.json_preview.set_config(self._config, self._base_dir)
         self.video_preview.set_epconfig(self._config)
+        # 重新指向自动保存:服务在 start() 时缓存 config 对象与项目路径
+        # (auto_save_service.py),不重启会继续把旧项目的配置备份到旧位置,
+        # 崩溃恢复也会指向错误的项目。
+        self._auto_save_service.start(
+            self._config, self._project_path, self._base_dir)
         self._update_title()
         self.status_bar.showMessage(f"新建项目: {dir_path}")
 
@@ -1197,6 +1216,10 @@ class MainWindow(QMainWindow):
                 file_path = os.path.join(self._base_dir, file_path)
 
             if os.path.exists(file_path):
+                # 打开项目:记录 editor 状态拷贝待加载完成后恢复;加载期挂起
+                # 同步,防止 _init_cropbox 的默认框先把保存值覆盖掉/误标脏。
+                self._begin_editor_restore(
+                    self.video_preview, self._config.editor.loop)
                 if self._config.loop.is_image:
                     logger.info(f"尝试加载循环图片: {file_path}")
                     self._load_loop_image(file_path)
@@ -1204,6 +1227,7 @@ class MainWindow(QMainWindow):
                     logger.info(f"尝试加载循环视频: {file_path}")
                     if not self.video_preview.load_video(file_path):
                         load_failures.append("循环视频")
+                        self._cancel_editor_restore(self.video_preview)
             else:
                 logger.warning(f"循环素材文件不存在: {file_path}")
 
@@ -1213,8 +1237,11 @@ class MainWindow(QMainWindow):
                 intro_path = os.path.join(self._base_dir, intro_path)
             if os.path.exists(intro_path):
                 logger.info(f"尝试加载入场视频: {intro_path}")
+                self._begin_editor_restore(
+                    self.intro_preview, self._config.editor.intro)
                 if not self.intro_preview.load_video(intro_path):
                     load_failures.append("入场视频")
+                    self._cancel_editor_restore(self.intro_preview)
 
         # load_video 现在是异步受理:返回 False 仅代表同步拒绝(文件/mpv 缺失),
         # 元数据探测失败会经 load_failed 信号进入 _on_preview_load_failed 聚合弹窗。
@@ -1308,6 +1335,10 @@ class MainWindow(QMainWindow):
             self.advanced_config_panel.set_config(self._config, self._base_dir)
             self.basic_config_panel.set_config(self._config, self._base_dir)
             self.json_preview.set_config(self._config, self._base_dir)
+
+            # 重新指向自动保存(路径已切换;服务缓存的是 start() 时的值)。
+            self._auto_save_service.start(
+                self._config, self._project_path, self._base_dir)
 
             self._update_title()
             self.status_bar.showMessage(f"已保存: {path}")
@@ -2660,6 +2691,9 @@ class MainWindow(QMainWindow):
                             self, "加载失败",
                             "无法开始加载视频，请确认 mpv 与文件可用。")
                         return
+                    if self._config:
+                        # 换了新素材:旧文件的取景状态不再适用。
+                        self._config.editor.loop = EditorTrackState()
 
                 logger.info("将时间轴连接到video_preview")
                 self._connect_timeline_to_preview(self.video_preview)
@@ -2680,6 +2714,9 @@ class MainWindow(QMainWindow):
         logger.info(f"入场视频文件被选择: {path}")
         if path and os.path.exists(path):
             if self.intro_preview.load_video(path):
+                if self._config:
+                    # 换了新素材:旧文件的取景状态不再适用。
+                    self._config.editor.intro = EditorTrackState()
                 self.preview_tabs.setCurrentIndex(0)
         else:
             logger.warning(f"入场视频文件不存在: {path}")
@@ -3310,6 +3347,7 @@ class MainWindow(QMainWindow):
             self.timeline.set_in_point(0)
             self.timeline.set_out_point(total_frames - 1)
         self._intro_in_out = (0, total_frames - 1)
+        self._finish_editor_restore(self.intro_preview)
         self.status_bar.showMessage(
             f"入场视频已加载: {total_frames} 帧, {fps:.1f} FPS")
 
@@ -3327,37 +3365,43 @@ class MainWindow(QMainWindow):
         """入场视频旋转变更"""
         if self._is_timeline_bound_to(self.intro_preview):
             self.timeline.set_rotation(rotation)
+        self._on_editor_state_changed(self.intro_preview)
 
     def _on_loop_rotation_changed(self, rotation: int):
         """循环视频旋转变更"""
         if self._is_timeline_bound_to(self.video_preview):
             self.timeline.set_rotation(rotation)
+        self._on_editor_state_changed(self.video_preview)
 
     def _on_set_in_point(self):
         """设置入点为当前帧"""
         index = self.preview_tabs.currentIndex()
         if index == 0:
-            current_frame = self.intro_preview.current_frame_index
+            preview = self.intro_preview
         elif index == 3:
-            current_frame = self.video_preview.current_frame_index
+            preview = self.video_preview
         else:
             return  # 截取帧/过渡图片标签页无入点操作
 
+        current_frame = preview.current_frame_index
         self.timeline.set_in_point(current_frame)
         logger.debug(f"设置入点: {current_frame}")
+        self._on_editor_state_changed(preview)  # 入出点属于项目状态,需标脏并持久化
 
     def _on_set_out_point(self):
         """设置出点为当前帧"""
         index = self.preview_tabs.currentIndex()
         if index == 0:
-            current_frame = self.intro_preview.current_frame_index
+            preview = self.intro_preview
         elif index == 3:
-            current_frame = self.video_preview.current_frame_index
+            preview = self.video_preview
         else:
             return  # 截取帧/过渡图片标签页无出点操作
 
+        current_frame = preview.current_frame_index
         self.timeline.set_out_point(current_frame)
         logger.debug(f"设置出点: {current_frame}")
+        self._on_editor_state_changed(preview)
 
     def _load_loop_image(self, path: str):
         """加载循环图片到预览器（以循环视频方式预览）"""
@@ -3559,6 +3603,7 @@ class MainWindow(QMainWindow):
             self.timeline.set_in_point(0)
             self.timeline.set_out_point(total_frames - 1)
         self._loop_in_out = (0, total_frames - 1)
+        self._finish_editor_restore(self.video_preview)
         self.status_bar.showMessage(f"视频已加载: {total_frames} 帧, {fps:.1f} FPS")
 
     def _on_toggle_crop_mode(self):
@@ -3580,8 +3625,78 @@ class MainWindow(QMainWindow):
         if self._timeline_preview is preview:
             self.timeline.set_crop_mode_checked(enabled)
 
-    def _on_preview_load_failed(self, which: str, message: str):
+    def _on_editor_state_changed(self, preview):
+        """预览裁剪/旋转/入出点变化 → 写入 config.editor 并标记项目已修改。
+
+        此前这些编辑结果只活在控件内存里:不持久化、不标脏,关闭或换项目
+        即静默丢失,自动保存/崩溃恢复也无从恢复。
+        """
+        if self._restoring_editor_state or preview in self._editor_sync_suspended:
+            return
+        if not self._config or not self._preview_has_loaded_media(preview):
+            return
+        track = (
+            self._config.editor.loop
+            if preview is self.video_preview
+            else self._config.editor.intro
+        )
+        track.crop = list(preview.get_cropbox_in_rotated_space())
+        track.rotation = preview.get_rotation()
+        if self._is_timeline_bound_to(preview):
+            self._snapshot_active_timeline_state()
+        in_out = self._get_cached_in_out(preview)
+        track.in_frame, track.out_frame = int(in_out[0]), int(in_out[1])
+        if not self._is_modified:
+            self._is_modified = True
+            self._update_title()
+
+    def _begin_editor_restore(self, preview, track):
+        """打开项目:记录待恢复拷贝并挂起该预览的 editor 同步。"""
+        self._editor_sync_suspended.add(preview)
+        self._pending_editor_restore[preview] = EditorTrackState.from_dict(
+            track.to_dict()
+        )
+
+    def _cancel_editor_restore(self, preview):
+        self._editor_sync_suspended.discard(preview)
+        self._pending_editor_restore.pop(preview, None)
+
+    def _finish_editor_restore(self, preview):
+        """加载完成:恢复打开前保存的裁剪/旋转/入出点,并解除同步挂起。"""
+        self._editor_sync_suspended.discard(preview)
+        track = self._pending_editor_restore.pop(preview, None)
+        if track is None or track.is_default() or not self._config:
+            return
+        self._restoring_editor_state = True
+        try:
+            if track.rotation:
+                # 先旋转再设裁剪框:set_rotation 会重置裁剪框到默认。
+                preview.set_rotation(track.rotation)
+            if track.crop:
+                preview.set_cropbox(*track.crop)
+            if 0 <= track.in_frame <= track.out_frame:
+                total = max(1, int(getattr(preview, "total_frames", 1)))
+                in_f = min(track.in_frame, total - 1)
+                out_f = min(track.out_frame, total - 1)
+                if preview is self.video_preview:
+                    self._loop_in_out = (in_f, out_f)
+                else:
+                    self._intro_in_out = (in_f, out_f)
+                if self._is_timeline_bound_to(preview):
+                    self.timeline.set_in_point(in_f)
+                    self.timeline.set_out_point(out_f)
+        finally:
+            self._restoring_editor_state = False
+        # 以打开前的拷贝写回,修正加载期间默认值对 config.editor 的任何覆盖。
+        if preview is self.video_preview:
+            self._config.editor.loop = track
+        else:
+            self._config.editor.intro = track
+
+    def _on_preview_load_failed(self, which: str, message: str, preview=None):
         """异步视频加载失败(元数据探测/启动失败信号)——聚合后弹一次警告。"""
+        if preview is not None:
+            self._cancel_editor_restore(preview)
         logger.warning("%s加载失败: %s", which, message)
         if which not in self._pending_load_failures:
             self._pending_load_failures.append(which)
