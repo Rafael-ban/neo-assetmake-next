@@ -665,6 +665,8 @@ class MainWindow(QMainWindow):
             self._on_loop_rotation_changed)
         self.video_preview.load_failed.connect(
             lambda msg: self._on_preview_load_failed("循环视频", msg))
+        self.video_preview.crop_mode_changed.connect(
+            lambda on: self._on_preview_crop_mode_changed(self.video_preview, on))
 
         self.btn_firmware.clicked.connect(self._on_sidebar_firmware)
         self.btn_material.clicked.connect(self._on_sidebar_material)
@@ -682,6 +684,9 @@ class MainWindow(QMainWindow):
             self._on_intro_rotation_changed)
         self.intro_preview.load_failed.connect(
             lambda msg: self._on_preview_load_failed("入场视频", msg))
+        self.intro_preview.crop_mode_changed.connect(
+            lambda on: self._on_preview_crop_mode_changed(self.intro_preview, on))
+        self.timeline.crop_mode_toggled.connect(self._on_toggle_crop_mode)
 
         self._connect_timeline_to_preview(self.intro_preview)
 
@@ -2991,6 +2996,8 @@ class MainWindow(QMainWindow):
         self.timeline.rotation_value_changed.connect(preview.set_rotation)
 
         self._timeline_preview = preview
+        if hasattr(preview, 'is_crop_mode'):
+            self.timeline.set_crop_mode_checked(preview.is_crop_mode())
 
         if hasattr(preview, 'total_frames') and preview.total_frames > 0:
             self.timeline.set_total_frames(preview.total_frames)
@@ -3552,6 +3559,25 @@ class MainWindow(QMainWindow):
             self.timeline.set_out_point(total_frames - 1)
         self._loop_in_out = (0, total_frames - 1)
         self.status_bar.showMessage(f"视频已加载: {total_frames} 帧, {fps:.1f} FPS")
+
+    def _on_toggle_crop_mode(self):
+        """时间轴"裁剪"开关:对当前绑定的预览器进出静帧裁剪模式。"""
+        preview = self._timeline_preview
+        if preview is None:
+            return
+        if preview.is_crop_mode():
+            preview.exit_crop_mode()
+            return
+        if preview.enter_crop_mode():
+            self.status_bar.showMessage("裁剪模式：在冻结帧上拖动裁剪框(播放/跳帧自动退出)")
+        else:
+            self.timeline.set_crop_mode_checked(False)
+            self.status_bar.showMessage("请先加载素材再进入裁剪模式")
+
+    def _on_preview_crop_mode_changed(self, preview, enabled: bool):
+        """预览器裁剪模式变化(含播放/跳帧自动退出)→ 同步时间轴按钮。"""
+        if self._timeline_preview is preview:
+            self.timeline.set_crop_mode_checked(enabled)
 
     def _on_preview_load_failed(self, which: str, message: str):
         """异步视频加载失败(元数据探测/启动失败信号)——聚合后弹一次警告。"""

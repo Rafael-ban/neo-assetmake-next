@@ -89,24 +89,20 @@ class _PreviewLabel(QLabel):
 
 
 class _MpvSurface(QWidget):
+    """Bare native host window for mpv's --wid embedding.
+
+    mpv creates its own child window filling this HWND (mpv manual, --wid):
+    that child receives the paint and mouse traffic, so QPainter overlays
+    drawn here are occluded and Qt mouse handlers never fire. Crop editing
+    therefore happens on a frozen frame on the QLabel page (crop mode)
+    instead of over the live video.
+    """
+
     def __init__(self, owner: "VideoPreviewWidget"):
         super().__init__(owner)
         self._owner = owner
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        self._owner._paint_cropbox(self)
-
-    def mousePressEvent(self, event: QMouseEvent):
-        self._owner._handle_mouse_press(self, event)
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        self._owner._handle_mouse_move(self, event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        self._owner._handle_mouse_release(event)
 
 
 class VideoPreviewWidget(QWidget):
@@ -118,6 +114,7 @@ class VideoPreviewWidget(QWidget):
     video_loaded = pyqtSignal(int, float)
     load_failed = pyqtSignal(str)  # async metadata probe / mpv launch failure
     rotation_changed = pyqtSignal(int)
+    crop_mode_changed = pyqtSignal(bool)  # still-frame crop mode entered/left
 
     DRAG_NONE = 0
     DRAG_MOVE = 1
@@ -157,6 +154,7 @@ class VideoPreviewWidget(QWidget):
         # timer dies with the widget and can never fire into a deleted object.
         self._ipc_retry_timer: Optional[QTimer] = None
         self._ipc_retry_epoch = 0
+        self._crop_mode = False  # editing the crop on a frozen frame (page 0)
         self._media_toolchain = MediaToolchain.discover()
         self._has_video = False
         self._loop_frame: Optional[np.ndarray] = None
@@ -552,6 +550,7 @@ class VideoPreviewWidget(QWidget):
 
         self._load_epoch += 1
         epoch = self._load_epoch
+        self._reset_crop_mode()
         self._stop_reader_thread()
         self.pause()
         self._loop_frame = None
@@ -663,6 +662,7 @@ class VideoPreviewWidget(QWidget):
 
     def _load_static_frame(self, frame: np.ndarray) -> bool:
         self._load_epoch += 1  # invalidate pending probe/retry continuations
+        self._reset_crop_mode()
         self.pause()
         self._stop_reader_thread()
         self._loop_frame = None
@@ -820,6 +820,8 @@ class VideoPreviewWidget(QWidget):
         self._update_info_label()
 
     def play(self):
+        if self._crop_mode:
+            self.exit_crop_mode()  # back to the live video before playback
         if self.is_playing or not (self._has_video or self._loop_frame is not None):
             return
         if self._mpv_process is not None:
@@ -848,6 +850,8 @@ class VideoPreviewWidget(QWidget):
             self.play()
 
     def next_frame(self):
+        if self._crop_mode:
+            self.exit_crop_mode()
         if not (self._has_video or self._loop_frame is not None):
             return
         self.pause()
@@ -859,6 +863,8 @@ class VideoPreviewWidget(QWidget):
         self._update_info_label()
 
     def prev_frame(self):
+        if self._crop_mode:
+            self.exit_crop_mode()
         if not (self._has_video or self._loop_frame is not None):
             return
         self.pause()
@@ -868,6 +874,8 @@ class VideoPreviewWidget(QWidget):
         self._update_info_label()
 
     def seek_to_frame(self, index: int):
+        if self._crop_mode:
+            self.exit_crop_mode()
         if not (self._has_video or self._loop_frame is not None):
             return
         self.pause()
@@ -985,6 +993,56 @@ class VideoPreviewWidget(QWidget):
             self.request_screenshot(callback)
             return
         callback(self.current_frame)
+
+    def is_crop_mode(self) -> bool:
+        return self._crop_mode
+
+    def enter_crop_mode(self) -> bool:
+        """裁剪模式：冻结当前帧到 QLabel 页并在其上编辑裁剪框。
+
+        mpv 经 ``--wid`` 嵌入时在本控件内创建自己的子窗口(mpv 手册,--wid)：
+        QPainter 覆盖层被其遮挡、鼠标事件也进不了 Qt——活视频上的裁剪交互
+        整体失效,因此裁剪在暂停后的截图帧上进行(复用静态图页已工作的
+        绘制/拖拽路径)。返回 True 表示已进入或已受理(mpv 截图为异步)。
+        """
+        if self._crop_mode:
+            return True
+        if self._mpv_process is None or not self._mpv_ipc_connected:
+            # 静态图 / 图片循环本就显示在 QLabel 页,裁剪路径已经可用。
+            if self.current_frame is not None:
+                self._crop_mode = True
+                self.crop_mode_changed.emit(True)
+                self._refresh_display()
+                return True
+            return False
+        self.pause()
+        epoch = self._load_epoch
+
+        def _on_shot(frame):
+            if frame is None or epoch != self._load_epoch or self._crop_mode:
+                return
+            self._crop_mode = True
+            self._display_stack.setCurrentIndex(0)
+            self._display_frame(frame)
+            self.crop_mode_changed.emit(True)
+
+        self.request_screenshot(_on_shot)
+        return True
+
+    def exit_crop_mode(self):
+        if not self._crop_mode:
+            return
+        self._crop_mode = False
+        if self._mpv_process is not None:
+            self._display_stack.setCurrentIndex(self._mpv_page_index)
+            self._refresh_display()
+        self.crop_mode_changed.emit(False)
+
+    def _reset_crop_mode(self):
+        """New media/clear invalidates any frozen-frame crop session."""
+        if self._crop_mode:
+            self._crop_mode = False
+            self.crop_mode_changed.emit(False)
 
     def get_current_frame(self) -> int:
         return self.current_frame_index
@@ -1215,6 +1273,7 @@ class VideoPreviewWidget(QWidget):
 
     def clear(self, sync_shutdown: bool = False):
         self._load_epoch += 1  # invalidate pending probe/retry continuations
+        self._reset_crop_mode()
         self.pause()
         self._stop_reader_thread(sync_shutdown=sync_shutdown)
         self._loop_frame = None
