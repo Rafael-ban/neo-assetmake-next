@@ -3558,48 +3558,45 @@ class MainWindow(QMainWindow):
             return
 
         current_tab = self.preview_tabs.currentIndex()
-        logger.info(f"当前标签页: {current_tab}")
-
         if current_tab == 3:
             source_preview = self.video_preview
         else:
             source_preview = self.intro_preview
 
-        logger.info(f"选择视频预览器: {type(source_preview).__name__}")
-
-        frame = source_preview.current_frame
-        logger.info(f"当前帧: {frame}")
-
-        if frame is None:
-            logger.info("当前帧为 None，尝试另一个预览器")
+        if source_preview.current_frame is None:
             other = self.video_preview if source_preview is self.intro_preview else self.intro_preview
-            frame = other.current_frame
-            logger.info(f"另一个预览器的当前帧: {frame}")
             if other.current_frame is not None:
                 source_preview = other
-                logger.info(f"切换到另一个预览器: {type(source_preview).__name__}")
 
-        if frame is None:
+        if source_preview.current_frame is None:
             logger.warning("所有预览器的当前帧都为 None，显示警告")
             QMessageBox.warning(self, "警告", "请先加载视频")
             return
 
+        # mpv 渲染在自己的子窗口里，控件内存中的帧只是占位符——先通过 IPC 把
+        # 真实帧读回来（截图回填），拿到后再继续原有流程。
+        def _deliver(frame):
+            if frame is None:
+                logger.warning("截取视频帧失败：未能从 mpv 读回当前帧")
+                QMessageBox.warning(self, "警告", "截取视频帧失败，请稍后重试")
+                return
+            self._finish_capture_frame(source_preview, frame)
+
+        source_preview.capture_frame_async(_deliver)
+
+    def _finish_capture_frame(self, source_preview, frame):
+        """截取帧就绪：旋转后载入截取帧编辑页并切换标签。"""
         from gui.widgets.video_preview import VideoPreviewWidget
 
         frame = frame.copy()
         rotation = source_preview.get_rotation()
-        logger.info(f"旋转变换: {rotation}度")
         frame = VideoPreviewWidget.apply_rotation_to_frame(frame, rotation)
 
         logger.info(f"加载到截取帧编辑预览，帧尺寸: {frame.shape}")
         self.frame_capture_preview.load_static_image_from_array(frame)
 
         self._current_video_preview = source_preview
-
-        logger.info("连接时间轴到原始视频预览器")
         self._connect_timeline_to_preview(source_preview)
-
-        logger.info("切换到截取帧编辑标签页")
         self.preview_tabs.setCurrentIndex(1)
 
         logger.info("截取视频帧完成")

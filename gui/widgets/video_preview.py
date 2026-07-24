@@ -122,8 +122,11 @@ class VideoPreviewWidget(QWidget):
         self._mpv_ipc_server = ""
         self._mpv_ipc_attempts = 0  # async IPC-connect retry counter
         self._mpv_ipc_connected = False  # True once the IPC socket has connected
-        self._pending_mpv_cmds: list = []  # commands issued before the socket connected
+        self._pending_mpv_cmds: list = []  # (command, on_reply) queued before connect
         self._mpv_read_buf = b""  # partial JSON-IPC line buffer
+        self._mpv_request_id = 0  # monotonically increasing JSON-IPC request_id
+        self._mpv_reply_callbacks: dict = {}  # request_id -> on_reply callable
+        self._screenshot_refresh_timer: Optional[QTimer] = None
         self._media_toolchain = MediaToolchain.discover()
         self._has_video = False
         self._loop_frame: Optional[np.ndarray] = None
@@ -216,6 +219,10 @@ class VideoPreviewWidget(QWidget):
                 pass
         self._mpv_socket = None
         self._mpv_process = None
+        # Pending replies can never arrive once the socket is gone.
+        self._mpv_reply_callbacks = {}
+        if self._screenshot_refresh_timer is not None:
+            self._screenshot_refresh_timer.stop()
         try:
             if socket is not None:
                 socket.disconnectFromServer()
@@ -231,17 +238,26 @@ class VideoPreviewWidget(QWidget):
         except Exception as exc:
             logger.debug("mpv shutdown failed: %s", exc)
 
-    def _send_mpv_command(self, command: list):
+    def _send_mpv_command(self, command: list, on_reply=None):
         if self._mpv_socket is None or \
                 self._mpv_socket.state() != QLocalSocket.LocalSocketState.ConnectedState:
             # Not connected yet: queue so an early seek/pause/rotate issued during the
             # async connect window isn't silently lost. Bound the queue so a mpv that
             # never connects can't grow it without limit.
             if self._mpv_process is not None:
-                self._pending_mpv_cmds.append(command)
+                self._pending_mpv_cmds.append((command, on_reply))
                 del self._pending_mpv_cmds[:-32]
             return
-        payload = json.dumps({"command": command}, separators=(",", ":"))
+        # mpv echoes request_id in the reply together with an "error" field, so
+        # replies can be correlated to callers and failures logged instead of
+        # being silently dropped.
+        self._mpv_request_id += 1
+        request_id = self._mpv_request_id
+        if on_reply is not None:
+            self._mpv_reply_callbacks[request_id] = on_reply
+        payload = json.dumps(
+            {"command": command, "request_id": request_id}, separators=(",", ":")
+        )
         self._mpv_socket.write((payload + "\n").encode("utf-8"))
         self._mpv_socket.waitForBytesWritten(100)
 
@@ -271,6 +287,10 @@ class VideoPreviewWidget(QWidget):
             "--pause=yes",
             f"--input-ipc-server={self._mpv_ipc_server}",
             "--osc=no",
+            # Software screenshot rendering: works VO-independently, so
+            # screenshot-to-file succeeds both under --wid embedding and the
+            # headless --vo=null branch (mpv manual, --screenshot-sw).
+            "--screenshot-sw=yes",
         ]
         if is_headless:
             args.extend(["--force-window=no", "--ao=null", "--vo=null"])
@@ -297,6 +317,7 @@ class VideoPreviewWidget(QWidget):
         self._mpv_ipc_connected = False
         self._pending_mpv_cmds = []
         self._mpv_read_buf = b""
+        self._mpv_reply_callbacks = {}
         self._try_mpv_ipc_connect()
 
     def _try_mpv_ipc_connect(self):
@@ -323,8 +344,8 @@ class VideoPreviewWidget(QWidget):
             self._send_mpv_command(["set_property", "video-rotate", self._rotation])
         # Flush commands that were queued before the socket connected (early seek/pause).
         pending, self._pending_mpv_cmds = self._pending_mpv_cmds, []
-        for cmd in pending:
-            self._send_mpv_command(cmd)
+        for cmd, on_reply in pending:
+            self._send_mpv_command(cmd, on_reply)
 
     def _on_mpv_readable(self):
         """Drain mpv JSON-IPC lines and dispatch them (Pc: time-pos observation)."""
@@ -345,6 +366,20 @@ class VideoPreviewWidget(QWidget):
     def _handle_mpv_message(self, msg: dict):
         """Handle one parsed mpv IPC message; drive the frame counter from time-pos."""
         if not isinstance(msg, dict):
+            return
+        request_id = msg.get("request_id")
+        if request_id is not None:
+            callback = self._mpv_reply_callbacks.pop(request_id, None)
+            error = msg.get("error")
+            if error not in (None, "success"):
+                logger.warning(
+                    "mpv command failed (request_id=%s): %s", request_id, error
+                )
+            if callback is not None:
+                try:
+                    callback(msg)
+                except Exception:
+                    logger.exception("mpv reply callback raised")
             return
         if msg.get("event") == "property-change" and msg.get("name") == "time-pos":
             data = msg.get("data")
@@ -660,6 +695,9 @@ class VideoPreviewWidget(QWidget):
         self.timer.stop()
         if self._mpv_process is not None:
             self._send_mpv_command(["set_property", "pause", True])
+            # Refresh current_frame shortly after pausing so capture/crop tools
+            # see the real frame instead of the load-time placeholder.
+            self._schedule_screenshot_refresh()
         was_playing = self.is_playing
         self.is_playing = False
         if was_playing:
@@ -705,6 +743,97 @@ class VideoPreviewWidget(QWidget):
             return
         seconds = self.current_frame_index / self.video_fps
         self._send_mpv_command(["seek", seconds, "absolute+exact"])
+        self._schedule_screenshot_refresh()
+
+    def request_screenshot(self, callback=None, _attempts_left: int = 5) -> bool:
+        """Read the current mpv frame back into ``current_frame`` via a temp PNG.
+
+        mpv renders into its own child window, so the widget never sees pixels
+        unless it asks mpv to write them out (`screenshot-to-file <file> video`
+        = the video frame without OSD/subtitles). ``callback(frame | None)``
+        fires once the reply arrives. Returns False when no mpv IPC session is
+        available (callback still fires with None).
+        """
+        if not HAS_CV2 or self._mpv_process is None or not self._mpv_ipc_connected:
+            if callback is not None:
+                callback(None)
+            return False
+        shot_path = os.path.join(
+            tempfile.gettempdir(), f"neo_mpv_shot_{uuid.uuid4().hex}.png"
+        )
+
+        def _on_reply(msg: dict):
+            frame = None
+            try:
+                if msg.get("error") == "success" and os.path.exists(shot_path):
+                    data = np.fromfile(shot_path, dtype=np.uint8)
+                    decoded = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                    if decoded is not None:
+                        # mpv bakes video-rotate into the screenshot (verified
+                        # against the bundled mpv v0.41: 240x360 becomes 360x240
+                        # after video-rotate=90). current_frame must stay in
+                        # SOURCE orientation like the static-image path, so
+                        # undo the rotation here.
+                        if self._rotation:
+                            decoded = self.apply_rotation_to_frame(
+                                decoded, (360 - self._rotation) % 360
+                            )
+                        frame = decoded
+            finally:
+                try:
+                    if os.path.exists(shot_path):
+                        os.remove(shot_path)
+                except OSError:
+                    pass
+            if frame is None and _attempts_left > 0:
+                # mpv rejects screenshot commands with "error running command"
+                # until the file has finished loading (observed right after
+                # IPC connect on the bundled mpv v0.41) — retry briefly
+                # instead of failing the capture.
+                QTimer.singleShot(
+                    200,
+                    lambda: self.request_screenshot(callback, _attempts_left - 1),
+                )
+                return
+            if frame is not None:
+                self.current_frame = frame
+            if callback is not None:
+                callback(frame)
+
+        self._send_mpv_command(["screenshot-to-file", shot_path, "video"], _on_reply)
+        return True
+
+    def _schedule_screenshot_refresh(self, delay_ms: int = 150):
+        """Debounced current_frame refresh after pause/seek (mpv sessions only)."""
+        if self._mpv_process is None:
+            return
+        if self._screenshot_refresh_timer is None:
+            self._screenshot_refresh_timer = QTimer(self)
+            self._screenshot_refresh_timer.setSingleShot(True)
+            self._screenshot_refresh_timer.timeout.connect(
+                self._on_screenshot_refresh_due
+            )
+        self._screenshot_refresh_timer.start(delay_ms)
+
+    def _on_screenshot_refresh_due(self):
+        if self._mpv_process is None or not self._mpv_ipc_connected:
+            return
+        self.request_screenshot(None)
+
+    def capture_frame_async(self, callback):
+        """Deliver the current frame (source orientation) to ``callback``.
+
+        mpv-backed video pauses and reads the frame back over IPC; static
+        images / image loops already hold the frame in memory.
+        """
+        if self._mpv_process is not None and self._mpv_ipc_connected:
+            self.pause()
+            if self._screenshot_refresh_timer is not None:
+                # The explicit capture below supersedes the debounced refresh.
+                self._screenshot_refresh_timer.stop()
+            self.request_screenshot(callback)
+            return
+        callback(self.current_frame)
 
     def get_current_frame(self) -> int:
         return self.current_frame_index

@@ -123,6 +123,8 @@ class MpvAffinityTests(unittest.TestCase):
         holder._mpv_socket = None
         holder._mpv_ipc_server = ""
         holder._mpv_ipc_attempts = 0
+        holder._mpv_reply_callbacks = {}
+        holder._screenshot_refresh_timer = None
         holder._rotation = 0
         holder._mpv_page_index = 0
         holder._display_stack = types.SimpleNamespace(setCurrentIndex=lambda i: None)

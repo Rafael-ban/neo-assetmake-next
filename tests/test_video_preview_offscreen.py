@@ -62,7 +62,10 @@ class MpvPlaybackSyncTests(unittest.TestCase):
         cls = self._preview_cls()
         holder = types.SimpleNamespace(_mpv_socket=None, _mpv_process=object(), _pending_mpv_cmds=[])
         cls._send_mpv_command(holder, ["seek", 1.0, "absolute+exact"])
-        self.assertEqual(holder._pending_mpv_cmds, [["seek", 1.0, "absolute+exact"]])
+        # S1: the queue carries (command, on_reply) so callbacks survive the wait.
+        self.assertEqual(
+            holder._pending_mpv_cmds, [(["seek", 1.0, "absolute+exact"], None)]
+        )
 
     def test_time_pos_property_change_drives_frame_counter(self):
         cls = self._preview_cls()
