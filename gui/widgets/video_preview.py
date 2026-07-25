@@ -133,7 +133,6 @@ class VideoPreviewWidget(QWidget):
         self.current_frame_index = 0
         self.current_frame: Optional[np.ndarray] = None
 
-        self._reader_thread = None
         self._mpv_process: Optional[QProcess] = None
         self._mpv_socket: Optional[QLocalSocket] = None
         self._mpv_ipc_server = ""
@@ -161,8 +160,6 @@ class VideoPreviewWidget(QWidget):
         self._preview_mode = False
         self._epconfig: Optional["EPConfig"] = None
         self._overlay_renderer = None
-        self._use_gl = False
-        self._gl_renderer = None
         self._rotation = 0
 
         self.is_playing = False
@@ -224,15 +221,8 @@ class VideoPreviewWidget(QWidget):
         )
         layout.addWidget(self.info_label)
 
-    def _stop_reader_thread(self, sync_shutdown: bool = False):
+    def _teardown_media(self, sync_shutdown: bool = False):
         self._stop_mpv_process(sync=sync_shutdown)
-        if self._reader_thread is not None:
-            try:
-                self._reader_thread.request_stop()
-                self._reader_thread.wait(1000)
-            except Exception:
-                pass
-            self._reader_thread = None
         self._has_video = False
 
     def _stop_mpv_process(self, sync: bool = False):
@@ -551,7 +541,7 @@ class VideoPreviewWidget(QWidget):
         self._load_epoch += 1
         epoch = self._load_epoch
         self._reset_crop_mode()
-        self._stop_reader_thread()
+        self._teardown_media()
         self.pause()
         self._loop_frame = None
         self._has_video = False
@@ -664,7 +654,7 @@ class VideoPreviewWidget(QWidget):
         self._load_epoch += 1  # invalidate pending probe/retry continuations
         self._reset_crop_mode()
         self.pause()
-        self._stop_reader_thread()
+        self._teardown_media()
         self._loop_frame = None
         self._display_stack.setCurrentIndex(0)
         self.video_width = frame.shape[1]
@@ -1053,9 +1043,6 @@ class VideoPreviewWidget(QWidget):
     def get_cropbox_in_rotated_space(self) -> Tuple[int, int, int, int]:
         return tuple(self.cropbox)
 
-    def get_cropbox_for_export(self) -> Tuple[int, int, int, int]:
-        return self._cropbox_to_original_coords(*self.cropbox)
-
     def set_cropbox(self, x: int, y: int, w: int, h: int):
         self.cropbox = [x, y, w, h]
         self._bound_cropbox()
@@ -1071,11 +1058,6 @@ class VideoPreviewWidget(QWidget):
 
     def is_preview_mode(self) -> bool:
         return self._preview_mode
-
-    def set_use_gl(self, enabled: bool):
-        self._use_gl = False
-        if enabled:
-            logger.debug("OpenGL preview path is retired for mpv playback")
 
     def set_rotation(self, degrees: int):
         # Snap to a cardinal angle: mpv video-rotate and the VapourSynth export only
@@ -1299,7 +1281,7 @@ class VideoPreviewWidget(QWidget):
         self._load_epoch += 1  # invalidate pending probe/retry continuations
         self._reset_crop_mode()
         self.pause()
-        self._stop_reader_thread(sync_shutdown=sync_shutdown)
+        self._teardown_media(sync_shutdown=sync_shutdown)
         self._loop_frame = None
         self.video_path = ""
         self.total_frames = 0

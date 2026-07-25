@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-import struct
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Tuple
@@ -27,6 +26,32 @@ from core.media_pipeline import MediaEncoder, write_vpy_script
 from core.media_tools import MediaToolchain
 
 logger = logging.getLogger(__name__)
+
+
+def _to_bgra_bytes_source(mat: np.ndarray) -> np.ndarray:
+    """Rotate 180° and return a contiguous BGRA uint8 array for .argb output.
+
+    Matches the old per-pixel writer exactly: rotate first, then emit
+    B,G,R,A per pixel (grayscale replicated across BGR, alpha defaults 255).
+    """
+    if HAS_CV2:
+        mat = cv2.rotate(mat, cv2.ROTATE_180)
+    else:
+        mat = np.rot90(mat, 2)
+    mat = mat.astype(np.uint8)
+    if mat.ndim == 2:  # grayscale
+        h, w = mat.shape
+        bgra = np.empty((h, w, 4), np.uint8)
+        bgra[..., 0] = bgra[..., 1] = bgra[..., 2] = mat
+        bgra[..., 3] = 255
+    elif mat.shape[2] == 4:
+        bgra = mat
+    else:  # 3-channel BGR
+        h, w = mat.shape[:2]
+        bgra = np.empty((h, w, 4), np.uint8)
+        bgra[..., :3] = mat[..., :3]
+        bgra[..., 3] = 255
+    return np.ascontiguousarray(bgra)
 
 
 class ExportType(Enum):
@@ -179,28 +204,19 @@ class ExportWorker(QThread):
             fh.write(encoded.tobytes())
 
     def _export_argb(self, output_path: str, mat: np.ndarray) -> None:
-        if HAS_CV2:
-            mat = cv2.rotate(mat, cv2.ROTATE_180)
-        else:
-            mat = np.rot90(mat, 2)
-        mat = mat.astype(np.uint8)
-        height, width = mat.shape[:2]
-        channels = mat.shape[-1] if len(mat.shape) == 3 else 1
-
+        # The 180° rotation and the B,G,R,A byte layout are the device
+        # framebuffer contract (the overlay plane is the SCREEN size, 360-wide,
+        # per simulator/src/config/firmware_config.rs). This is a vectorized
+        # rewrite of the old per-pixel struct.pack loop — byte-identical output,
+        # seconds -> milliseconds on a 720p overlay.
+        bgra = _to_bgra_bytes_source(mat)
         with open(output_path, "wb") as fh:
-            for y in range(height):
+            rows = bgra.shape[0]
+            band = max(1, rows // 16)  # keep cancellation responsive on big screens
+            for start in range(0, rows, band):
                 if self._cancelled:
                     raise InterruptedError("Export cancelled")
-                for x in range(width):
-                    if channels == 4:
-                        b, g, r, a = mat[y, x]
-                    elif channels == 3:
-                        b, g, r = mat[y, x]
-                        a = 255
-                    else:
-                        b = g = r = mat[y, x]
-                        a = 255
-                    fh.write(struct.pack("BBBB", int(b), int(g), int(r), int(a)))
+                fh.write(bgra[start:start + band].tobytes())
 
     def _export_video(
         self,

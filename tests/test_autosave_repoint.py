@@ -52,6 +52,7 @@ class AutoSaveRepointTests(unittest.TestCase):
             w._check_save = lambda: True
             w._cleanup_temp_dir = _null
             w._update_title = _null
+            w._reset_undo_history = _null  # undo subsystem out of scope here
             for name in ("video_preview", "intro_preview", "frame_capture_preview"):
                 setattr(w, name, types.SimpleNamespace(
                     clear=_null, set_epconfig=_null))

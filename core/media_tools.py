@@ -163,25 +163,17 @@ class MediaToolchain:
 
     @classmethod
     def discover(cls, app_dir: Optional[os.PathLike[str] | str] = None) -> "MediaToolchain":
-        root = Path(app_dir) if app_dir is not None else Path(get_app_dir())
-        return cls(
-            mpv_path=_find_tool(root, _exe_names("mpv")),
-            vspipe_path=_find_tool(root, _exe_names("VSPipe")),
-            x264_path=_find_tool(root, ("x264-7mod.exe", "x264-7mod", "x264.exe", "x264")),
-            muxer_path=_find_tool(
-                root,
-                (
-                    "MP4Box.exe",
-                    "MP4Box",
-                    "mp4box.exe",
-                    "mp4box",
-                    "lsmash-muxer.exe",
-                    "lsmash-muxer",
-                    "muxer.exe",
-                    "muxer",
-                ),
-            ),
-        )
+        # Memoized: discover() runs dozens of Path.is_file() stats and used to be
+        # called 2-3x per video load (preview + probe + export). Cache per resolved
+        # root; call MediaToolchain.refresh() after installing tools at runtime.
+        root = str(Path(app_dir)) if app_dir is not None else str(Path(get_app_dir()))
+        return _discover_cached(root)
+
+    @staticmethod
+    def refresh() -> None:
+        """Clear the discovery + VapourSynth-plugin caches (e.g. after install)."""
+        _discover_cached.cache_clear()
+        _missing_vapoursynth_plugins.cache_clear()
 
     def missing_for_export(self) -> list[str]:
         missing = []
@@ -206,3 +198,26 @@ class MediaToolchain:
             "MP4 muxer": self.muxer_path,
         }
         return ", ".join(f"{name}={'found' if path else 'missing'}" for name, path in parts.items())
+
+
+@lru_cache(maxsize=8)
+def _discover_cached(root: str) -> MediaToolchain:
+    base = Path(root)
+    return MediaToolchain(
+        mpv_path=_find_tool(base, _exe_names("mpv")),
+        vspipe_path=_find_tool(base, _exe_names("VSPipe")),
+        x264_path=_find_tool(base, ("x264-7mod.exe", "x264-7mod", "x264.exe", "x264")),
+        muxer_path=_find_tool(
+            base,
+            (
+                "MP4Box.exe",
+                "MP4Box",
+                "mp4box.exe",
+                "mp4box",
+                "lsmash-muxer.exe",
+                "lsmash-muxer",
+                "muxer.exe",
+                "muxer",
+            ),
+        ),
+    )

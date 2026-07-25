@@ -106,6 +106,7 @@ class EditorSyncTests(unittest.TestCase):
         w._snapshot_active_timeline_state = lambda: None
         w._is_modified = False
         w._update_title = lambda: None
+        w._mark_undo_change = lambda: None  # undo subsystem out of scope here
         return w
 
     def test_change_writes_config_and_marks_dirty(self):

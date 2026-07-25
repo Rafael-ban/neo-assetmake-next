@@ -91,6 +91,15 @@ class MainWindow(QMainWindow):
         self._undo_stack = []
         self._redo_stack = []
         self._max_history = 50  # 最大历史记录数
+        # Undo baseline = last committed config dict. Edits are coalesced into
+        # one undo step per ~800ms burst via a debounce timer (avoids one step
+        # per keystroke). Snapshots include the editor section (crop/rotation/
+        # trim), so those are undoable too.
+        self._undo_baseline: dict = {}
+        self._undo_timer = QTimer(self)
+        self._undo_timer.setSingleShot(True)
+        self._undo_timer.timeout.connect(self._commit_undo_snapshot)
+        self._applying_undo = False
 
         self._recent_files = []
         self._max_recent_files = 10  # 最多保留10个最近文件
@@ -1070,6 +1079,7 @@ class MainWindow(QMainWindow):
 
         self._auto_save_service.start(
             self._config, self._project_path, self._base_dir)
+        self._reset_undo_history()
 
     def _cleanup_temp_dir(self):
         """清理临时项目目录"""
@@ -1170,6 +1180,7 @@ class MainWindow(QMainWindow):
         # 崩溃恢复也会指向错误的项目。
         self._auto_save_service.start(
             self._config, self._project_path, self._base_dir)
+        self._reset_undo_history()
         self._update_title()
         self.status_bar.showMessage(f"新建项目: {dir_path}")
 
@@ -1270,6 +1281,7 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"已打开: {self._project_path}")
         self._auto_save_service.start(
             self._config, self._project_path, self._base_dir)
+        self._reset_undo_history()
 
     def _load_project(self, path: str):
         """加载指定路径的项目文件（供最近打开和崩溃恢复调用）"""
@@ -1868,71 +1880,135 @@ class MainWindow(QMainWindow):
 
         self._update_recent_menu()
 
+    def _reset_undo_history(self):
+        """Reset the undo baseline to the current config (project open/new)."""
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._undo_baseline = self._config.to_dict() if self._config else {}
+        self._undo_timer.stop()
+        self._set_undo_redo_enabled()
+
+    def _mark_undo_change(self):
+        """An edit happened — (re)start the debounce that coalesces the burst."""
+        if self._applying_undo or not self._config:
+            return
+        self._undo_timer.start(800)
+
+    def _commit_undo_snapshot(self):
+        """Debounce fired: push the pre-burst baseline as one undo step."""
+        if not self._config:
+            return
+        current = self._config.to_dict()
+        if current == self._undo_baseline:
+            return  # nothing actually changed
+        self._undo_stack.append(self._undo_baseline)
+        if len(self._undo_stack) > self._max_history:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self._undo_baseline = current
+        self._set_undo_redo_enabled()
+
     def _on_undo(self):
         """撤销操作"""
+        # Flush a pending debounce so an in-flight burst becomes undoable first.
+        if self._undo_timer.isActive():
+            self._undo_timer.stop()
+            self._commit_undo_snapshot()
         if not self._undo_stack:
             return
-
         prev_state = self._undo_stack.pop()
-
-        current_state = self._config.to_dict() if self._config else {}
-        self._redo_stack.append(current_state)
-
-        if prev_state:
-            self._config = EPConfig.from_dict(prev_state)
-            self._update_ui_from_config()
-
-        self.action_undo.setEnabled(len(self._undo_stack) > 0)
-        self.action_redo.setEnabled(len(self._redo_stack) > 0)
-        self.menu_action_undo.setEnabled(len(self._undo_stack) > 0)
-        self.menu_action_redo.setEnabled(len(self._redo_stack) > 0)
-        self._shortcut_undo.setEnabled(len(self._undo_stack) > 0)
-        self._shortcut_redo.setEnabled(len(self._redo_stack) > 0)
-
+        self._redo_stack.append(self._config.to_dict() if self._config else {})
+        self._apply_undo_state(prev_state)
+        self._undo_baseline = prev_state
+        self._set_undo_redo_enabled()
         self.status_bar.showMessage("已撤销", 2000)
 
     def _on_redo(self):
         """重做操作"""
         if not self._redo_stack:
             return
-
         next_state = self._redo_stack.pop()
-
-        current_state = self._config.to_dict() if self._config else {}
-        self._undo_stack.append(current_state)
-
-        if next_state:
-            self._config = EPConfig.from_dict(next_state)
-            self._update_ui_from_config()
-
-        self.action_undo.setEnabled(len(self._undo_stack) > 0)
-        self.action_redo.setEnabled(len(self._redo_stack) > 0)
-        self.menu_action_undo.setEnabled(len(self._undo_stack) > 0)
-        self.menu_action_redo.setEnabled(len(self._redo_stack) > 0)
-        self._shortcut_undo.setEnabled(len(self._undo_stack) > 0)
-        self._shortcut_redo.setEnabled(len(self._redo_stack) > 0)
-
+        self._undo_stack.append(self._config.to_dict() if self._config else {})
+        self._apply_undo_state(next_state)
+        self._undo_baseline = next_state
+        self._set_undo_redo_enabled()
         self.status_bar.showMessage("已重做", 2000)
 
-    def _save_state(self):
-        """保存当前状态到撤销栈"""
-        if not self._config:
+    def _apply_undo_state(self, state: dict):
+        """Restore a config snapshot to the model, panels and previews.
+
+        A media file is reloaded only when its path actually changed between
+        snapshots; otherwise the still-loaded preview just has its editor state
+        (crop/rotation/trim) re-applied.
+        """
+        if not state:
             return
+        old_loop = self._config.loop.file if self._config else ""
+        old_intro = self._config.intro.file if self._config else ""
+        old_loop_is_image = self._config.loop.is_image if self._config else False
 
-        current_state = self._config.to_dict()
-        self._undo_stack.append(current_state)
+        self._applying_undo = True
+        try:
+            self._config = EPConfig.from_dict(state)
+            self._update_ui_from_config()  # panels + json + set_epconfig
 
-        if len(self._undo_stack) > self._max_history:
-            self._undo_stack.pop(0)
+            self._apply_undo_track(
+                self.video_preview, self._config.editor.loop,
+                old_loop, self._config.loop.file,
+                is_image=self._config.loop.is_image,
+                image_changed=old_loop_is_image != self._config.loop.is_image,
+            )
+            self._apply_undo_track(
+                self.intro_preview, self._config.editor.intro,
+                old_intro, self._config.intro.file if self._config.intro.enabled else "",
+                is_image=False, image_changed=False,
+            )
+        finally:
+            self._applying_undo = False
 
-        self._redo_stack.clear()
+    def _apply_undo_track(self, preview, track, old_file, new_file, *,
+                          is_image, image_changed):
+        resolved_new = self._resolve_media_path(new_file) if new_file else ""
+        if (old_file != new_file or image_changed) and resolved_new and os.path.exists(resolved_new):
+            # File changed: reload; _finish_editor_restore re-applies the crop
+            # after the (async) load via the pending-restore machinery.
+            self._begin_editor_restore(preview, track)
+            if is_image:
+                self._load_loop_image(resolved_new)
+            elif not preview.load_video(resolved_new):
+                self._cancel_editor_restore(preview)
+        elif new_file and self._preview_has_loaded_media(preview):
+            # Same file still loaded: re-apply the editor state directly.
+            self._restoring_editor_state = True
+            try:
+                if track.rotation != preview.get_rotation():
+                    preview.set_rotation(track.rotation)
+                if track.crop:
+                    preview.set_cropbox(*track.crop)
+                if 0 <= track.in_frame <= track.out_frame:
+                    total = max(1, int(getattr(preview, "total_frames", 1)))
+                    in_f, out_f = min(track.in_frame, total - 1), min(track.out_frame, total - 1)
+                    if preview is self.video_preview:
+                        self._loop_in_out = (in_f, out_f)
+                    else:
+                        self._intro_in_out = (in_f, out_f)
+                    if self._is_timeline_bound_to(preview):
+                        self.timeline.set_in_point(in_f)
+                        self.timeline.set_out_point(out_f)
+            finally:
+                self._restoring_editor_state = False
 
-        self.action_undo.setEnabled(len(self._undo_stack) > 0)
-        self.action_redo.setEnabled(False)
-        self.menu_action_undo.setEnabled(len(self._undo_stack) > 0)
-        self.menu_action_redo.setEnabled(False)
-        self._shortcut_undo.setEnabled(len(self._undo_stack) > 0)
-        self._shortcut_redo.setEnabled(False)
+    def _set_undo_redo_enabled(self):
+        has_undo = len(self._undo_stack) > 0
+        has_redo = len(self._redo_stack) > 0
+        for attr, enabled in (
+            ("action_undo", has_undo), ("action_redo", has_redo),
+            ("menu_action_undo", has_undo), ("menu_action_redo", has_redo),
+            ("_shortcut_undo", has_undo), ("_shortcut_redo", has_redo),
+        ):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.setEnabled(enabled)
 
     def _update_ui_from_config(self):
         """从配置更新UI"""
@@ -2660,6 +2736,7 @@ class MainWindow(QMainWindow):
         """配置变更"""
         self._is_modified = True
         self._update_title()
+        self._mark_undo_change()
 
         if self._config:
             self.json_preview.set_config(self._config, self._base_dir)
@@ -2785,10 +2862,9 @@ class MainWindow(QMainWindow):
                 self._apply_theme_image(value)
 
         elif setting_name == 'hardware_acceleration':
-            for preview in [self.video_preview, self.intro_preview,
-                            self.frame_capture_preview]:
-                if hasattr(preview, 'set_use_gl'):
-                    preview.set_use_gl(bool(value))
+            # No-op: preview playback is mpv (hardware decode handled internally);
+            # the retired in-process OpenGL renderer had this toggle.
+            pass
 
         elif setting_name == 'scale':
             logger.info(f"界面缩放已设置为: {value}")
@@ -3667,6 +3743,7 @@ class MainWindow(QMainWindow):
         if not self._is_modified:
             self._is_modified = True
             self._update_title()
+        self._mark_undo_change()
 
     def _begin_editor_restore(self, preview, track):
         """打开项目:记录待恢复拷贝并挂起该预览的 editor 同步。"""
