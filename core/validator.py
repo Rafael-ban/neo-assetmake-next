@@ -290,6 +290,19 @@ class EPConfigValidator:
             self._add_result(ValidationLevel.WARNING, "overlay.options.color",
                            f"颜色格式不合法，将使用默认黑色: {color}")
 
+        # 干员名/代号/条码为空时设备会渲染空白 UI —— 之前只校验颜色,空文本
+        # 被静默放行。它们是模板必填项,置为错误让用户在导出前修正。
+        for field, label in (
+            ("operator_name", "干员名称"),
+            ("operator_code", "干员代号"),
+            ("barcode_text", "条码文字"),
+        ):
+            if not str(options.get(field, "")).strip():
+                self._add_result(
+                    ValidationLevel.ERROR, f"overlay.options.{field}",
+                    f"{label}不能为空",
+                )
+
         if self.base_dir:
             if options.get("logo"):
                 self._validate_optional_image("overlay.options.logo", options["logo"])
@@ -299,10 +312,12 @@ class EPConfigValidator:
 
     def _validate_image_overlay(self, options: dict):
         """校验图片叠加UI选项"""
+        # duration == 0 是文档默认值,表示"一直显示"(epconfig.ImageOverlayOptions),
+        # 之前对默认状态也弹警告是误报;只有负值才不合法。
         duration = options.get("duration", 0)
-        if duration <= 0:
-            self._add_result(ValidationLevel.WARNING, "overlay.options.duration",
-                           "duration建议设置大于0")
+        if duration < 0:
+            self._add_result(ValidationLevel.ERROR, "overlay.options.duration",
+                           f"duration 不能为负: {duration}")
         if self.base_dir and options.get("image"):
             self._validate_optional_image("overlay.options.image", options["image"])
 

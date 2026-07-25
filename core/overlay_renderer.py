@@ -224,15 +224,26 @@ class OverlayRenderer:
 
         rot_array = np.array(rotated)
         if rot_array.shape[2] == 4:
-            alpha = rot_array[:, :, 3] / 255.0
-            # RGBA -> BGR for OpenCV
+            # Clip the text box to the frame instead of dropping it wholesale.
+            # The old `region.shape == alpha.shape` guard skipped the ENTIRE
+            # blend whenever the box overran the frame edge, so text placed or
+            # rotated near a border silently vanished. Blend the overlapping
+            # sub-rectangle only.
+            fh, fw = frame.shape[:2]
+            th, tw = rot_array.shape[0], rot_array.shape[1]
+            x0, y0 = max(0, x), max(0, y)
+            x1, y1 = min(fw, x + tw), min(fh, y + th)
+            if x1 <= x0 or y1 <= y0:
+                return  # fully off-frame
+            sx0, sy0 = x0 - x, y0 - y  # source offset into the text array
+            src = rot_array[sy0:sy0 + (y1 - y0), sx0:sx0 + (x1 - x0)]
+            alpha = src[:, :, 3] / 255.0
             for c in range(3):
                 bgr_c = 2 - c  # RGB -> BGR
-                region = frame[y:y + rot_array.shape[0], x:x + rot_array.shape[1], bgr_c]
-                if region.shape == alpha.shape:
-                    frame[y:y + rot_array.shape[0], x:x + rot_array.shape[1], bgr_c] = (
-                        region * (1 - alpha) + rot_array[:, :, c] * alpha
-                    ).astype(np.uint8)
+                region = frame[y0:y1, x0:x1, bgr_c]
+                frame[y0:y1, x0:x1, bgr_c] = (
+                    region * (1 - alpha) + src[:, :, c] * alpha
+                ).astype(np.uint8)
 
     def _draw_transparent_rect(
         self,

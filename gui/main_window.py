@@ -3929,6 +3929,21 @@ class MainWindow(QMainWindow):
                     resolution=self._config.screen.value,
                     rotation=intro_state['rotation']
                 )
+                # 把 intro.duration(µs)校准到实际编码时长:trim 与用户手填的
+                # duration 各自独立,设备按 duration 计时,不一致会导致入场
+                # 卡顿/截断。以修剪后的真实帧数为准写回。
+                fps = float(intro_state['fps'] or 30.0)
+                frames = max(1, int(intro_state['end_frame']) - int(intro_state['start_frame']))
+                if fps > 0:
+                    computed_us = round(frames / fps * 1_000_000)
+                    frame_us = round(1_000_000 / fps)
+                    if abs(self._config.intro.duration - computed_us) > frame_us:
+                        self._config.intro.duration = computed_us
+                        self.status_bar.showMessage(
+                            f"入场时长已按修剪长度校准为 {computed_us/1_000_000:.2f}s")
+                        if not self._is_modified:
+                            self._is_modified = True
+                            self._update_title()
 
         from config.epconfig import OverlayType
         if self._config.overlay.type == OverlayType.IMAGE:
