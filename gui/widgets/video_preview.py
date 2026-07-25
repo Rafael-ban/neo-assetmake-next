@@ -1084,11 +1084,24 @@ class VideoPreviewWidget(QWidget):
         degrees = (round(int(degrees) / 90) * 90) % 360
         if self._rotation == degrees:
             return
+        has_video = self.video_width > 0 and self.video_height > 0
+        # Remap the crop box through the rotation change instead of resetting it
+        # to a default centred rectangle (which silently discarded the user's
+        # crop on every rotate). Map current rotated-space box -> original
+        # coords (using the OLD angle) -> new rotated-space (using the NEW angle).
+        original_box = None
+        if has_video:
+            original_box = self._cropbox_to_original_coords(*self.cropbox)
         self._rotation = degrees
         if self._mpv_process is not None:
             self._send_mpv_command(["set_property", "video-rotate", degrees])
-        if self.video_width > 0 and self.video_height > 0:
-            self._init_cropbox()
+        if has_video:
+            if original_box is not None:
+                self.cropbox = list(self._original_to_rotated_coords(*original_box))
+                self._bound_cropbox()
+                self._emit_cropbox_changed()
+            else:
+                self._init_cropbox()
         self.rotation_changed.emit(degrees)
         self._refresh_display()
 
@@ -1148,14 +1161,25 @@ class VideoPreviewWidget(QWidget):
     def _cropbox_to_original_coords(
         self, x: int, y: int, w: int, h: int
     ) -> Tuple[int, int, int, int]:
-        if self._rotation == 0:
-            return x, y, w, h
+        """Map a crop box from the CURRENT rotated display space to source coords."""
         if self._rotation == 90:
             return y, self.video_height - x - w, h, w
         if self._rotation == 180:
             return self.video_width - x - w, self.video_height - y - h, w, h
         if self._rotation == 270:
             return self.video_width - y - h, x, h, w
+        return x, y, w, h
+
+    def _original_to_rotated_coords(
+        self, x: int, y: int, w: int, h: int
+    ) -> Tuple[int, int, int, int]:
+        """Inverse of _cropbox_to_original_coords for the CURRENT rotation."""
+        if self._rotation == 90:
+            return self.video_height - h - y, x, h, w
+        if self._rotation == 180:
+            return self.video_width - x - w, self.video_height - y - h, w, h
+        if self._rotation == 270:
+            return y, self.video_width - x - w, h, w
         return x, y, w, h
 
     def _display_to_rotated_coords(self, widget: QWidget, pos: QPoint) -> Tuple[int, int]:

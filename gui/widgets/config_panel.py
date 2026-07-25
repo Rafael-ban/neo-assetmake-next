@@ -245,7 +245,10 @@ class ConfigPanel(QWidget):
         intro_layout.addRow("文件:", intro_file_layout)
 
         self.spin_intro_duration = SpinBox()
-        self.spin_intro_duration.setRange(0, 30000000)
+        # Widened from 30s: legitimately longer intros were silently clamped to
+        # the max on load (QSpinBox.setValue clamps to [min,max]) and the clamped
+        # value was then written back on the next edit. 600s stays under INT_MAX µs.
+        self.spin_intro_duration.setRange(0, 600000000)
         self.spin_intro_duration.setSingleStep(100000)
         self.spin_intro_duration.setSuffix(" 微秒")
         self.spin_intro_duration.setValue(5000000)
@@ -277,7 +280,7 @@ class ConfigPanel(QWidget):
         in_layout.addRow("类型:", self.combo_trans_in_type)
 
         self.spin_trans_in_duration = SpinBox()
-        self.spin_trans_in_duration.setRange(0, 5000000)
+        self.spin_trans_in_duration.setRange(0, 30000000)
         self.spin_trans_in_duration.setSingleStep(50000)
         self.spin_trans_in_duration.setValue(500000)
         self.spin_trans_in_duration.setToolTip("进入过渡持续时间(微秒)")
@@ -318,7 +321,7 @@ class ConfigPanel(QWidget):
         loop_layout.addRow("类型:", self.combo_trans_loop_type)
 
         self.spin_trans_loop_duration = SpinBox()
-        self.spin_trans_loop_duration.setRange(0, 5000000)
+        self.spin_trans_loop_duration.setRange(0, 30000000)
         self.spin_trans_loop_duration.setSingleStep(50000)
         self.spin_trans_loop_duration.setValue(500000)
         self.spin_trans_loop_duration.setToolTip("循环过渡持续时间(微秒)")
@@ -386,7 +389,7 @@ class ConfigPanel(QWidget):
         ark_layout = QFormLayout()
 
         self.spin_ark_appear = SpinBox()
-        self.spin_ark_appear.setRange(0, 5000000)
+        self.spin_ark_appear.setRange(0, 600000000)
         self.spin_ark_appear.setValue(100000)
         self.spin_ark_appear.setToolTip("叠加UI出现时间(微秒)")
         ark_layout.addRow("出现时间(微秒):", self.spin_ark_appear)
@@ -488,13 +491,13 @@ class ConfigPanel(QWidget):
         img_layout = QFormLayout()
 
         self.spin_img_appear = SpinBox()
-        self.spin_img_appear.setRange(0, 5000000)
+        self.spin_img_appear.setRange(0, 600000000)
         self.spin_img_appear.setValue(100000)
         self.spin_img_appear.setToolTip("图片叠加出现时间(微秒)")
         img_layout.addRow("出现时间(微秒):", self.spin_img_appear)
 
         self.spin_img_duration = SpinBox()
-        self.spin_img_duration.setRange(0, 5000000)
+        self.spin_img_duration.setRange(0, 600000000)
         self.spin_img_duration.setValue(0)
         self.spin_img_duration.setToolTip("图片叠加持续时间(微秒)")
         img_layout.addRow("持续时间(微秒):", self.spin_img_duration)

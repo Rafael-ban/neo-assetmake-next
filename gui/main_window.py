@@ -492,6 +492,10 @@ class MainWindow(QMainWindow):
         frame_capture_layout.setContentsMargins(0, 0, 0, 0)
         frame_capture_layout.setSpacing(5)
         self.frame_capture_preview = VideoPreviewWidget()
+        # The saved icon is center-cropped to 256x256 by process_for_logo, so the
+        # capture crop box must be square too — otherwise the user frames a tall
+        # 360:640 region but a different centre square is what actually ships.
+        self.frame_capture_preview.set_target_resolution(256, 256)
         frame_capture_layout.addWidget(self.frame_capture_preview, stretch=1)
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -1086,9 +1090,19 @@ class MainWindow(QMainWindow):
             for filename in os.listdir(self._temp_dir):
                 src = os.path.join(self._temp_dir, filename)
                 dst = os.path.join(dest_dir, filename)
-                if os.path.isfile(src) and not os.path.exists(dst):
-                    shutil.copy2(src, dst)
-                    logger.debug(f"已迁移文件: {filename}")
+                if not os.path.isfile(src):
+                    continue
+                if os.path.exists(dst):
+                    # Don't bind the project to a pre-existing foreign file when
+                    # the temp source is the intended one: overwrite only when
+                    # the temp file is newer, otherwise log the skip so a stale
+                    # destination doesn't silently win.
+                    if os.path.getmtime(src) <= os.path.getmtime(dst):
+                        logger.warning(
+                            "迁移跳过(目标已存在且不更旧): %s", filename)
+                        continue
+                shutil.copy2(src, dst)
+                logger.debug(f"已迁移文件: {filename}")
 
             self._cleanup_temp_dir()
             logger.info(f"已将临时项目迁移到: {dest_dir}")
@@ -3585,6 +3599,11 @@ class MainWindow(QMainWindow):
         if success:
             with open(out_path, 'wb') as f:
                 f.write(encoded.tobytes())
+            # The on-disk transition asset changed — reflect it in the dirty flag
+            # (this edit was previously invisible to the unsaved-changes prompt).
+            if not self._is_modified:
+                self._is_modified = True
+                self._update_title()
 
     def _get_target_resolution(self):
         """获取当前选择的目标分辨率"""
@@ -3829,6 +3848,16 @@ class MainWindow(QMainWindow):
 
             icon_path = os.path.join(self._base_dir, "icon.png")
             logger.info(f"保存图标到: {icon_path}")
+
+            if os.path.exists(icon_path):
+                if QMessageBox.question(
+                    self, "覆盖确认",
+                    "icon.png 已存在，是否覆盖？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                ) != QMessageBox.StandardButton.Yes:
+                    self.status_bar.showMessage("已取消保存图标")
+                    return
 
             success, encoded = cv2.imencode('.png', cropped)
             if success:

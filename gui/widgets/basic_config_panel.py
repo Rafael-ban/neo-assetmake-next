@@ -240,12 +240,21 @@ class BasicConfigPanel(QWidget):
                     )
 
                 if self._config.overlay.arknights_options:
-                    self._config.overlay.arknights_options.operator_name = self.edit_ark_name.text()
-                    class_value = self.combo_ark_class.currentData()
-                    if class_value:
-                        self._config.overlay.arknights_options.operator_class_icon = f"class_icons/{class_value}.png"
-                    else:
-                        self._config.overlay.arknights_options.operator_class_icon = ""
+                    ark = self._config.overlay.arknights_options
+                    ark.operator_name = self.edit_ark_name.text()
+                    # Only drive the class icon from the basic combo when the
+                    # current value is empty or an existing preset (class_icons/*).
+                    # A custom icon set in the advanced panel must not be
+                    # clobbered just because the basic panel was touched.
+                    current_icon = ark.operator_class_icon or ""
+                    is_preset_or_empty = (
+                        not current_icon or current_icon.startswith("class_icons/")
+                    )
+                    if is_preset_or_empty:
+                        class_value = self.combo_ark_class.currentData()
+                        ark.operator_class_icon = (
+                            f"class_icons/{class_value}.png" if class_value else ""
+                        )
             elif template == "自定义模板":
                 pass
         except Exception as e:
