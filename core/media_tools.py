@@ -13,9 +13,14 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from utils.file_utils import get_app_dir
+from config.vsconfig import load_vsconfig
 
 
-REQUIRED_VAPOURSYNTH_PLUGINS = ("lsmas", "imwri")
+# Single source of truth for the required VS plugin set + plugin dir + output
+# format is config/vsconfig.json (via config.vsconfig.VSConfig). This
+# module-level tuple is a backward-compat snapshot for anything still importing
+# it; live reads go through load_vsconfig(). Adding a plugin = edit the JSON.
+REQUIRED_VAPOURSYNTH_PLUGINS = tuple(load_vsconfig().required_plugins)
 
 
 def _exe_names(base_name: str) -> tuple[str, ...]:
@@ -75,12 +80,41 @@ def build_media_subprocess_env(tool_path: str) -> dict[str, str]:
 
     _prepend_env_value(env, "PATH", media_dir)
     _prepend_env_value(env, "PYTHONPATH", media_dir / "Lib" / "site-packages")
-    _prepend_env_value(
-        env,
-        "VAPOURSYNTH_EXTRA_PLUGIN_PATH",
-        media_dir / "vs-plugins",
-    )
+    # Plugin autoload dir(s) come from VSConfig (default ("vs-plugins",) → env
+    # byte-identical). PATH/PYTHONPATH locate the tool + bundled Python runtime
+    # (discovery), so they stay here, not in VSConfig.
+    for plugin_dir in load_vsconfig().extra_plugin_dirs:
+        _prepend_env_value(
+            env, "VAPOURSYNTH_EXTRA_PLUGIN_PATH", media_dir / plugin_dir
+        )
     return env
+
+
+def _plugin_probe_script(cfg) -> str:
+    """Build the VSPipe probe script that verifies the required plugins load.
+
+    hasattr(core, name) is the correct presence probe: VS R73 exposes each
+    plugin as a namespace property on Core (vapoursynth-stubs/__init__.pyi
+    :1505-1534). Required set + output format come from VSConfig (single SoT).
+    """
+    return "\n".join(
+        [
+            "import vapoursynth as vs",
+            "core = vs.core",
+            f"required = {tuple(cfg.required_plugins)!r}",
+            "missing = [name for name in required if not hasattr(core, name)]",
+            "if missing:",
+            "    raise RuntimeError(",
+            "        'missing VapourSynth plugin namespace(s): '",
+            "        + ', '.join(missing)",
+            "    )",
+            "clip = core.std.BlankClip(",
+            f"    width=16, height=16, length=1, format=vs.{cfg.output_format}",
+            ")",
+            "clip.set_output()",
+            "",
+        ]
+    )
 
 
 @lru_cache(maxsize=16)
@@ -89,25 +123,9 @@ def _missing_vapoursynth_plugins(vspipe_path: str) -> tuple[str, ...]:
     if resolved is None:
         return ()
 
+    cfg = load_vsconfig()
     script_path = None
-    script = "\n".join(
-        [
-            "import vapoursynth as vs",
-            "core = vs.core",
-            f"required = {REQUIRED_VAPOURSYNTH_PLUGINS!r}",
-            "missing = [name for name in required if not hasattr(core, name)]",
-            "if missing:",
-            "    raise RuntimeError(",
-            "        'missing VapourSynth plugin namespace(s): '",
-            "        + ', '.join(missing)",
-            "    )",
-            "clip = core.std.BlankClip(",
-            "    width=16, height=16, length=1, format=vs.YUV420P8",
-            ")",
-            "clip.set_output()",
-            "",
-        ]
-    )
+    script = _plugin_probe_script(cfg)
 
     try:
         with tempfile.NamedTemporaryFile(
@@ -144,7 +162,7 @@ def _missing_vapoursynth_plugins(vspipe_path: str) -> tuple[str, ...]:
         return ()
 
     output = f"{result.stdout}\n{result.stderr}"
-    missing = [name for name in REQUIRED_VAPOURSYNTH_PLUGINS if name in output]
+    missing = [name for name in cfg.required_plugins if name in output]
     if not missing:
         details = output.strip().splitlines()
         tail = details[-1] if details else f"VSPipe exited {result.returncode}"
@@ -171,9 +189,10 @@ class MediaToolchain:
 
     @staticmethod
     def refresh() -> None:
-        """Clear the discovery + VapourSynth-plugin caches (e.g. after install)."""
+        """Clear the discovery + VapourSynth-plugin + VSConfig caches (e.g. after install)."""
         _discover_cached.cache_clear()
         _missing_vapoursynth_plugins.cache_clear()
+        load_vsconfig.cache_clear()
 
     def missing_for_export(self) -> list[str]:
         missing = []
