@@ -570,6 +570,12 @@ def run_cxfreeze(skip_flasher=False, source_root=None):
             "class_icons",
         ),  # 运行时通过 class_icons/ 相对路径访问
     ]
+
+    # VS 配置单一事实源:随包分发默认 config/vsconfig.json,装好后用户可就地
+    # 编辑(加插件到 required_plugins 等);缺失时代码回落 dataclass 默认值。
+    if os.path.exists(os.path.join("config", "vsconfig.json")):
+        include_files.append(("config/vsconfig.json", "config/vsconfig.json"))
+        print("  Including VS config: config/vsconfig.json")
     for runtime_name, runtime_path in pyarmor_runtimes:
         include_files.append((runtime_path, runtime_name))
         print(f"  Including PyArmor runtime: {runtime_path}")

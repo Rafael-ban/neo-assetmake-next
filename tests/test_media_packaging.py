@@ -23,6 +23,11 @@ class MediaPackagingTests(unittest.TestCase):
             with self.subTest(expected_token=expected_token):
                 self.assertIn(expected_token, self.build_source)
 
+    def test_build_script_packages_vsconfig(self):
+        # The VS config single source of truth must ship so the installed app
+        # can read + override it (load_vsconfig falls back to defaults if absent).
+        self.assertIn("config/vsconfig.json", self.build_source)
+
     def test_runtime_source_does_not_reference_removed_ffmpeg_stack(self):
         disallowed_tokens = (
             "import av",
