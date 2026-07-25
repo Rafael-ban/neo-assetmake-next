@@ -13,9 +13,11 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Optional
 
-from config.constants import get_resolution_spec
 from core.media_tools import MediaToolchain, build_media_subprocess_env
 from core.video_processor import X264_CLI_ARGS
+# VS script authoring lives in core.vs_script now; re-exported here so the two
+# production callers and the test suite keep importing them from core.media_pipeline.
+from core.vs_script import write_vpy_script, _quote_vs_string, _vs_path
 
 # VSPipe -p prints "Frame: <done>/<total>" lines (\r-refreshed) to stderr.
 _VSPIPE_PROGRESS_RE = re.compile(rb"Frame:\s*(\d+)\s*/\s*(\d+)")
@@ -160,128 +162,6 @@ def build_mux_command(
     if "mp4box" in muxer_name:
         return build_mp4box_mux_command(muxer_path, raw_h264_path, output_path, fps)
     return build_lsmash_mux_command(muxer_path, raw_h264_path, output_path, fps)
-
-
-def _vs_path(path: str) -> str:
-    return Path(path).as_posix()
-
-
-def _quote_vs_string(value: str) -> str:
-    return repr(_vs_path(value))
-
-
-def write_vpy_script(script_path: str | os.PathLike[str], params) -> None:
-    """Write a VapourSynth script for one export track."""
-    spec = get_resolution_spec(params.resolution)
-    target_w = int(spec["width"])
-    target_h = int(spec["height"])
-    padded_w = int(spec["padded_width"])
-    padded_h = int(spec["padded_height"])
-    padding_side = spec["padding_side"]
-    rotate_180 = bool(spec["rotate_180"])
-    start_frame = max(0, int(params.start_frame))
-    # start_frame + 1: a video clip[a:a] is an EMPTY clip and aborts the whole
-    # encode with an opaque y4m error — a degenerate trim must still yield one frame.
-    end_frame = max(start_frame + 1, int(params.end_frame))
-    crop_x, crop_y, crop_w, crop_h = [max(0, int(v)) for v in params.cropbox]
-    # Snap rotation to a cardinal angle so export can never diverge from the preview
-    # (which rotates via cv2.ROTATE_*). Idempotent; keeps existing saved projects working.
-    rotation = (round(int(params.rotation) / 90) * 90) % 360
-
-    lines = [
-        "import vapoursynth as vs",
-        "core = vs.core",
-    ]
-
-    if params.is_image:
-        lines.extend(
-            [
-                f"clip = core.imwri.Read({_quote_vs_string(params.video_path)})",
-                "clip = clip if clip.format.id == vs.RGB24 else core.resize.Bicubic(clip, format=vs.RGB24)",
-            ]
-        )
-    else:
-        # cachefile: without it lsmas writes a persistent <source>.lwi index
-        # NEXT TO THE USER'S SOURCE VIDEO (LWLibavSource(source, ..., cache,
-        # cachefile, ...) — VS R73 stub) and nothing ever removes it; keep the
-        # index beside our own .vpy instead, where the export cleanup owns it.
-        cache_file = str(Path(script_path).with_suffix(".lwi"))
-        lines.extend(
-            [
-                "clip = core.lsmas.LWLibavSource("
-                f"{_quote_vs_string(params.video_path)}, "
-                f"cachefile={_quote_vs_string(cache_file)})",
-                f"clip = clip[{start_frame}:{end_frame}]",
-            ]
-        )
-
-    # Rotation and crop apply to BOTH branches (they used to live only in the
-    # video branch, so image loops silently ignored the user's crop/rotation).
-    # Transpose/Flip*/Turn180 and CropAbs are format-generic, so the shared
-    # block works on the image branch's RGB24 just as on the video branch's YUV.
-    #
-    # Match cv2.ROTATE_* used by the preview (video_preview.py). core.std.Transpose
-    # is a matrix transpose (reflection across the main diagonal), NOT a rotation:
-    # a true 90deg clockwise = Transpose then FlipHorizontal; 270deg (counter-
-    # clockwise) = Transpose then FlipVertical; 180deg == Turn180. rotation is already
-    # snapped to {0,90,180,270} above, so no arbitrary-angle branch is needed.
-    if rotation == 90:
-        lines.append("clip = core.std.FlipHorizontal(core.std.Transpose(clip))")
-    elif rotation == 180:
-        lines.append("clip = core.std.Turn180(clip)")
-    elif rotation == 270:
-        lines.append("clip = core.std.FlipVertical(core.std.Transpose(clip))")
-
-    if crop_w > 0 and crop_h > 0:
-        # Clamp the crop box to the ACTUAL post-rotation clip dimensions at eval
-        # time and force every value even. VapourSynth CropAbs on a YUV420 (4:2:0)
-        # clip rejects odd offsets/sizes AND a box extending past the frame; either
-        # aborts the whole encode. Computing it against clip.width/height in the
-        # script keeps it correct regardless of source size or rotation. (Kept even
-        # for the RGB24 image branch: it converts to YUV420 right below anyway.)
-        lines.append(f"_cx = min(max(0, {crop_x}), clip.width - 2) & ~1")
-        lines.append(f"_cy = min(max(0, {crop_y}), clip.height - 2) & ~1")
-        lines.append(f"_cw = min({crop_w}, clip.width - _cx) & ~1")
-        lines.append(f"_ch = min({crop_h}, clip.height - _cy) & ~1")
-        lines.append("if _cw >= 2 and _ch >= 2:")
-        lines.append("    clip = core.std.CropAbs(clip, width=_cw, height=_ch, left=_cx, top=_cy)")
-
-    if params.is_image:
-        # Loop AFTER rotate/crop: one processed frame repeated, instead of
-        # rotating/cropping every duplicated frame.
-        lines.append(f"clip = core.std.Loop(clip, times={max(1, end_frame - start_frame)})")
-
-    # Colour handling (all target resolutions are sub-HD, H.273 convention = BT.601):
-    # - image branch: RGB->YUV requires an explicit matrix or VapourSynth raises
-    #   "Matrix must be specified". It used to force '709' — but the stream was
-    #   untagged, and untagged sub-HD is decoded as BT.601 by players/devices,
-    #   so 709-coded data showed a visible hue/saturation shift (preview != export).
-    #   Convert with '170m' to match the smpte170m VUI tags in build_x264_command.
-    # - video branch: normalize whatever the source is to 170m. zimg reads the
-    #   input matrix from the _Matrix frame prop; when the source leaves it
-    #   unspecified (2), stamp the H.273 resolution heuristic (>=720p -> 709,
-    #   else 601) that mpv also applies, then let resize do the real conversion.
-    if not params.is_image:
-        lines.append("if clip.get_frame(0).props.get('_Matrix', 2) == 2:")
-        lines.append(
-            "    clip = core.std.SetFrameProps(clip, _Matrix=1 if clip.height >= 720 else 6)"
-        )
-    lines.append(
-        f"clip = core.resize.Bicubic(clip, width={target_w}, height={target_h}, "
-        f"format=vs.YUV420P8, matrix_s='170m')"
-    )
-
-    if padding_side == "right":
-        lines.append(f"clip = core.std.AddBorders(clip, right={padded_w - target_w})")
-    elif padding_side == "bottom":
-        lines.append(f"clip = core.std.AddBorders(clip, bottom={padded_h - target_h})")
-
-    if rotate_180:
-        lines.append("clip = core.std.Turn180(clip)")
-
-    lines.append("clip.set_output()")
-
-    Path(script_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 class MediaEncoder:
