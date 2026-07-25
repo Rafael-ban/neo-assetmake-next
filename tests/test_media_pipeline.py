@@ -36,7 +36,8 @@ class MediaToolchainTests(unittest.TestCase):
         vspipe = build_vspipe_command("VSPipe.exe", "script.vpy")
         x264 = build_x264_command("x264-7mod.exe", "out.mp4", crf=26, preset="veryslow")
 
-        self.assertEqual(vspipe, ["VSPipe.exe", "-c", "y4m", "script.vpy", "-"])
+        # -p enables VSPipe per-frame progress on stderr (drives the dialog).
+        self.assertEqual(vspipe, ["VSPipe.exe", "-c", "y4m", "-p", "script.vpy", "-"])
         self.assertIn("--demuxer", x264)
         self.assertIn("y4m", x264)
         self.assertIn("--output", x264)
@@ -111,30 +112,29 @@ class MediaToolchainTests(unittest.TestCase):
             missing,
         )
 
-    def test_muxer_commands_preserve_raw_stream_fps(self):
+    def test_muxer_commands_use_rational_fps(self):
+        # A probed 29.97 float is really 30000/1001 (NTSC). Re-stamping the
+        # muxer with the lossy float made every frame duration slightly wrong;
+        # MP4Box accepts "num/den" (mp4box -h import: "-fps ... as TS/inc").
         from core.media_pipeline import (
             build_lsmash_mux_command,
             build_mp4box_mux_command,
+            _fps_to_fraction,
         )
 
         self.assertEqual(
             build_mp4box_mux_command("MP4Box.exe", "video.264", "out.mp4", 29.97),
-            ["MP4Box.exe", "-add", "video.264:fps=29.97", "-new", "out.mp4"],
+            ["MP4Box.exe", "-add", "video.264:fps=30000/1001", "-new", "out.mp4"],
         )
+        # Whole rates stay bare integers, not "30/1".
         self.assertEqual(
             build_lsmash_mux_command(
                 "lsmash-muxer.exe", "video.264", "out.mp4", 30.0
             ),
-            [
-                "lsmash-muxer.exe",
-                "-i",
-                "video.264",
-                "--fps",
-                "30",
-                "-o",
-                "out.mp4",
-            ],
+            ["lsmash-muxer.exe", "-i", "video.264", "--fps", "30", "-o", "out.mp4"],
         )
+        self.assertEqual(_fps_to_fraction(23.976).as_integer_ratio(), (24000, 1001))
+        self.assertEqual(_fps_to_fraction(59.94).as_integer_ratio(), (60000, 1001))
 
 
 class VapourSynthScriptTests(unittest.TestCase):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import struct
 from dataclasses import dataclass
 from enum import Enum
@@ -36,6 +37,7 @@ class ExportType(Enum):
     LOOP_VIDEO = "loop"
     INTRO_VIDEO = "intro"
     ICON = "icon"
+    AUX_IMAGE = "aux_image"  # class_icon.png / ark_logo.png / overlay.png (PNG mat)
 
 
 @dataclass
@@ -72,6 +74,7 @@ class ExportWorker(QThread):
         super().__init__(parent)
         self._tasks: list[ExportTask] = []
         self._output_dir = ""
+        self._staging_dir = ""
         self._cancelled = False
         self._epconfig: Optional[EPConfig] = None
         self._resolution = "360x640"
@@ -99,6 +102,7 @@ class ExportWorker(QThread):
             self._media_encoder.terminate_active_processes()
 
     def run(self) -> None:
+        staging_dir = ""
         try:
             total_tasks = len(self._tasks)
             if total_tasks == 0 and not self._epconfig:
@@ -106,6 +110,14 @@ class ExportWorker(QThread):
                 return
 
             os.makedirs(self._output_dir, exist_ok=True)
+            # All artifacts are produced in a staging dir and promoted only
+            # after EVERY task succeeded: a mid-export failure used to leave a
+            # half-populated package (icon.png/overlay.argb without loop.mp4).
+            staging_dir = os.path.join(self._output_dir, ".export_tmp")
+            if os.path.isdir(staging_dir):
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            os.makedirs(staging_dir, exist_ok=True)
+            self._staging_dir = staging_dir
 
             for index, task in enumerate(self._tasks):
                 if self._cancelled:
@@ -119,6 +131,14 @@ class ExportWorker(QThread):
                     self.export_failed.emit(f"Export {task.export_type.value} failed: {exc}")
                     return
 
+            # Promote artifacts (os.replace is atomic per file on the same
+            # volume), then write epconfig.json LAST so a package with an
+            # epconfig always has all the files it references.
+            for task in self._tasks:
+                staged = os.path.join(staging_dir, task.output_path)
+                if os.path.exists(staged):
+                    os.replace(staged, os.path.join(self._output_dir, task.output_path))
+
             if self._epconfig:
                 self.progress_updated.emit(95, "Generating epconfig.json...")
                 self._generate_epconfig()
@@ -128,9 +148,13 @@ class ExportWorker(QThread):
         except Exception as exc:
             logger.exception("Export failed")
             self.export_failed.emit(f"Export failed: {exc}")
+        finally:
+            self._staging_dir = ""
+            if staging_dir and os.path.isdir(staging_dir):
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
     def _execute_task(self, task: ExportTask, base_progress: int, total_tasks: int) -> None:
-        output_path = os.path.join(self._output_dir, task.output_path)
+        output_path = os.path.join(self._staging_dir or self._output_dir, task.output_path)
 
         if task.export_type == ExportType.LOGO:
             self.progress_updated.emit(base_progress, f"Exporting {task.output_path}...")
@@ -138,7 +162,7 @@ class ExportWorker(QThread):
         elif task.export_type == ExportType.OVERLAY:
             self.progress_updated.emit(base_progress, f"Exporting {task.output_path}...")
             self._export_argb(output_path, task.data)
-        elif task.export_type == ExportType.ICON:
+        elif task.export_type in (ExportType.ICON, ExportType.AUX_IMAGE):
             self.progress_updated.emit(base_progress, f"Exporting {task.output_path}...")
             self._export_icon(output_path, task.data)
         elif task.export_type in (ExportType.LOOP_VIDEO, ExportType.INTRO_VIDEO):
@@ -189,9 +213,22 @@ class ExportWorker(QThread):
             raise RuntimeError("Missing media tools: " + ", ".join(missing))
 
         script_path = os.path.join(
-            self._output_dir,
+            self._staging_dir or self._output_dir,
             f"_{os.path.splitext(os.path.basename(output_path))[0]}.vpy",
         )
+        # write_vpy_script points the lsmas index (.lwi) next to the script so
+        # it never lands beside the user's source video; clean both up here.
+        lwi_path = os.path.splitext(script_path)[0] + ".lwi"
+
+        def _on_encode_progress(done: int, total: int) -> None:
+            # Map VSPipe "Frame: done/total" onto this task's 50..90 band —
+            # the dialog used to sit frozen at +50 for the entire encode.
+            if total > 0:
+                span = int(40 * min(done, total) / total)
+                self.progress_updated.emit(
+                    base_progress + 50 + span, f"Encoding video... {done}/{total}"
+                )
+
         try:
             self.progress_updated.emit(base_progress + 10, "Generating VapourSynth script...")
             write_vpy_script(script_path, params)
@@ -203,11 +240,16 @@ class ExportWorker(QThread):
                 output_path.replace("\\", "/"),
                 params.fps,
                 is_cancelled=lambda: self._cancelled,
+                progress_cb=_on_encode_progress,
             )
         finally:
             self._media_encoder = None
-            if os.path.exists(script_path):
-                os.remove(script_path)
+            for leftover in (script_path, lwi_path):
+                if os.path.exists(leftover):
+                    try:
+                        os.remove(leftover)
+                    except OSError:
+                        pass
 
     def _generate_epconfig(self) -> None:
         if not self._epconfig:
@@ -253,6 +295,7 @@ class ExportService(QObject):
         intro_video_params: Optional[VideoExportParams] = None,
         loop_image_path: Optional[str] = None,
         loop_image_params: Optional[VideoExportParams] = None,
+        aux_images: Optional[list] = None,
     ) -> None:
         if self.is_exporting:
             self.export_failed.emit("An export task is already running")
@@ -266,6 +309,14 @@ class ExportService(QObject):
 
         if overlay_mat is not None:
             tasks.append(ExportTask(ExportType.OVERLAY, "overlay.argb", overlay_mat))
+
+        # Auxiliary PNGs (custom class icon / logo / image overlay). These used
+        # to be written straight into output_dir BEFORE the worker ran, so a
+        # later video-encode failure left them orphaned in a half package. As
+        # tasks they go through the same staging-dir + atomic-promote path.
+        for filename, mat in (aux_images or []):
+            if mat is not None:
+                tasks.append(ExportTask(ExportType.AUX_IMAGE, filename, mat))
 
         if loop_image_params is not None:
             # Full parameters from the preview: crop box (rotated space),

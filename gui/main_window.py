@@ -1417,22 +1417,20 @@ class MainWindow(QMainWindow):
             show_error(e, "收集导出数据", self)
             return
 
-        # These write side-car assets (class_icon.png / ark_logo.png / overlay.png) that
-        # the exported epconfig.json references. If they fail we must NOT continue to
-        # export_all, or the run would report "导出成功" while the referenced files are
-        # missing — abort so the failure is visible.
+        # Side-car assets (class_icon.png / ark_logo.png / overlay.png) that the
+        # exported epconfig.json references. Collect+resize them here (so a
+        # decode/resize failure aborts BEFORE the run and stays visible), but
+        # hand the actual PNG writes to export_all as AUX_IMAGE tasks — they
+        # then share the staging-dir + atomic-promote path instead of being
+        # written straight into output_dir where a later encode failure would
+        # orphan them in a half package.
+        aux_images: list = []
         try:
-            self._process_arknights_custom_images(dir_path)
+            aux_images.extend(self._collect_arknights_custom_images())
+            aux_images.extend(self._collect_image_overlay())
         except Exception as e:
             logger.error(f"处理自定义图片失败: {e}")
             show_error(e, "处理自定义图片", self)
-            return
-
-        try:
-            self._process_image_overlay(dir_path)
-        except Exception as e:
-            logger.error(f"处理 ImageOverlay 失败: {e}")
-            show_error(e, "处理 ImageOverlay", self)
             return
 
         from core.export_service import ExportService
@@ -1463,6 +1461,7 @@ class MainWindow(QMainWindow):
             intro_video_params=export_data.get('intro_video_params'),
             loop_image_path=export_data.get('loop_image_path'),
             loop_image_params=export_data.get('loop_image_params'),
+            aux_images=aux_images,
         )
 
         self._export_dialog.exec()
@@ -3949,91 +3948,57 @@ class MainWindow(QMainWindow):
 
         return data
 
-    def _process_arknights_custom_images(self, output_dir: str):
-        """
-        处理arknights叠加的自定义图片
+    def _collect_arknights_custom_images(self) -> list:
+        """收集 arknights 叠加的自定义图片(职业图标 / logo),缩放后返回。
 
-        将自定义的logo和operator_class_icon缩放后复制到导出目录
-
-        Args:
-            output_dir: 导出目录
+        返回 [(标准化文件名, 缩放后的图像 mat)];实际写盘由导出的 AUX_IMAGE
+        任务在暂存目录完成(见 ExportService),失败即回滚整个包。
         """
         from config.epconfig import OverlayType
         from config.constants import ARK_CLASS_ICON_SIZE, ARK_LOGO_SIZE
         from core.image_processor import ImageProcessor
         import cv2
 
-        if not self._config:
-            return
-
-        if self._config.overlay.type != OverlayType.ARKNIGHTS:
-            return
-
+        result: list = []
+        if not self._config or self._config.overlay.type != OverlayType.ARKNIGHTS:
+            return result
         ark_opts = self._config.overlay.arknights_options
         if not ark_opts:
-            return
+            return result
 
-        if ark_opts.operator_class_icon:
-            src_path = ark_opts.operator_class_icon
-            if not os.path.isabs(src_path):
-                src_path = os.path.join(self._base_dir, src_path)
+        for src, size, dst_filename in (
+            (ark_opts.operator_class_icon, ARK_CLASS_ICON_SIZE, "class_icon.png"),
+            (ark_opts.logo, ARK_LOGO_SIZE, "ark_logo.png"),
+        ):
+            if not src:
+                continue
+            src_path = src if os.path.isabs(src) else os.path.join(self._base_dir, src)
+            if not os.path.exists(src_path):
+                continue
+            img = ImageProcessor.load_image(src_path)
+            if img is not None:
+                result.append((dst_filename, cv2.resize(img, size)))
+        return result
 
-            if os.path.exists(src_path):
-                img = ImageProcessor.load_image(src_path)
-                if img is not None:
-                    img = cv2.resize(img, ARK_CLASS_ICON_SIZE)
-                    dst_filename = "class_icon.png"
-                    dst_path = os.path.join(output_dir, dst_filename)
-                    success, encoded = cv2.imencode('.png', img)
-                    if success:
-                        with open(dst_path, 'wb') as f:
-                            f.write(encoded.tobytes())
-                        logger.info(f"已导出职业图标: {dst_path}")
-
-        if ark_opts.logo:
-            src_path = ark_opts.logo
-            if not os.path.isabs(src_path):
-                src_path = os.path.join(self._base_dir, src_path)
-
-            if os.path.exists(src_path):
-                img = ImageProcessor.load_image(src_path)
-                if img is not None:
-                    img = cv2.resize(img, ARK_LOGO_SIZE)
-                    dst_filename = "ark_logo.png"
-                    dst_path = os.path.join(output_dir, dst_filename)
-                    success, encoded = cv2.imencode('.png', img)
-                    if success:
-                        with open(dst_path, 'wb') as f:
-                            f.write(encoded.tobytes())
-                        logger.info(f"已导出Logo: {dst_path}")
-
-    def _process_image_overlay(self, output_dir: str):
-        """处理 ImageOverlay 的图片导出和路径标准化"""
+    def _collect_image_overlay(self) -> list:
+        """收集 ImageOverlay 的叠加图片(overlay.png),返回 [(文件名, mat)]。"""
         from config.epconfig import OverlayType
         from core.image_processor import ImageProcessor
-        import cv2
 
-        if not self._config:
-            return
-
-        if self._config.overlay.type != OverlayType.IMAGE:
-            return
-
-        if self._config.overlay.image_options and self._config.overlay.image_options.image:
-            src_path = self._config.overlay.image_options.image
-            if not os.path.isabs(src_path):
-                src_path = os.path.join(self._base_dir, src_path)
-
-            if os.path.exists(src_path):
-                img = ImageProcessor.load_image(src_path)
-                if img is not None:
-                    dst_filename = "overlay.png"
-                    dst_path = os.path.join(output_dir, dst_filename)
-                    success, encoded = cv2.imencode('.png', img)
-                    if success:
-                        with open(dst_path, 'wb') as f:
-                            f.write(encoded.tobytes())
-                        logger.info(f"已导出叠加图片: {dst_path}")
+        result: list = []
+        if not self._config or self._config.overlay.type != OverlayType.IMAGE:
+            return result
+        opts = self._config.overlay.image_options
+        if not (opts and opts.image):
+            return result
+        src_path = opts.image if os.path.isabs(opts.image) else os.path.join(
+            self._base_dir, opts.image)
+        if not os.path.exists(src_path):
+            return result
+        img = ImageProcessor.load_image(src_path)
+        if img is not None:
+            result.append(("overlay.png", img))
+        return result
 
     def _on_export_completed(self, success: bool, message: str):
         """导出完成回调"""

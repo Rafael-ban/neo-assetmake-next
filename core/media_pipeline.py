@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 from contextlib import contextmanager
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -15,10 +17,18 @@ from config.constants import get_resolution_spec
 from core.media_tools import MediaToolchain, build_media_subprocess_env
 from core.video_processor import X264_CLI_ARGS
 
+# VSPipe -p prints "Frame: <done>/<total>" lines (\r-refreshed) to stderr.
+_VSPIPE_PROGRESS_RE = re.compile(rb"Frame:\s*(\d+)\s*/\s*(\d+)")
+
 
 def build_vspipe_command(vspipe_path: str, script_path: str) -> list[str]:
-    """Build a VSPipe command that emits Y4M to stdout."""
-    return [vspipe_path, "-c", "y4m", script_path, "-"]
+    """Build a VSPipe command that emits Y4M to stdout.
+
+    ``-p`` enables per-frame progress on stderr (VSPipe R73 --help:
+    "-p, --progress   Print progress to stderr") so the export dialog can
+    show real progress instead of freezing at a fixed percentage.
+    """
+    return [vspipe_path, "-c", "y4m", "-p", script_path, "-"]
 
 
 def build_x264_command(
@@ -68,8 +78,41 @@ def build_x264_command(
     ]
 
 
+# Exact broadcast rates: the NTSC family MUST stay rational — 29.97 is not
+# 30000/1001, and a float re-stamp makes every frame duration slightly wrong,
+# which accumulates as timing drift over a looping asset.
+_COMMON_FPS = (
+    Fraction(24000, 1001),
+    Fraction(30000, 1001),
+    Fraction(60000, 1001),
+    Fraction(24),
+    Fraction(25),
+    Fraction(30),
+    Fraction(50),
+    Fraction(60),
+)
+
+
+def _fps_to_fraction(fps: float) -> Fraction:
+    """Snap a probed float fps to the nearest common broadcast rational."""
+    value = float(fps)
+    for candidate in _COMMON_FPS:
+        if abs(value - float(candidate)) < 1e-3:
+            return candidate
+    return Fraction(value).limit_denominator(1001)
+
+
 def _format_fps(fps: float) -> str:
-    return f"{float(fps):g}"
+    """Format fps for the muxers: integers stay bare, others become num/den.
+
+    MP4Box documents ``-fps`` as "expressed as a number, as TS-inc or TS/inc"
+    (mp4box -h import), so ``30000/1001`` is valid; the old ``%g`` float form
+    (``29.97``) silently discarded the exact rational.
+    """
+    frac = _fps_to_fraction(fps)
+    if frac.denominator == 1:
+        return str(frac.numerator)
+    return f"{frac.numerator}/{frac.denominator}"
 
 
 def build_mp4box_mux_command(
@@ -158,9 +201,16 @@ def write_vpy_script(script_path: str | os.PathLike[str], params) -> None:
             ]
         )
     else:
+        # cachefile: without it lsmas writes a persistent <source>.lwi index
+        # NEXT TO THE USER'S SOURCE VIDEO (LWLibavSource(source, ..., cache,
+        # cachefile, ...) — VS R73 stub) and nothing ever removes it; keep the
+        # index beside our own .vpy instead, where the export cleanup owns it.
+        cache_file = str(Path(script_path).with_suffix(".lwi"))
         lines.extend(
             [
-                f"clip = core.lsmas.LWLibavSource({_quote_vs_string(params.video_path)})",
+                "clip = core.lsmas.LWLibavSource("
+                f"{_quote_vs_string(params.video_path)}, "
+                f"cachefile={_quote_vs_string(cache_file)})",
                 f"clip = clip[{start_frame}:{end_frame}]",
             ]
         )
@@ -267,6 +317,7 @@ class MediaEncoder:
         fps: float,
         *,
         is_cancelled: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> None:
         if is_cancelled and is_cancelled():
             self.terminate_active_processes()
@@ -289,29 +340,40 @@ class MediaEncoder:
         if os.path.exists(temp_raw):
             os.remove(temp_raw)
 
-        result = self._run_encode_pipeline(script_path, temp_raw, is_cancelled)
-        if result["vspipe_returncode"] != 0:
-            details = str(result["stderr"])[-1000:].strip()
-            message = f"VSPipe failed with code {result['vspipe_returncode']}"
-            if details:
-                message = f"{message}: {details}"
-            raise RuntimeError(message)
-        if result["x264_returncode"] != 0:
-            raise RuntimeError(
-                f"x264-7mod failed with code {result['x264_returncode']}: "
-                + result["stderr"][-500:]
+        try:
+            result = self._run_encode_pipeline(
+                script_path, temp_raw, is_cancelled, progress_cb
             )
+            if result["vspipe_returncode"] != 0:
+                details = str(result["stderr"])[-1000:].strip()
+                message = f"VSPipe failed with code {result['vspipe_returncode']}"
+                if details:
+                    message = f"{message}: {details}"
+                raise RuntimeError(message)
+            if result["x264_returncode"] != 0:
+                raise RuntimeError(
+                    f"x264-7mod failed with code {result['x264_returncode']}: "
+                    + result["stderr"][-500:]
+                )
 
-        self._run_muxer(temp_raw, temp_output, fps)
-        os.replace(temp_output, output_path)
-        if os.path.exists(temp_raw):
-            os.remove(temp_raw)
+            self._run_muxer(temp_raw, temp_output, fps)
+            os.replace(temp_output, output_path)
+        finally:
+            # A failed/cancelled encode used to litter the export dir with
+            # .tmp.264 / .tmp.mp4 leftovers — clean up on every exit path.
+            for leftover in (temp_raw, temp_output):
+                try:
+                    if os.path.exists(leftover):
+                        os.remove(leftover)
+                except OSError:
+                    pass
 
     def _run_encode_pipeline(
         self,
         script_path: str,
         output_path: str,
         is_cancelled: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> dict[str, object]:
         vspipe_cmd = build_vspipe_command(self.toolchain.vspipe_path, script_path)
         x264_cmd = build_x264_command(self.toolchain.x264_path, output_path)
@@ -359,8 +421,48 @@ class MediaEncoder:
                 except Exception:
                     pass
 
+        def _drain_vspipe_with_progress(proc, key):
+            """Drain vspipe stderr AND surface `Frame: n/total` progress.
+
+            The plain _drain above swallowed the -p output, leaving the export
+            dialog frozen at a fixed percentage for the whole encode. VSPipe
+            refreshes the progress line with \r, so split on [\r\n].
+            """
+            chunks: list[bytes] = []
+            pending = b""
+            try:
+                stream = proc.stderr
+                if stream is None:
+                    return
+                while True:
+                    chunk = stream.read1(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    pending += chunk
+                    *complete, pending = re.split(rb"[\r\n]", pending)
+                    for line in complete:
+                        match = _VSPIPE_PROGRESS_RE.search(line)
+                        if match:
+                            try:
+                                progress_cb(int(match.group(1)), int(match.group(2)))
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            finally:
+                stderr_bufs[key] = b"".join(chunks)
+                try:
+                    if proc.stderr is not None:
+                        proc.stderr.close()
+                except Exception:
+                    pass
+
+        vspipe_drain = (
+            _drain_vspipe_with_progress if progress_cb is not None else _drain
+        )
         readers = [
-            threading.Thread(target=_drain, args=(vspipe, "vspipe"), daemon=True),
+            threading.Thread(target=vspipe_drain, args=(vspipe, "vspipe"), daemon=True),
             threading.Thread(target=_drain, args=(x264, "x264"), daemon=True),
         ]
         for reader in readers:
