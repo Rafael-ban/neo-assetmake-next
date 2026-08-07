@@ -193,7 +193,8 @@ uv run python main.py
 
 - 检查输入文件格式是否受支持
 - 确认视频文件未损坏
-- 若使用打包版本，检查 `mpv`、`VSPipe`、`x264-7mod` 等媒体工具是否随安装包完整分发
+- 若使用打包版本，检查 `VapourSynth`（含 `portable.vs` 与 `vs-plugins/`）、`VSPipe`、`x264-7mod` 等媒体工具是否随安装包完整分发
+- 预览与导出都依赖 VapourSynth 解码：若某文件无法建立索引，会在**加载时**直接报错（而非预览正常、导出失败）
 
 ### RNDIS 远程上传失败
 

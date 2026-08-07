@@ -228,7 +228,7 @@ neo-assetmaker/
 │   ├── widgets/                     # UI 组件
 │   │   ├── config_panel.py          # 高级配置面板
 │   │   ├── basic_config_panel.py    # 基础配置面板
-│   │   ├── video_preview.py         # 视频预览（mpv 嵌入 + JSON IPC）
+│   │   ├── video_preview.py         # 视频预览（进程内 VapourSynth 帧请求）
 │   │   ├── gl_video_renderer.py     # OpenGL 视频渲染器
 │   │   ├── frame_reader_thread.py   # 旧帧读取接口兼容层
 │   │   ├── drop_overlay.py          # 拖放文件导入覆盖层
@@ -318,10 +318,10 @@ GitHub Actions 工作流位于 `.github/workflows/`：
 
 ### 媒体工具依赖
 
-应用程序需要以下可选媒体工具用于视频预览和导出：
+应用程序需要以下媒体工具用于视频预览和导出：
 
-- **mpv.exe** — 视频预览播放器
-- **VSPipe.exe** — VapourSynth 脚本处理器
+- **vapoursynth.pyd / vapoursynth.dll + `portable.vs` + `vs-plugins/`** — 预览与导出共用的渲染核心（进程内加载）
+- **VSPipe.exe** — VapourSynth 脚本处理器（导出用）
 - **x264-7mod.exe** — 视频编码器
 - **mp4box.exe / lsmash-muxer.exe** — MP4 复用器
 
@@ -335,7 +335,7 @@ GitHub Actions 工作流位于 `.github/workflows/`：
 ```bash
 gh release create media-tools-v1.0 media-tools-v1.0.7z \
   --title "Media Tools v1.0" \
-  --notes "媒体工具包：mpv, VSPipe, x264-7mod 等"
+  --notes "媒体工具包：VapourSynth, VSPipe, x264-7mod 等"
 ```
 或通过网页：访问 `https://github.com/{你的用户名}/{你的仓库}/releases/new`，tag 填 `media-tools-v1.0`，上传 `media-tools-v1.0.7z` 文件。
 
@@ -361,7 +361,7 @@ gh release create media-tools-v1.0 media-tools-v1.0.7z \
 | 扩展模块 | OAuth + PKCE、FIDO2、MTP | `_mext/` |
 | 模拟器 | Rust (egui) | `simulator/` |
 | IPC | Windows 命名管道 (JSON) | `simulator/src/ipc/` |
-| 视频处理 | mpv + VapourSynth/VSPipe + x264-7mod | `core/`, `gui/widgets/`, `simulator/` |
+| 视频处理 | VapourSynth（进程内预览 + VSPipe 导出）+ x264-7mod | `core/`, `gui/widgets/`, `simulator/` |
 | 打包 | cx_Freeze + Inno Setup + 可选 PyArmor 混淆 | `build.py` |
 | 依赖管理 | uv + pyproject.toml | `pyproject.toml` |
 | CI/CD | GitHub Actions | `.github/workflows/` |
