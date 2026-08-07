@@ -5,6 +5,9 @@ ENV/
 env/
 .uv-cache/
 
+# 预览的 lsmas 索引缓存(.lwi,按源文件哈希命名)
+.cache/
+
 # Python cache
 __pycache__/
 *.py[cod]

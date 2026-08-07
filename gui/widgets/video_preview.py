@@ -350,6 +350,29 @@ class VideoPreviewWidget(QWidget):
     # VapourSynth frame-request preview (replaces the mpv IPC player)
     # ------------------------------------------------------------------
 
+    def _is_image_source(self) -> bool:
+        ext = os.path.splitext(self.video_path)[1].lower()
+        return ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+
+    def _build_export_params(self):
+        """The same VideoExportParams the export would use for this media.
+
+        Reusing the export's parameter object (rather than a preview-only
+        approximation) is what keeps 预览 and 导出 on one code path.
+        """
+        from core.export_service import VideoExportParams
+
+        return VideoExportParams(
+            video_path=self.video_path,
+            cropbox=tuple(self.cropbox),
+            rotation=self._rotation,
+            start_frame=0,
+            end_frame=max(1, self.total_frames),
+            resolution=f"{self.target_width}x{self.target_height}",
+            fps=self.video_fps,
+            is_image=self._is_image_source(),
+        )
+
     def _use_vs_preview(self) -> bool:
         """True when the in-process VapourSynth core is usable for preview.
 
@@ -380,9 +403,7 @@ class VideoPreviewWidget(QWidget):
         if not self._use_vs_preview():
             return False
         try:
-            from core.vs_graph import build_source_graph
-
-            clip = build_source_graph(path, is_image=False, rotation=self._rotation)
+            clip = self._build_preview_clip()
             requester = self._ensure_requester()
             requester.set_clip(clip, self._load_epoch)
             self._vs_active = True
@@ -396,16 +417,28 @@ class VideoPreviewWidget(QWidget):
             self._vs_active = False
             return False
 
+    def _build_preview_clip(self):
+        """The clip the preview should show for the current mode.
+
+        Preview mode ("导出预览") renders the REAL export graph converted back
+        to RGB, so what is on screen is the pixels the device gets — including
+        the export's own resizer, padding and final 180° turn. Edit mode shows
+        the whole (rotated) source with the crop rectangle painted over it.
+        """
+        from core.vs_graph import build_display_graph, build_source_graph
+
+        if not self._preview_mode:
+            return build_source_graph(self.video_path, is_image=self._is_image_source(),
+                                      rotation=self._rotation)
+        return build_display_graph(self._build_export_params())
+
     def _rebuild_vs_graph(self) -> None:
-        """Re-derive the graph after a rotation change and refresh the frame."""
+        """Re-derive the graph (rotation / crop / preview-mode change)."""
         if not self._vs_active or not self.video_path:
             return
         try:
-            from core.vs_graph import build_source_graph
-
-            clip = build_source_graph(self.video_path, is_image=False,
-                                      rotation=self._rotation)
-            self._ensure_requester().set_clip(clip, self._load_epoch)
+            self._ensure_requester().set_clip(self._build_preview_clip(),
+                                              self._load_epoch)
             self._request_current_frame()
         except Exception as exc:
             logger.warning("VapourSynth graph rebuild failed: %s", exc)
@@ -919,6 +952,11 @@ class VideoPreviewWidget(QWidget):
         self._update_info_label()
 
     def _make_display_frame(self, frame: np.ndarray) -> np.ndarray:
+        if self._vs_active:
+            # The VapourSynth graph already applied rotation, and in preview mode
+            # the crop/resize/padding too — re-doing either here (with cv2's own
+            # resampler) is what used to make 预览 differ from 导出.
+            return frame
         rotated = self._apply_rotation(frame)
         if not self._preview_mode:
             return rotated
@@ -938,6 +976,12 @@ class VideoPreviewWidget(QWidget):
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     def _refresh_display(self):
+        if self._vs_active and self._preview_mode and self.video_path:
+            # 预览模式显示的是导出图,裁剪框一变缓存帧就过期了 —— 必须重新构图取帧,
+            # 而不是重画上一帧(那会让"导出预览"落后于实际参数)。
+            self._rebuild_vs_graph()
+            self._update_info_label()
+            return
         if self.current_frame is not None and self._display_stack.currentIndex() == 0:
             self._display_frame(self.current_frame)
         else:
@@ -1314,8 +1358,15 @@ class VideoPreviewWidget(QWidget):
         return self.video_fps, self.total_frames, self.video_width, self.video_height
 
     def set_preview_mode(self, enabled: bool):
-        self._preview_mode = enabled
-        self._refresh_display()
+        if self._preview_mode == bool(enabled):
+            return
+        self._preview_mode = bool(enabled)
+        if self._vs_active:
+            # Swap between the source graph and the real export graph; the frame
+            # itself changes, so rebuild rather than re-render the cached one.
+            self._rebuild_vs_graph()
+        else:
+            self._refresh_display()
 
     def is_preview_mode(self) -> bool:
         return self._preview_mode
@@ -1452,7 +1503,9 @@ class VideoPreviewWidget(QWidget):
         return self.DRAG_NONE
 
     def _handle_mouse_press(self, widget: QWidget, event: QMouseEvent):
-        if event.button() != Qt.MouseButton.LeftButton:
+        if event.button() != Qt.MouseButton.LeftButton or self._preview_mode:
+            # 预览模式下画面是导出结果(已裁剪/缩放/补边),裁剪框不绘制,
+            # 此时的拖拽会按导出几何去改框——无反馈且坐标系不对。
             return
         vx, vy = self._display_to_rotated_coords(widget, event.pos())
         self.drag_mode = self._get_drag_mode(vx, vy)
@@ -1462,6 +1515,9 @@ class VideoPreviewWidget(QWidget):
             self.setFocus()
 
     def _handle_mouse_move(self, widget: QWidget, event: QMouseEvent):
+        if self._preview_mode:
+            widget.setCursor(Qt.CursorShape.ArrowCursor)
+            return
         if self.drag_mode == self.DRAG_NONE or self.drag_start_pos is None:
             vx, vy = self._display_to_rotated_coords(widget, event.pos())
             mode = self._get_drag_mode(vx, vy)
