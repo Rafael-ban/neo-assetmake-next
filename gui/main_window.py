@@ -686,8 +686,6 @@ class MainWindow(QMainWindow):
         self.video_preview.load_failed.connect(
             lambda msg: self._on_preview_load_failed(
                 "循环视频", msg, self.video_preview))
-        self.video_preview.crop_mode_changed.connect(
-            lambda on: self._on_preview_crop_mode_changed(self.video_preview, on))
         # 裁剪框变化写入 config.editor(此前从未连接:关闭即静默丢失)
         self.video_preview.cropbox_changed.connect(
             lambda *a: self._on_editor_state_changed(self.video_preview))
@@ -709,11 +707,8 @@ class MainWindow(QMainWindow):
         self.intro_preview.load_failed.connect(
             lambda msg: self._on_preview_load_failed(
                 "入场视频", msg, self.intro_preview))
-        self.intro_preview.crop_mode_changed.connect(
-            lambda on: self._on_preview_crop_mode_changed(self.intro_preview, on))
         self.intro_preview.cropbox_changed.connect(
             lambda *a: self._on_editor_state_changed(self.intro_preview))
-        self.timeline.crop_mode_toggled.connect(self._on_toggle_crop_mode)
 
         self._connect_timeline_to_preview(self.intro_preview)
 
@@ -1272,12 +1267,12 @@ class MainWindow(QMainWindow):
                     load_failures.append("入场视频")
                     self._cancel_editor_restore(self.intro_preview)
 
-        # load_video 现在是异步受理:返回 False 仅代表同步拒绝(文件/mpv 缺失),
+        # load_video 现在是异步受理:返回 False 仅代表同步拒绝(文件不存在),
         # 元数据探测失败会经 load_failed 信号进入 _on_preview_load_failed 聚合弹窗。
         if load_failures:
             QMessageBox.warning(
                 self, "部分素材加载失败",
-                "以下素材无法开始加载（请确认 mpv 与文件可用）：\n"
+                "以下素材无法开始加载（请确认文件可被 VapourSynth/lsmas 解码）：\n"
                 + "、".join(load_failures),
             )
 
@@ -2783,12 +2778,12 @@ class MainWindow(QMainWindow):
                     self.video_preview.load_static_image_from_file(path)
                 else:
                     logger.info("加载视频文件...")
-                    # 同步拒绝(文件/mpv 缺失)即时弹窗;探测失败会经
+                    # 同步拒绝(文件不存在)即时弹窗;探测失败会经
                     # load_failed 信号弹窗,预览区同时显示错误文案。
                     if not self.video_preview.load_video(path):
                         QMessageBox.warning(
                             self, "加载失败",
-                            "无法开始加载视频，请确认 mpv 与文件可用。")
+                            "无法开始加载视频，请确认文件可被 VapourSynth/lsmas 解码。")
                         return
                     if self._config:
                         # 换了新素材:旧文件的取景状态不再适用。
@@ -2871,7 +2866,7 @@ class MainWindow(QMainWindow):
                 self._apply_theme_image(value)
 
         elif setting_name == 'hardware_acceleration':
-            # No-op: preview playback is mpv (hardware decode handled internally);
+            # No-op: preview decodes on the CPU through VapourSynth/lsmas;
             # the retired in-process OpenGL renderer had this toggle.
             pass
 
@@ -3132,8 +3127,6 @@ class MainWindow(QMainWindow):
         self.timeline.rotation_value_changed.connect(preview.set_rotation)
 
         self._timeline_preview = preview
-        if hasattr(preview, 'is_crop_mode'):
-            self.timeline.set_crop_mode_checked(preview.is_crop_mode())
 
         if hasattr(preview, 'total_frames') and preview.total_frames > 0:
             self.timeline.set_total_frames(preview.total_frames)
@@ -3208,10 +3201,8 @@ class MainWindow(QMainWindow):
         # (_collect_preview_media_state 优先复用预览缓存),导出本就是阻塞
         # 模态流程;预览路径的探测已改为 MetadataProbeWorker 异步执行。
         from core.video_processor import VideoProcessor
-        from core.media_tools import MediaToolchain
 
-        toolchain = MediaToolchain.discover()
-        info = VideoProcessor(toolchain.mpv_path).get_video_info(video_path)
+        info = VideoProcessor().get_video_info(video_path)
         if info is None:
             raise RuntimeError(f"Unable to probe video metadata: {video_path}")
         return info.width, info.height, max(1, info.total_frames), info.fps or 30.0
@@ -3709,25 +3700,6 @@ class MainWindow(QMainWindow):
         self._finish_editor_restore(self.video_preview)
         self.status_bar.showMessage(f"视频已加载: {total_frames} 帧, {fps:.1f} FPS")
 
-    def _on_toggle_crop_mode(self):
-        """时间轴"裁剪"开关:对当前绑定的预览器进出静帧裁剪模式。"""
-        preview = self._timeline_preview
-        if preview is None:
-            return
-        if preview.is_crop_mode():
-            preview.exit_crop_mode()
-            return
-        if preview.enter_crop_mode():
-            self.status_bar.showMessage("裁剪模式：在冻结帧上拖动裁剪框(播放/跳帧自动退出)")
-        else:
-            self.timeline.set_crop_mode_checked(False)
-            self.status_bar.showMessage("请先加载素材再进入裁剪模式")
-
-    def _on_preview_crop_mode_changed(self, preview, enabled: bool):
-        """预览器裁剪模式变化(含播放/跳帧自动退出)→ 同步时间轴按钮。"""
-        if self._timeline_preview is preview:
-            self.timeline.set_crop_mode_checked(enabled)
-
     def _on_editor_state_changed(self, preview):
         """预览裁剪/旋转/入出点变化 → 写入 config.editor 并标记项目已修改。
 
@@ -3820,7 +3792,7 @@ class MainWindow(QMainWindow):
         if failures:
             QMessageBox.warning(
                 self, "素材加载失败",
-                "以下素材无法获取视频元数据（请确认 mpv 与文件可用）：\n"
+                "以下素材无法获取视频元数据（请确认文件可被 VapourSynth/lsmas 解码）：\n"
                 + "、".join(failures),
             )
 
@@ -3859,11 +3831,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "请先加载视频")
             return
 
-        # mpv 渲染在自己的子窗口里，控件内存中的帧只是占位符——先通过 IPC 把
-        # 真实帧读回来（截图回填），拿到后再继续原有流程。
+        # 帧由 VapourSynth 图直接给出（异步:首帧可能仍在解码），拿到后再继续。
         def _deliver(frame):
             if frame is None:
-                logger.warning("截取视频帧失败：未能从 mpv 读回当前帧")
+                logger.warning("截取视频帧失败：未能从预览图取回当前帧")
                 QMessageBox.warning(self, "警告", "截取视频帧失败，请稍后重试")
                 return
             self._finish_capture_frame(source_preview, frame)

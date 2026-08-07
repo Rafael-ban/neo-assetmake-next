@@ -34,7 +34,7 @@ def _toolchain():
     from core.media_tools import MediaToolchain
 
     return MediaToolchain(
-        mpv_path="mpv.exe", vspipe_path="VSPipe.exe",
+        vspipe_path="VSPipe.exe",
         x264_path="x264-7mod.exe", muxer_path="MP4Box.exe",
     )
 

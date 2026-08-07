@@ -209,7 +209,6 @@ class TimelineWidget(QWidget):
     set_out_point_clicked = pyqtSignal()
     simulator_requested = pyqtSignal()  # 模拟器启动请求信号
     rotation_value_changed = pyqtSignal(int)  # 旋转角度变更信号
-    crop_mode_toggled = pyqtSignal()  # 静帧裁剪模式开关请求
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -285,11 +284,6 @@ class TimelineWidget(QWidget):
         self.btn_preview.setToolTip("启动模拟器预览实际显示效果")
         control_layout.addWidget(self.btn_preview)
 
-        self.btn_crop = PushButton("裁剪")
-        self.btn_crop.setCheckable(True)
-        self.btn_crop.setToolTip("裁剪模式：在冻结帧上拖动裁剪框(播放/跳帧自动退出)")
-        control_layout.addWidget(self.btn_crop)
-
         self.btn_rotate_ccw = ToolButton()
         self.btn_rotate_ccw.setText("↺")
         self.btn_rotate_ccw.setFixedWidth(32)
@@ -339,7 +333,6 @@ class TimelineWidget(QWidget):
         self.btn_set_out.clicked.connect(self.set_out_point_clicked.emit)
         self.timeline_slider.seek_requested.connect(self.seek_requested.emit)
         self.btn_preview.clicked.connect(self.simulator_requested.emit)
-        self.btn_crop.clicked.connect(self.crop_mode_toggled.emit)
         self.btn_rotate_ccw.clicked.connect(lambda: self._step_rotation(-90))
         self.btn_rotate_cw.clicked.connect(lambda: self._step_rotation(90))
         self.spin_rotation.valueChanged.connect(self._on_spin_changed)
@@ -399,12 +392,6 @@ class TimelineWidget(QWidget):
         self.spin_rotation.blockSignals(True)
         self.spin_rotation.setValue(degrees % 360)
         self.spin_rotation.blockSignals(False)
-
-    def set_crop_mode_checked(self, checked: bool):
-        """同步裁剪模式按钮显示（blockSignals 防止信号循环）"""
-        self.btn_crop.blockSignals(True)
-        self.btn_crop.setChecked(checked)
-        self.btn_crop.blockSignals(False)
 
     def _step_rotation(self, delta: int):
         """按步进调整旋转角度"""

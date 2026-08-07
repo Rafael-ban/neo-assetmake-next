@@ -174,7 +174,15 @@ jobs:
           7z x media-tools-v1.0.7z -y
 
           # Verify critical binaries exist
-          $requiredTools = @("mpv.exe", "VSPipe.exe", "x264-7mod.exe")
+          # Preview + export both run through VapourSynth now. The plugin
+          # autoload anchors on the directory of the loaded VapourSynth.dll and
+          # is gated by the `portable.vs` marker, so a missing marker or plugin
+          # degrades SILENTLY to "no plugins" at runtime — fail the build here.
+          $requiredTools = @(
+            "VSPipe.exe", "x264-7mod.exe",
+            "vapoursynth.pyd", "vapoursynth.dll", "portable.vs",
+            "vs-plugins/LSMASHSource.dll", "vs-plugins/libimwri.dll"
+          )
           foreach ($tool in $requiredTools) {
             $path = "tools/media/$tool"
             if (-not (Test-Path $path)) {

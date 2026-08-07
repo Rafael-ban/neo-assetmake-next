@@ -1,13 +1,9 @@
-"""Video preview widget backed by mpv playback and metadata."""
+"""Video preview widget backed by the in-process VapourSynth render graph."""
 
 from __future__ import annotations
 
 import logging
 import os
-import json
-import sys
-import tempfile
-import uuid
 from typing import Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
@@ -19,9 +15,8 @@ try:
 except ImportError:
     HAS_CV2 = False
 
-from PyQt6.QtCore import QCoreApplication, QPoint, QProcess, QSize, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, QSize, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import (
-    QGuiApplication,
     QImage,
     QKeyEvent,
     QMouseEvent,
@@ -29,7 +24,6 @@ from PyQt6.QtGui import (
     QPen,
     QPixmap,
 )
-from PyQt6.QtNetwork import QLocalSocket
 from PyQt6.QtWidgets import QLabel, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
 from qfluentwidgets import CaptionLabel, setCustomStyleSheet
 
@@ -38,16 +32,6 @@ from core.video_processor import MetadataProbeWorker
 
 if TYPE_CHECKING:
     from config.epconfig import EPConfig
-
-# mpv JSON-IPC connection retry budget. The connect is driven asynchronously on
-# the GUI thread via QTimer, so these never block the UI.
-_MPV_IPC_MAX_ATTEMPTS = 100
-_MPV_IPC_RETRY_MS = 100
-
-# QProcess instances detached during async teardown: they must outlive the
-# widget until their `finished` signal releases them, otherwise C++-side
-# destruction of a still-running QProcess kills the app.
-_DYING_MPV_PROCESSES: list = []
 
 # In-flight metadata probe workers. A superseded load drops the widget's own
 # reference to its worker; without this keep-alive the unparented QThread's
@@ -94,23 +78,6 @@ class _PreviewLabel(QLabel):
         self._owner._handle_mouse_release(event)
 
 
-class _MpvSurface(QWidget):
-    """Bare native host window for mpv's --wid embedding.
-
-    mpv creates its own child window filling this HWND (mpv manual, --wid):
-    that child receives the paint and mouse traffic, so QPainter overlays
-    drawn here are occluded and Qt mouse handlers never fire. Crop editing
-    therefore happens on a frozen frame on the QLabel page (crop mode)
-    instead of over the live video.
-    """
-
-    def __init__(self, owner: "VideoPreviewWidget"):
-        super().__init__(owner)
-        self._owner = owner
-        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        self.setAttribute(Qt.WidgetAttribute.WA_DontCreateNativeAncestors, True)
-
-
 class VideoPreviewWidget(QWidget):
     """Preview media, expose crop/trim state, and keep the legacy public API."""
 
@@ -118,9 +85,8 @@ class VideoPreviewWidget(QWidget):
     frame_changed = pyqtSignal(int)
     playback_state_changed = pyqtSignal(bool)
     video_loaded = pyqtSignal(int, float)
-    load_failed = pyqtSignal(str)  # async metadata probe / mpv launch failure
+    load_failed = pyqtSignal(str)  # async metadata probe failure
     rotation_changed = pyqtSignal(int)
-    crop_mode_changed = pyqtSignal(bool)  # still-frame crop mode entered/left
 
     DRAG_NONE = 0
     DRAG_MOVE = 1
@@ -139,28 +105,15 @@ class VideoPreviewWidget(QWidget):
         self.current_frame_index = 0
         self.current_frame: Optional[np.ndarray] = None
 
-        self._mpv_process: Optional[QProcess] = None
-        self._mpv_socket: Optional[QLocalSocket] = None
-        self._mpv_ipc_server = ""
-        self._mpv_ipc_attempts = 0  # async IPC-connect retry counter
-        self._mpv_ipc_connected = False  # True once the IPC socket has connected
-        self._pending_mpv_cmds: list = []  # (command, on_reply) queued before connect
-        self._mpv_read_buf = b""  # partial JSON-IPC line buffer
-        self._mpv_request_id = 0  # monotonically increasing JSON-IPC request_id
-        self._mpv_reply_callbacks: dict = {}  # request_id -> on_reply callable
-        self._screenshot_refresh_timer: Optional[QTimer] = None
         # Load-generation token: bumped by every new load/clear. Deferred
-        # continuations (probe results, IPC connect retries, screenshot
-        # retries) capture it at schedule time and no-op when stale, so a
-        # slow continuation from load A can never corrupt load B's session.
+        # continuations (probe results, frame deliveries) capture it at
+        # schedule time and no-op when stale, so a slow continuation from
+        # load A can never corrupt load B's session. Still load-bearing:
+        # lsmas index building is slow and asynchronous.
         self._load_epoch = 0
         self._probe_worker: Optional[MetadataProbeWorker] = None
-        # IPC connect retry runs on a child QTimer + bound-method slot, so the
-        # timer dies with the widget and can never fire into a deleted object.
-        self._ipc_retry_timer: Optional[QTimer] = None
-        self._ipc_retry_epoch = 0
-        self._crop_mode = False  # editing the crop on a frozen frame (page 0)
-        # VapourSynth frame-request preview (the mpv player's replacement).
+        # In-process VapourSynth preview: frames are pulled on a VS worker
+        # thread and delivered here by Qt signals.
         self._frame_requester = None
         self._vs_active = False
         self._media_toolchain = MediaToolchain.discover()
@@ -216,11 +169,6 @@ class VideoPreviewWidget(QWidget):
         )
         self._display_stack.addWidget(self.video_label)
 
-        self._mpv_widget = _MpvSurface(self)
-        self._mpv_widget.setMouseTracking(True)
-        self._mpv_widget.setStyleSheet("background-color: #000; border: none;")
-        self._mpv_page_index = self._display_stack.addWidget(self._mpv_widget)
-
         layout.addWidget(self._display_stack)
         self.info_label = CaptionLabel("Frame 0/0 | Crop: (0, 0, 0, 0)")
         setCustomStyleSheet(
@@ -231,120 +179,17 @@ class VideoPreviewWidget(QWidget):
         layout.addWidget(self.info_label)
 
     def _teardown_media(self, sync_shutdown: bool = False):
-        # Drop the VS graph first: no child process, so nothing to wait on.
-        self._stop_vs_preview(permanent=sync_shutdown)
-        return self._teardown_mpv(sync_shutdown=sync_shutdown)
+        """Release the preview backend. No child process, so nothing to wait on.
 
-    def _teardown_mpv(self, sync_shutdown: bool = False):
-        self._stop_mpv_process(sync=sync_shutdown)
-        self._has_video = False
-
-    def _stop_mpv_process(self, sync: bool = False):
-        """Tear down the mpv session.
-
-        Reload/clear paths run ASYNCHRONOUSLY: `quit` is sent, the process is
-        detached, and kill-escalation runs on timers — the GUI thread never
-        calls the blocking `QProcess.waitForFinished` (QtCore.pyi:6985), which
-        used to freeze the UI up to ~6.1s on every video switch. ``sync=True``
-        is reserved for window-close/app-quit, where the event loop is about
-        to stop and timers would never fire.
+        This used to tear down an mpv QProcess + QLocalSocket: a `quit`
+        handshake, detaching the process into a module-level keep-alive list,
+        and two escalating kill timers — all to dodge the blocking
+        QProcess.waitForFinished (PyQt6 QtCore.pyi:6985) that froze the UI for
+        seconds on every video switch. Dropping the VS graph is synchronous and
+        cheap, so the whole apparatus is gone.
         """
-        socket = self._mpv_socket
-        process = self._mpv_process
-        # Best-effort graceful quit while the socket is still connected.
-        if socket is not None and socket.state() == QLocalSocket.LocalSocketState.ConnectedState:
-            try:
-                self._send_mpv_command(["quit"])
-            except Exception:
-                pass
-        self._mpv_socket = None
-        self._mpv_process = None
-        # Pending replies can never arrive once the socket is gone.
-        self._mpv_reply_callbacks = {}
-        if self._screenshot_refresh_timer is not None:
-            self._screenshot_refresh_timer.stop()
-        if self._ipc_retry_timer is not None:
-            self._ipc_retry_timer.stop()
-        try:
-            if socket is not None:
-                socket.disconnectFromServer()
-                socket.abort()
-                socket.deleteLater()
-        except Exception as exc:
-            logger.debug("mpv socket shutdown failed: %s", exc)
-        if process is None:
-            return
-        try:
-            if process.state() == QProcess.ProcessState.NotRunning:
-                process.deleteLater()
-                return
-            if sync:
-                if process.state() != QProcess.ProcessState.NotRunning:
-                    process.waitForFinished(3000)
-                if process.state() != QProcess.ProcessState.NotRunning:
-                    process.kill()
-                    process.waitForFinished(3000)
-                process.deleteLater()
-                return
-        except Exception as exc:
-            logger.debug("mpv shutdown failed: %s", exc)
-            return
-        # Async detach: `quit` was already sent; release on `finished`, and
-        # escalate to kill if mpv lingers. No GUI-thread blocking involved.
-        # Un-parent the process first — a dying process must outlive this
-        # widget, and cascade-deleting a running QProcess with the widget
-        # would fire Qt warnings / kill semantics at an uncontrolled time.
-        process.setParent(None)
-        _DYING_MPV_PROCESSES.append(process)
-
-        def _release(*_args):
-            try:
-                _DYING_MPV_PROCESSES.remove(process)
-            except ValueError:
-                return  # already released
-            process.deleteLater()
-
-        process.finished.connect(_release)
-
-        def _kill_if_running():
-            try:
-                if process in _DYING_MPV_PROCESSES and \
-                        process.state() != QProcess.ProcessState.NotRunning:
-                    process.kill()
-            except RuntimeError:
-                pass  # C++ object already gone
-
-        QTimer.singleShot(1500, _kill_if_running)
-        QTimer.singleShot(4000, _kill_if_running)
-
-    def _send_mpv_command(self, command: list, on_reply=None):
-        if self._mpv_socket is None or \
-                self._mpv_socket.state() != QLocalSocket.LocalSocketState.ConnectedState:
-            # Not connected yet: queue so an early seek/pause/rotate issued during the
-            # async connect window isn't silently lost. Bound the queue so a mpv that
-            # never connects can't grow it without limit.
-            if self._mpv_process is not None:
-                self._pending_mpv_cmds.append((command, on_reply))
-                del self._pending_mpv_cmds[:-32]
-            return
-        # mpv echoes request_id in the reply together with an "error" field, so
-        # replies can be correlated to callers and failures logged instead of
-        # being silently dropped.
-        self._mpv_request_id += 1
-        request_id = self._mpv_request_id
-        if on_reply is not None:
-            self._mpv_reply_callbacks[request_id] = on_reply
-        payload = json.dumps(
-            {"command": command, "request_id": request_id}, separators=(",", ":")
-        )
-        self._mpv_socket.write((payload + "\n").encode("utf-8"))
-        self._mpv_socket.waitForBytesWritten(100)
-
-    def _make_mpv_ipc_server(self) -> str:
-        name = f"neo_assetmaker_mpv_{os.getpid()}_{uuid.uuid4().hex}"
-        if sys.platform == "win32":
-            return name
-        return os.path.join(tempfile.gettempdir(), name)
+        self._stop_vs_preview(permanent=sync_shutdown)
+        self._has_video = False
 
     # ------------------------------------------------------------------
     # VapourSynth frame-request preview (replaces the mpv IPC player)
@@ -477,182 +322,6 @@ class VideoPreviewWidget(QWidget):
             else:
                 self._frame_requester.clear()
 
-    def _start_mpv_preview(self, path: str) -> bool:
-        """启动 mpv 预览（异步方式，不阻塞 UI）"""
-        self._stop_mpv_process()
-
-        # 准备 IPC 服务器名称
-        self._mpv_ipc_server = self._make_mpv_ipc_server()
-
-        # 切换到 mpv 页面
-        self._display_stack.setCurrentIndex(self._mpv_page_index)
-        QCoreApplication.processEvents()
-
-        # 构建 mpv 参数
-        platform_name = (QGuiApplication.platformName() or "").lower()
-        is_headless = platform_name == "offscreen"
-        args = [
-            "--no-config",
-            "--keep-open=yes",
-            "--pause=yes",
-            f"--input-ipc-server={self._mpv_ipc_server}",
-            "--osc=no",
-            # Software screenshot rendering: works VO-independently, so
-            # screenshot-to-file succeeds both under --wid embedding and the
-            # headless --vo=null branch (mpv manual, --screenshot-sw).
-            "--screenshot-sw=yes",
-        ]
-        if is_headless:
-            args.extend(["--force-window=no", "--ao=null", "--vo=null"])
-        else:
-            mpv_window_id = int(self._mpv_widget.winId())
-            args.extend(["--force-window=yes", f"--wid={mpv_window_id}"])
-        args.append(path)
-
-        # 在 GUI 线程创建 QProcess（正确的线程亲和），用信号异步驱动启动。
-        # 不再放到工作线程里：QProcess/QLocalSocket 只能在其所属线程使用，且
-        # 其事件驱动 I/O 与 deleteLater 依赖所属线程的事件循环。
-        self._mpv_process = QProcess(self)
-        self._mpv_process.errorOccurred.connect(self._on_mpv_process_error)
-        self._mpv_process.started.connect(self._on_mpv_process_started)
-        self._mpv_process.start(self._media_toolchain.mpv_path, args)
-
-        # 立即返回 True，实际结果通过 started / IPC 连接信号异步通知
-        return True
-
-    def _on_mpv_process_started(self):
-        """mpv 进程已启动 → 开始异步连接其 JSON IPC 服务器。"""
-        logger.debug("mpv process started, connecting IPC...")
-        self._mpv_ipc_attempts = 0
-        self._mpv_ipc_connected = False
-        self._pending_mpv_cmds = []
-        self._mpv_read_buf = b""
-        self._mpv_reply_callbacks = {}
-        self._try_mpv_ipc_connect()
-
-    def _try_mpv_ipc_connect(self):
-        """尝试连接 mpv 的 IPC 服务器；失败则用 QTimer 异步重试（不阻塞 UI）。"""
-        if self._mpv_process is None:
-            return  # 已被 _stop_mpv_process 取消
-        self._mpv_ipc_attempts += 1
-        socket = QLocalSocket(self)
-        self._mpv_socket = socket
-        socket.connected.connect(self._on_mpv_ipc_connected)
-        socket.errorOccurred.connect(self._on_mpv_ipc_error)
-        socket.connectToServer(self._mpv_ipc_server)
-
-    def _on_mpv_ipc_connected(self):
-        """IPC 连接成功：开始观察播放位置、补发排队命令、应用旋转。"""
-        logger.info("mpv IPC connected after %d attempt(s)", self._mpv_ipc_attempts)
-        self._mpv_ipc_connected = True
-        # Read mpv's replies/events so we can track the real playback position.
-        if self._mpv_socket is not None:
-            self._mpv_socket.readyRead.connect(self._on_mpv_readable)
-        self._mpv_read_buf = b""
-        self._send_mpv_command(["observe_property", 1, "time-pos"])
-        if self._rotation:
-            self._send_mpv_command(["set_property", "video-rotate", self._rotation])
-        # Flush commands that were queued before the socket connected (early seek/pause).
-        pending, self._pending_mpv_cmds = self._pending_mpv_cmds, []
-        for cmd, on_reply in pending:
-            self._send_mpv_command(cmd, on_reply)
-
-    def _on_mpv_readable(self):
-        """Drain mpv JSON-IPC lines and dispatch them (Pc: time-pos observation)."""
-        if self._mpv_socket is None:
-            return
-        self._mpv_read_buf += bytes(self._mpv_socket.readAll())
-        while b"\n" in self._mpv_read_buf:
-            raw, self._mpv_read_buf = self._mpv_read_buf.split(b"\n", 1)
-            raw = raw.strip()
-            if not raw:
-                continue
-            try:
-                msg = json.loads(raw.decode("utf-8", "replace"))
-            except (ValueError, TypeError):
-                continue
-            self._handle_mpv_message(msg)
-
-    def _handle_mpv_message(self, msg: dict):
-        """Handle one parsed mpv IPC message; drive the frame counter from time-pos."""
-        if not isinstance(msg, dict):
-            return
-        request_id = msg.get("request_id")
-        if request_id is not None:
-            callback = self._mpv_reply_callbacks.pop(request_id, None)
-            error = msg.get("error")
-            if error not in (None, "success"):
-                logger.warning(
-                    "mpv command failed (request_id=%s): %s", request_id, error
-                )
-            if callback is not None:
-                try:
-                    callback(msg)
-                except Exception:
-                    logger.exception("mpv reply callback raised")
-            return
-        if msg.get("event") == "property-change" and msg.get("name") == "time-pos":
-            data = msg.get("data")
-            if isinstance(data, (int, float)) and self.video_fps > 0:
-                idx = int(round(data * self.video_fps))
-                idx = max(0, min(idx, max(0, self.total_frames - 1)))
-                if idx != self.current_frame_index:
-                    self.current_frame_index = idx
-                    self.frame_changed.emit(idx)
-                    self._update_info_label()
-
-    def _on_mpv_ipc_error(self, _err):
-        """IPC socket 出错：区分"从未连上(重试)"与"连上后断开(mpv 正常退出，勿重试)"。"""
-        socket = self._mpv_socket
-        if socket is not None:
-            socket.abort()
-            socket.deleteLater()
-            self._mpv_socket = None
-        # A post-connect error means mpv closed the pipe (e.g. a normal quit), not a
-        # failed initial connect — do NOT re-enter the retry loop or show a spurious
-        # "mpv IPC connection failed".
-        if self._mpv_ipc_connected:
-            logger.debug("mpv IPC closed after a successful connection")
-            return
-        if self._mpv_process is None:
-            return  # 已停止
-        if self._mpv_ipc_attempts >= _MPV_IPC_MAX_ATTEMPTS:
-            self._on_mpv_launch_failed("mpv IPC connection failed after multiple attempts")
-            return
-        # Capture the load epoch: if the user loads another video during the
-        # retry window, the stale timer must not connect to (and hijack) the
-        # NEW session's socket — `_mpv_process is not None` alone passes
-        # wrongly in that case because the new load already created a process.
-        self._ipc_retry_epoch = self._load_epoch
-        if self._ipc_retry_timer is None:
-            self._ipc_retry_timer = QTimer(self)
-            self._ipc_retry_timer.setSingleShot(True)
-            self._ipc_retry_timer.timeout.connect(self._on_ipc_retry_due)
-        self._ipc_retry_timer.start(_MPV_IPC_RETRY_MS)
-
-    def _on_ipc_retry_due(self):
-        if self._ipc_retry_epoch != self._load_epoch:
-            return  # a newer load owns the mpv session now
-        self._try_mpv_ipc_connect()
-
-    def _on_mpv_process_error(self, error):
-        """QProcess 层错误。只有启动失败才当作 launch 失败，避免停止时的误报。"""
-        if self._mpv_process is None:
-            return  # 停止过程中，忽略
-        if error == QProcess.ProcessError.FailedToStart:
-            self._on_mpv_launch_failed(f"mpv failed to start: {self._mpv_process.errorString()}")
-
-    def _on_mpv_launch_failed(self, error_msg: str):
-        """mpv 启动/连接失败：清理并显示错误。"""
-        logger.error("mpv launch failed: %s", error_msg)
-        self._stop_mpv_process()
-        self._display_stack.setCurrentIndex(0)
-        self.video_label.setText(f"mpv launch failed: {error_msg}")
-
-        # 标记加载失败并对外可见(此时 video_loaded 可能已发出)
-        self._has_video = False
-        self.load_failed.emit(error_msg)
-
     def set_target_resolution(self, width: int, height: int):
         if self.target_width == width and self.target_height == height:
             return
@@ -677,24 +346,23 @@ class VideoPreviewWidget(QWidget):
 
         Returns True when the load was *accepted*; the metadata probe then runs
         on a worker thread and the outcome arrives via ``video_loaded`` /
-        ``load_failed``. Returns False only for synchronous rejections (file or
-        mpv missing). The probe's blocking ``waitFor*`` chain used to run right
-        here on the GUI thread, freezing the UI for up to tens of seconds per
-        load (QtNetwork.pyi:202-205, QtCore.pyi:6985-6988 — blocking calls).
+        ``load_failed``. Returns False only for synchronous rejections (missing
+        file, or no usable VapourSynth core). The probe used to be a blocking
+        mpv JSON-IPC ``waitFor*`` chain running right here on the GUI thread,
+        freezing the UI for up to tens of seconds per load (PyQt6
+        QtNetwork.pyi:202-205, QtCore.pyi:6985-6988 — blocking calls).
         """
         logger.info("Loading video: %s", path)
         if not os.path.exists(path):
             self.video_label.setText(f"File not found: {path}")
             return False
 
-        self._media_toolchain = MediaToolchain.discover()
-        if not (self._use_vs_preview() or self._media_toolchain.mpv_path):
-            self.video_label.setText("无可用的视频后端(VapourSynth / mpv)")
+        if not self._use_vs_preview():
+            self.video_label.setText("VapourSynth 不可用,无法预览")
             return False
 
         self._load_epoch += 1
         epoch = self._load_epoch
-        self._reset_crop_mode()
         self._teardown_media()
         self.pause()
         self._loop_frame = None
@@ -707,7 +375,7 @@ class VideoPreviewWidget(QWidget):
         # widget while possibly still running (fatal). The worker keeps itself
         # alive until `finished` -> deleteLater; the bound-method connections
         # below auto-disconnect if this widget's C++ side goes away first.
-        worker = MetadataProbeWorker(self._media_toolchain.mpv_path, path)
+        worker = MetadataProbeWorker(path)
         worker.epoch = epoch
         self._probe_worker = worker
         worker.result.connect(self._on_probe_worker_result)
@@ -739,22 +407,19 @@ class VideoPreviewWidget(QWidget):
         self.video_height = max(1, info.height)
         self.total_frames = max(1, info.total_frames)
         self.current_frame_index = 0
-        # The mpv path needs a placeholder because mpv renders into its own
-        # child window and the widget never sees pixels until a screenshot
-        # round trip. The VapourSynth path fills current_frame from the first
-        # frame request instead, so DON'T seed a black frame there — a consumer
-        # (截取帧 / crop) that reads it too early would otherwise get black.
-        self.current_frame = (
-            None if self._use_vs_preview()
-            else np.zeros((self.video_height, self.video_width, 3), dtype=np.uint8)
-        )
+        # current_frame stays None until the first real frame arrives. Never
+        # seed a black placeholder: a consumer (截取帧 / crop) reading it early
+        # would silently get black pixels, which is exactly the defect the old
+        # mpv screenshot round trip produced.
+        self.current_frame = None
         self._has_video = True
         self._init_cropbox()
         self._update_info_label()
         if not self._start_vs_preview(path):
-            # VapourSynth unavailable (no bundle / plugin / Qt-order issue):
-            # keep the legacy mpv preview so media still plays.
-            self._start_mpv_preview(path)
+            self._has_video = False
+            self.video_label.setText("无法建立 VapourSynth 预览")
+            self.load_failed.emit("无法建立 VapourSynth 预览")
+            return
         self.video_loaded.emit(self.total_frames, self.video_fps)
 
     def _on_probe_failed(self, epoch: int, message: str):
@@ -815,7 +480,6 @@ class VideoPreviewWidget(QWidget):
 
     def _load_static_frame(self, frame: np.ndarray) -> bool:
         self._load_epoch += 1  # invalidate pending probe/retry continuations
-        self._reset_crop_mode()
         self.pause()
         self._teardown_media()
         self._loop_frame = None
@@ -992,14 +656,8 @@ class VideoPreviewWidget(QWidget):
             self._rebuild_vs_graph()
             self._update_info_label()
             return
-        if self.current_frame is not None and self._display_stack.currentIndex() == 0:
+        if self.current_frame is not None:
             self._display_frame(self.current_frame)
-        else:
-            self._update_display_geometry(
-                self._mpv_widget,
-                *self._get_rotated_video_size(),
-            )
-            self._mpv_widget.update()
         self._update_info_label()
 
     def _update_display_geometry(self, widget: QWidget, media_w: int, media_h: int):
@@ -1035,29 +693,21 @@ class VideoPreviewWidget(QWidget):
     def _on_timer_tick(self):
         if not (self._has_video or self._loop_frame is not None):
             return
-        # mpv path: the frame index is driven by observed time-pos
-        # (_handle_mpv_message), so don't also free-run the counter (drift).
-        if self._mpv_process is not None:
-            return
         self.current_frame_index += 1
         if self.current_frame_index >= max(1, self.total_frames):
             self.current_frame_index = 0
-        # VapourSynth path: THIS timer is the playback clock. Ask for the frame
-        # we just advanced to; coalesce so a slow decode drops frames instead of
-        # queueing a backlog that is already stale by the time it lands.
+        # THIS timer is the playback clock. Ask for the frame we just advanced
+        # to; coalesce so a slow decode drops frames instead of queueing a
+        # backlog that is already stale by the time it lands.
         self._request_current_frame(coalesce=True)
         self.frame_changed.emit(self.current_frame_index)
         self._update_info_label()
 
     def play(self):
-        if self._crop_mode:
-            self.exit_crop_mode()  # back to the live video before playback
         if self.is_playing or not (self._has_video or self._loop_frame is not None):
             return
-        if self._mpv_process is not None:
-            self._send_mpv_command(["set_property", "pause", False])
-        # VapourSynth path: `self.timer` IS the playback clock (_on_timer_tick
-        # advances the index and requests that frame).
+        # `self.timer` IS the playback clock (_on_timer_tick advances the index
+        # and requests that frame).
         interval = max(1, round(1000 / max(self.video_fps, 1.0)))
         self.timer.start(interval)
         self.is_playing = True
@@ -1065,11 +715,6 @@ class VideoPreviewWidget(QWidget):
 
     def pause(self):
         self.timer.stop()
-        if self._mpv_process is not None:
-            self._send_mpv_command(["set_property", "pause", True])
-            # Refresh current_frame shortly after pausing so capture/crop tools
-            # see the real frame instead of the load-time placeholder.
-            self._schedule_screenshot_refresh()
         was_playing = self.is_playing
         self.is_playing = False
         if was_playing:
@@ -1082,8 +727,6 @@ class VideoPreviewWidget(QWidget):
             self.play()
 
     def next_frame(self):
-        if self._crop_mode:
-            self.exit_crop_mode()
         if not (self._has_video or self._loop_frame is not None):
             return
         self.pause()
@@ -1095,8 +738,6 @@ class VideoPreviewWidget(QWidget):
         self._update_info_label()
 
     def prev_frame(self):
-        if self._crop_mode:
-            self.exit_crop_mode()
         if not (self._has_video or self._loop_frame is not None):
             return
         self.pause()
@@ -1106,8 +747,6 @@ class VideoPreviewWidget(QWidget):
         self._update_info_label()
 
     def seek_to_frame(self, index: int):
-        if self._crop_mode:
-            self.exit_crop_mode()
         if not (self._has_video or self._loop_frame is not None):
             return
         self.pause()
@@ -1117,119 +756,23 @@ class VideoPreviewWidget(QWidget):
         self._update_info_label()
 
     def _seek_backend_to_current_frame(self):
-        """Seek whichever backend is active to ``current_frame_index``.
+        """Seek to ``current_frame_index`` — one frame request.
 
-        VapourSynth is frame-indexed, so a seek is just a frame request — no
-        fps→seconds→re-quantize round trip and no ±1 drift on VFR sources,
-        which is what ``round(time_pos * fps)`` could produce on the mpv path.
+        VapourSynth is frame-indexed, so a seek needs no fps→seconds→re-quantize
+        round trip and carries no ±1 drift on VFR sources, which is what mpv's
+        ``round(time_pos * fps)`` could produce. This is why preview indices and
+        the export's ``clip[start:end]`` now agree exactly.
         """
         if self._vs_active:
             self._request_current_frame(coalesce=True)
-            return
-        self._seek_mpv_to_current_frame()
-
-    def _seek_mpv_to_current_frame(self):
-        if self._mpv_process is None or self.video_fps <= 0:
-            return
-        seconds = self.current_frame_index / self.video_fps
-        self._send_mpv_command(["seek", seconds, "absolute+exact"])
-        self._schedule_screenshot_refresh()
-
-    def request_screenshot(
-        self, callback=None, _attempts_left: int = 5, _epoch: Optional[int] = None
-    ) -> bool:
-        """Read the current mpv frame back into ``current_frame`` via a temp PNG.
-
-        mpv renders into its own child window, so the widget never sees pixels
-        unless it asks mpv to write them out (`screenshot-to-file <file> video`
-        = the video frame without OSD/subtitles). ``callback(frame | None)``
-        fires once the reply arrives. Returns False when no mpv IPC session is
-        available (callback still fires with None).
-        """
-        if _epoch is None:
-            _epoch = self._load_epoch
-        if (
-            not HAS_CV2
-            or self._mpv_process is None
-            or not self._mpv_ipc_connected
-            or _epoch != self._load_epoch
-        ):
-            if callback is not None:
-                callback(None)
-            return False
-        shot_path = os.path.join(
-            tempfile.gettempdir(), f"neo_mpv_shot_{uuid.uuid4().hex}.png"
-        )
-
-        def _on_reply(msg: dict):
-            frame = None
-            try:
-                if msg.get("error") == "success" and os.path.exists(shot_path):
-                    data = np.fromfile(shot_path, dtype=np.uint8)
-                    decoded = cv2.imdecode(data, cv2.IMREAD_COLOR)
-                    if decoded is not None:
-                        # mpv bakes video-rotate into the screenshot (verified
-                        # against the bundled mpv v0.41: 240x360 becomes 360x240
-                        # after video-rotate=90). current_frame must stay in
-                        # SOURCE orientation like the static-image path, so
-                        # undo the rotation here.
-                        if self._rotation:
-                            decoded = self.apply_rotation_to_frame(
-                                decoded, (360 - self._rotation) % 360
-                            )
-                        frame = decoded
-            finally:
-                try:
-                    if os.path.exists(shot_path):
-                        os.remove(shot_path)
-                except OSError:
-                    pass
-            if frame is None and _attempts_left > 0:
-                # mpv rejects screenshot commands with "error running command"
-                # until the file has finished loading (observed right after
-                # IPC connect on the bundled mpv v0.41) — retry briefly
-                # instead of failing the capture. The retry carries the load
-                # epoch so it can never capture a *different* video's frame.
-                def _retry():
-                    try:
-                        self.request_screenshot(callback, _attempts_left - 1, _epoch)
-                    except RuntimeError:
-                        pass  # widget C++ side destroyed while the timer was pending
-
-                QTimer.singleShot(200, _retry)
-                return
-            if frame is not None:
-                self.current_frame = frame
-            if callback is not None:
-                callback(frame)
-
-        self._send_mpv_command(["screenshot-to-file", shot_path, "video"], _on_reply)
-        return True
-
-    def _schedule_screenshot_refresh(self, delay_ms: int = 150):
-        """Debounced current_frame refresh after pause/seek (mpv sessions only)."""
-        if self._mpv_process is None:
-            return
-        if self._screenshot_refresh_timer is None:
-            self._screenshot_refresh_timer = QTimer(self)
-            self._screenshot_refresh_timer.setSingleShot(True)
-            self._screenshot_refresh_timer.timeout.connect(
-                self._on_screenshot_refresh_due
-            )
-        self._screenshot_refresh_timer.start(delay_ms)
-
-    def _on_screenshot_refresh_due(self):
-        if self._mpv_process is None or not self._mpv_ipc_connected:
-            return
-        self.request_screenshot(None)
 
     def _capture_frame_vs(self, callback) -> bool:
         """Deliver the current frame from the VS graph. No PNG round trip.
 
-        The mpv path had to write a temp PNG via ``screenshot-to-file``, decode
-        it, undo mpv's baked-in ``video-rotate`` and retry while mpv refused the
-        command during loading. With VapourSynth the frame is already in memory
-        and ``current_frame`` is kept in source orientation, so this is a plain
+        The mpv path had to ask the player to write a temp PNG, decode it, undo
+        the rotation mpv had baked in, and retry while mpv refused the request
+        during loading. With VapourSynth the frame is already in memory and
+        ``current_frame`` is kept in source orientation, so this is a plain
         hand-off.
         """
         if not self._vs_active:
@@ -1264,90 +807,17 @@ class VideoPreviewWidget(QWidget):
     def capture_frame_async(self, callback):
         """Deliver the current frame (source orientation) to ``callback``.
 
-        VapourSynth hands the frame over directly; mpv-backed video pauses and
-        reads it back over IPC; static images / image loops already hold it.
+        VapourSynth hands the frame over directly; static images / image loops
+        already hold it. The mpv path had to pause, round-trip a temp PNG through
+        the player, undo the rotation it had baked in, and retry while mpv
+        refused the request during loading — that whole detour (and the black
+        frames it produced when it failed) is gone.
         """
         if self._vs_active:
             self.pause()
             if self._capture_frame_vs(callback):
                 return
-        if self._mpv_process is not None and self._mpv_ipc_connected:
-            self.pause()
-            if self._screenshot_refresh_timer is not None:
-                # The explicit capture below supersedes the debounced refresh.
-                self._screenshot_refresh_timer.stop()
-            self.request_screenshot(callback)
-            return
         callback(self.current_frame)
-
-    def is_crop_mode(self) -> bool:
-        return self._crop_mode
-
-    def enter_crop_mode(self) -> bool:
-        """裁剪模式：冻结当前帧到 QLabel 页并在其上编辑裁剪框。
-
-        mpv 经 ``--wid`` 嵌入时在本控件内创建自己的子窗口(mpv 手册,--wid)：
-        QPainter 覆盖层被其遮挡、鼠标事件也进不了 Qt——活视频上的裁剪交互
-        整体失效,因此裁剪在暂停后的截图帧上进行(复用静态图页已工作的
-        绘制/拖拽路径)。返回 True 表示已进入或已受理(mpv 截图为异步)。
-        """
-        if self._crop_mode:
-            return True
-        if self._vs_active:
-            # No mpv child window to occlude the overlay: the crop box is
-            # already live on the QLabel page, so "crop mode" is a no-op that
-            # only exists to keep the timeline button's state coherent. Wait for
-            # the first real frame so consumers never observe an empty one.
-            self.pause()
-
-            def _engage(*_args) -> None:
-                if self._crop_mode:
-                    return
-                self._crop_mode = True
-                self.crop_mode_changed.emit(True)
-                self._refresh_display()
-
-            if self.current_frame is not None:
-                _engage()
-            else:
-                self._capture_frame_vs(lambda _arr: _engage())
-            return True
-        if self._mpv_process is None or not self._mpv_ipc_connected:
-            # 静态图 / 图片循环本就显示在 QLabel 页,裁剪路径已经可用。
-            if self.current_frame is not None:
-                self._crop_mode = True
-                self.crop_mode_changed.emit(True)
-                self._refresh_display()
-                return True
-            return False
-        self.pause()
-        epoch = self._load_epoch
-
-        def _on_shot(frame):
-            if frame is None or epoch != self._load_epoch or self._crop_mode:
-                return
-            self._crop_mode = True
-            self._display_stack.setCurrentIndex(0)
-            self._display_frame(frame)
-            self.crop_mode_changed.emit(True)
-
-        self.request_screenshot(_on_shot)
-        return True
-
-    def exit_crop_mode(self):
-        if not self._crop_mode:
-            return
-        self._crop_mode = False
-        if self._mpv_process is not None:
-            self._display_stack.setCurrentIndex(self._mpv_page_index)
-            self._refresh_display()
-        self.crop_mode_changed.emit(False)
-
-    def _reset_crop_mode(self):
-        """New media/clear invalidates any frozen-frame crop session."""
-        if self._crop_mode:
-            self._crop_mode = False
-            self.crop_mode_changed.emit(False)
 
     def get_current_frame(self) -> int:
         return self.current_frame_index
@@ -1382,7 +852,7 @@ class VideoPreviewWidget(QWidget):
         return self._preview_mode
 
     def set_rotation(self, degrees: int):
-        # Snap to a cardinal angle: mpv video-rotate and the VapourSynth export only
+        # Snap to a cardinal angle: the VapourSynth export graph only
         # support 0/90/180/270, so keep preview and export in lockstep and never let an
         # arbitrary angle through the UI (timeline SpinBox also steps by 90).
         degrees = (round(int(degrees) / 90) * 90) % 360
@@ -1397,8 +867,6 @@ class VideoPreviewWidget(QWidget):
         if has_video:
             original_box = self._cropbox_to_original_coords(*self.cropbox)
         self._rotation = degrees
-        if self._mpv_process is not None:
-            self._send_mpv_command(["set_property", "video-rotate", degrees])
         if self._vs_active:
             # Rotation is part of the graph, so re-derive it (and refresh the
             # displayed frame) instead of asking a player to rotate for us.
@@ -1610,7 +1078,6 @@ class VideoPreviewWidget(QWidget):
 
     def clear(self, sync_shutdown: bool = False):
         self._load_epoch += 1  # invalidate pending probe/retry continuations
-        self._reset_crop_mode()
         self.pause()
         self._teardown_media(sync_shutdown=sync_shutdown)
         self._loop_frame = None

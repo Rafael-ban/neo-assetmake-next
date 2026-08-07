@@ -1,4 +1,3 @@
-import json
 import os
 import tempfile
 import unittest
@@ -16,14 +15,13 @@ class MediaToolchainTests(unittest.TestCase):
             root = Path(temp_dir)
             media_dir = root / "tools" / "media"
             media_dir.mkdir(parents=True)
-            for name in ("mpv.exe", "VSPipe.exe", "x264-7mod.exe", "MP4Box.exe"):
+            for name in ("VSPipe.exe", "x264-7mod.exe", "MP4Box.exe"):
                 (media_dir / name).write_text("", encoding="utf-8")
             (root / "ffmpeg.exe").write_text("", encoding="utf-8")
             (root / "ffprobe.exe").write_text("", encoding="utf-8")
 
             toolchain = MediaToolchain.discover(root)
 
-        self.assertEqual(Path(toolchain.mpv_path).name, "mpv.exe")
         self.assertEqual(Path(toolchain.vspipe_path).name, "VSPipe.exe")
         self.assertEqual(Path(toolchain.x264_path).name, "x264-7mod.exe")
         self.assertEqual(Path(toolchain.muxer_path).name, "MP4Box.exe")
@@ -82,7 +80,6 @@ class MediaToolchainTests(unittest.TestCase):
         from core.media_tools import MediaToolchain
 
         toolchain = MediaToolchain(
-            mpv_path="mpv.exe",
             vspipe_path="VSPipe.exe",
             x264_path="x264-7mod.exe",
         )
@@ -94,7 +91,6 @@ class MediaToolchainTests(unittest.TestCase):
         from core.media_tools import MediaToolchain
 
         toolchain = MediaToolchain(
-            mpv_path="mpv.exe",
             vspipe_path="VSPipe.exe",
             x264_path="x264-7mod.exe",
             muxer_path="MP4Box.exe",
@@ -247,7 +243,6 @@ class EncoderRunTests(unittest.TestCase):
         from core.media_pipeline import MediaEncoder, MediaToolchain
 
         toolchain = MediaToolchain(
-            mpv_path="mpv.exe",
             vspipe_path="VSPipe.exe",
             x264_path="x264-7mod.exe",
             muxer_path="MP4Box.exe",
@@ -308,8 +303,7 @@ class EncoderRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "out.mp4"
             toolchain = MediaToolchain(
-                mpv_path="mpv.exe",
-                vspipe_path="VSPipe.exe",
+                    vspipe_path="VSPipe.exe",
                 x264_path="x264-7mod.exe",
                 muxer_path="MP4Box.exe",
             )
@@ -367,7 +361,6 @@ class EncoderRunTests(unittest.TestCase):
                 pass
 
         toolchain = MediaToolchain(
-            mpv_path="mpv.exe",
             vspipe_path="VSPipe.exe",
             x264_path="x264-7mod.exe",
             muxer_path="MP4Box.exe",
@@ -377,156 +370,6 @@ class EncoderRunTests(unittest.TestCase):
         with mock.patch("core.media_pipeline.subprocess.Popen", FakePopen):
             with self.assertRaisesRegex(RuntimeError, "missing lsmas plugin"):
                 encoder.encode_vpy_to_mp4("script.vpy", "out.mp4", 30.0)
-
-
-class MpvMetadataTests(unittest.TestCase):
-    def test_metadata_session_requests_properties_over_json_ipc(self):
-        from core import video_processor
-
-        property_values = {
-            "width": 1280,
-            "height": 720,
-            "dwidth": 1280,
-            "dheight": 720,
-            "duration": 3.0,
-            "container-fps": 24.0,
-            "estimated-vf-fps": None,
-            "fps": None,
-            "estimated-frame-count": 72,
-            "video-codec": "h264",
-        }
-
-        class FakeProcess:
-            instances = []
-
-            class ProcessState:
-                NotRunning = "not_running"
-
-            def __init__(self):
-                self.program = None
-                self.arguments = []
-                FakeProcess.instances.append(self)
-
-            def setProgram(self, program):
-                self.program = program
-
-            def setArguments(self, arguments):
-                self.arguments = arguments
-
-            def start(self):
-                pass
-
-            def waitForStarted(self, timeout):
-                return True
-
-            def errorString(self):
-                return ""
-
-            def state(self):
-                return self.ProcessState.NotRunning
-
-            def waitForFinished(self, timeout):
-                return True
-
-            def kill(self):
-                pass
-
-        class FakeSocket:
-            def __init__(self):
-                self.connected_to = None
-                self.written_payloads = []
-                self.incoming = [b'{"event":"file-loaded"}\n']
-
-            def connectToServer(self, server_name):
-                self.connected_to = server_name
-
-            def waitForConnected(self, timeout):
-                return True
-
-            def abort(self):
-                pass
-
-            def canReadLine(self):
-                return bool(self.incoming)
-
-            def waitForReadyRead(self, timeout):
-                return bool(self.incoming)
-
-            def readLine(self):
-                return self.incoming.pop(0)
-
-            def write(self, data):
-                payload = json.loads(bytes(data).decode("utf-8"))
-                self.written_payloads.append(payload)
-                command = payload.get("command", [])
-                if command[:1] == ["get_property"]:
-                    response = {
-                        "request_id": payload["request_id"],
-                        "error": "success",
-                        "data": property_values.get(command[1]),
-                    }
-                    self.incoming.append(
-                        (json.dumps(response, separators=(",", ":")) + "\n").encode(
-                            "utf-8"
-                        )
-                    )
-                return len(data)
-
-            def waitForBytesWritten(self, timeout):
-                return True
-
-            def disconnectFromServer(self):
-                pass
-
-        fake_socket = FakeSocket()
-        with mock.patch("core.video_processor.QProcess", FakeProcess):
-            with mock.patch(
-                "core.video_processor.QLocalSocket",
-                mock.Mock(return_value=fake_socket),
-            ):
-                session = video_processor._MpvMetadataSession("mpv.exe")
-                properties = session.probe("clip.mp4")
-                del session
-
-        process = FakeProcess.instances[0]
-        self.assertEqual(process.program, "mpv.exe")
-        self.assertIn("--vo=null", process.arguments)
-        self.assertIn("--ao=null", process.arguments)
-        self.assertTrue(
-            any(arg.startswith("--input-ipc-server=") for arg in process.arguments)
-        )
-        self.assertEqual(process.arguments[-1], "clip.mp4")
-        self.assertEqual(properties, property_values)
-
-        requested_properties = [
-            payload["command"][1]
-            for payload in fake_socket.written_payloads
-            if payload.get("command", [])[:1] == ["get_property"]
-        ]
-        self.assertEqual(
-            requested_properties,
-            list(video_processor.MPV_METADATA_PROPERTIES),
-        )
-
-    def test_parse_mpv_metadata_uses_frame_count_or_duration_fallback(self):
-        from core.video_processor import parse_mpv_video_info
-
-        info = parse_mpv_video_info(
-            {
-                "width": 1920,
-                "height": 1080,
-                "duration": 2.5,
-                "container-fps": 29.97,
-                "estimated-frame-count": None,
-                "video-codec": "h264",
-            }
-        )
-
-        self.assertEqual(info.width, 1920)
-        self.assertEqual(info.height, 1080)
-        self.assertAlmostEqual(info.fps, 29.97)
-        self.assertEqual(info.total_frames, 75)
-        self.assertEqual(info.codec, "h264")
 
 
 if __name__ == "__main__":

@@ -174,7 +174,6 @@ def _missing_vapoursynth_plugins(vspipe_path: str) -> tuple[str, ...]:
 class MediaToolchain:
     """Resolved paths for the preview and export media toolchain."""
 
-    mpv_path: str = ""
     vspipe_path: str = ""
     x264_path: str = ""
     muxer_path: str = ""
@@ -207,11 +206,22 @@ class MediaToolchain:
         return missing
 
     def missing_for_preview(self) -> list[str]:
-        return [] if self.mpv_path else ["mpv"]
+        """What preview still needs. Preview is in-process VapourSynth now.
+
+        Checked against the loaded core rather than by probing VSPipe: the
+        preview renders through the very core this process holds, so an
+        out-of-process answer could disagree with it.
+        """
+        from core import vs_engine
+
+        try:
+            vs_engine.load_vapoursynth()
+        except Exception:
+            return ["VapourSynth"]
+        return [f"VapourSynth plugin {n}" for n in vs_engine.missing_plugins()]
 
     def describe(self) -> str:
         parts = {
-            "mpv": self.mpv_path,
             "VSPipe": self.vspipe_path,
             "x264-7mod": self.x264_path,
             "MP4 muxer": self.muxer_path,
@@ -223,7 +233,6 @@ class MediaToolchain:
 def _discover_cached(root: str) -> MediaToolchain:
     base = Path(root)
     return MediaToolchain(
-        mpv_path=_find_tool(base, _exe_names("mpv")),
         vspipe_path=_find_tool(base, _exe_names("VSPipe")),
         x264_path=_find_tool(base, ("x264-7mod.exe", "x264-7mod", "x264.exe", "x264")),
         muxer_path=_find_tool(

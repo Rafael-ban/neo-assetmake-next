@@ -49,7 +49,6 @@ def _widget(src, target):
 
     w = VideoPreviewWidget()
     w.video_width, w.video_height = src
-    w._mpv_process = None
     w.set_target_resolution(*target)
     w._init_cropbox()
     return w

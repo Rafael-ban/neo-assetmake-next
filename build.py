@@ -21,7 +21,6 @@ OBFUSCATABLE_ENTRIES = ["main.py", "core", "config", "utils", "_mext"]
 MEDIA_TOOL_DIR = os.path.join("tools", "media")
 MEDIA_TOOL_SOURCE_DIRS = ("", MEDIA_TOOL_DIR)
 MEDIA_TOOL_CANDIDATES = [
-    ("mpv.exe", os.path.join(MEDIA_TOOL_DIR, "mpv.exe")),
     ("VSPipe.exe", os.path.join(MEDIA_TOOL_DIR, "VSPipe.exe")),
     ("x264-7mod.exe", os.path.join(MEDIA_TOOL_DIR, "x264-7mod.exe")),
     ("mp4box.exe", os.path.join(MEDIA_TOOL_DIR, "mp4box.exe")),

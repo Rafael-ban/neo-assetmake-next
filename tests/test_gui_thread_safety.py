@@ -1,11 +1,13 @@
-"""Offscreen GUI regression tests for the USB/mpv thread-safety fixes.
+"""Offscreen GUI regression tests for the USB/preview thread-safety fixes.
 
 Covers:
   B2 - the file-manager delete path raises the busy gate.
   B4 - finished per-op workers are disposed (no QThread accumulation).
-  B3 - mpv QProcess is created on the GUI thread (correct affinity).
+  B3 - the preview backend is in-process VapourSynth and frames reach the GUI
+       thread (this replaced "mpv QProcess is created on the GUI thread": there
+       is no child-process player any more).
 """
-import sys
+import time
 import types
 import unittest
 
@@ -90,57 +92,56 @@ class WorkerDisposalTests(unittest.TestCase):
         self.assertEqual(len(children), 0)
 
 
-class MpvAffinityTests(unittest.TestCase):
-    """B3: mpv QProcess/QLocalSocket must live on the GUI thread."""
+class PreviewBackendTests(unittest.TestCase):
+    """预览后端只剩进程内 VapourSynth:不得再有 mpv 子进程/IPC 机制。
 
-    def test_module_retired_worker_and_added_async_handlers(self):
+    取代了 B3 的"mpv QProcess/QLocalSocket 必须在 GUI 线程"一组断言 —— 那条
+    约束存在的前提(有一个子进程播放器)已经不存在了。现在要守的是相反的性质:
+    这些符号不能回来,且帧交付必须落在 GUI 线程。
+    """
+
+    def test_no_mpv_process_or_ipc_machinery_remains(self):
         import gui.widgets.video_preview as vp
+
         self.assertFalse(hasattr(vp, "MpvLaunchWorker"))
-        cls = next(c for c in vars(vp).values()
-                   if isinstance(c, type) and hasattr(c, "_start_mpv_preview"))
-        self.assertFalse(hasattr(cls, "_on_mpv_launched"))
-        for added in ("_on_mpv_process_started", "_try_mpv_ipc_connect",
-                      "_on_mpv_ipc_connected", "_on_mpv_ipc_error", "_on_mpv_process_error"):
-            self.assertTrue(hasattr(cls, added), added)
+        self.assertFalse(hasattr(vp, "_MpvSurface"))
+        self.assertFalse(hasattr(vp, "_DYING_MPV_PROCESSES"))
+        cls = vp.VideoPreviewWidget
+        for gone in ("_start_mpv_preview", "_stop_mpv_process", "_send_mpv_command",
+                     "_make_mpv_ipc_server", "_try_mpv_ipc_connect",
+                     "_on_mpv_ipc_connected", "_on_mpv_ipc_error",
+                     "_on_mpv_process_error", "_on_mpv_launch_failed",
+                     "_seek_mpv_to_current_frame", "request_screenshot"):
+            self.assertFalse(hasattr(cls, gone), f"{gone} should be gone")
 
-    def test_start_creates_gui_thread_affine_process(self):
-        from PyQt6.QtCore import QObject, QProcess
+    def test_frames_are_delivered_on_the_gui_thread(self):
+        from PyQt6.QtCore import QThread
         from PyQt6.QtWidgets import QApplication
-        import gui.widgets.video_preview as vp
+        from core import vs_engine
 
+        if vs_engine._core is None or vs_engine.missing_plugins():
+            self.skipTest("VapourSynth core unavailable")
+        from core.vs_player import FrameRequester
+
+        vs = vs_engine.load_vapoursynth()
+        core = vs_engine.get_core()
+        clip = core.std.BlankClip(width=32, height=32, length=5,
+                                  format=vs.RGB24, color=[10, 20, 30])
+        req = FrameRequester()
+        req.set_clip(clip, epoch=1)
+        seen = {}
+        req.frame_ready.connect(
+            lambda e, i, a: seen.update(thread=QThread.currentThread()))
+        req.request(0)
         app = QApplication.instance()
-        gui_thread = app.thread()
-        cls = next(c for c in vars(vp).values()
-                   if isinstance(c, type) and hasattr(c, "_start_mpv_preview"))
-
-        holder = QObject()
-        for m in ("_stop_mpv_process", "_make_mpv_ipc_server", "_send_mpv_command",
-                  "_on_mpv_process_error", "_on_mpv_process_started", "_try_mpv_ipc_connect",
-                  "_on_mpv_ipc_connected", "_on_mpv_ipc_error", "_on_mpv_launch_failed",
-                  "_on_ipc_retry_due", "_start_mpv_preview"):
-            setattr(holder, m, types.MethodType(getattr(cls, m), holder))
-        holder._mpv_process = None
-        holder._mpv_socket = None
-        holder._mpv_ipc_server = ""
-        holder._mpv_ipc_attempts = 0
-        holder._mpv_reply_callbacks = {}
-        holder._screenshot_refresh_timer = None
-        holder._ipc_retry_timer = None
-        holder._ipc_retry_epoch = 0
-        holder._load_epoch = 0
-        holder._rotation = 0
-        holder._mpv_page_index = 0
-        holder._display_stack = types.SimpleNamespace(setCurrentIndex=lambda i: None)
-        holder._media_toolchain = types.SimpleNamespace(mpv_path=sys.executable)
-        holder.video_label = types.SimpleNamespace(setText=lambda *a: None)
-
-        holder._start_mpv_preview("test.mp4")
-        proc = holder._mpv_process
-        self.assertIsInstance(proc, QProcess)
-        self.assertIs(proc.thread(), gui_thread)
-        for _ in range(5):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and "thread" not in seen:
             app.processEvents()
-        holder._stop_mpv_process()
+            time.sleep(0.01)
+        self.addCleanup(req.close)
+        self.assertIn("thread", seen, "no frame delivered")
+        self.assertIs(seen["thread"], app.thread(),
+                      "frames must arrive on the GUI thread, not a VS worker")
 
 
 if __name__ == "__main__":

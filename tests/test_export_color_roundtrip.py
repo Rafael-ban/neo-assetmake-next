@@ -12,14 +12,13 @@ these round-trips FAIL on the old pipeline and pass on the new one
 
 Also covers: image loops now honour crop and rotation (the script blocks
 used to be video-branch-only), and the exported stream really carries the
-SMPTE 170M matrix tag (probed back via mpv video-params/colormatrix).
+SMPTE 170M matrix tag (read back off the decoded clip's H.273 frame props).
 """
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 import numpy as np
 
@@ -35,7 +34,6 @@ from core.media_tools import MediaToolchain
 
 REPO = Path(__file__).resolve().parent.parent
 TC = MediaToolchain.discover(str(REPO))
-MPV_OK = bool(TC.mpv_path)
 ENCODE_OK = HAS_CV2 and not TC.missing_for_export()
 
 
@@ -75,7 +73,7 @@ def _decode_first_frame(mp4: Path) -> np.ndarray:
     return frame  # BGR, 640x360 target -> (640, 360, 3)
 
 
-@unittest.skipUnless(MPV_OK and ENCODE_OK, "mpv / encode toolchain (tools/media) unavailable")
+@unittest.skipUnless(ENCODE_OK, "encode toolchain (tools/media) unavailable")
 class ExportColorRoundTripTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -126,22 +124,26 @@ class ExportColorRoundTripTests(unittest.TestCase):
         mp4 = _export_image_loop(png, self.d / "tag.mp4",
                                  cropbox=(0, 0, 360, 640))
 
-        from core import video_processor
+        # Read the tags back off the decoded clip's frame props. This replaced an
+        # mpv `video-params/colormatrix` probe: the frame props carry the raw
+        # H.273 numeric codes rather than mpv's rendered strings, so the
+        # assertion is exact instead of substring matching ("601"/"170m").
+        from core.vs_engine import source_clip
 
-        props_list = video_processor.MPV_METADATA_PROPERTIES + (
-            "video-params/colormatrix",
-        )
-        with mock.patch.object(
-            video_processor, "MPV_METADATA_PROPERTIES", props_list
-        ):
-            props = video_processor._MpvMetadataSession(TC.mpv_path).probe(str(mp4))
-        matrix = str(props.get("video-params/colormatrix") or "").lower()
-        self.assertTrue(
-            any(tag in matrix for tag in ("601", "170m")),
-            f"stream colormatrix tag is {matrix!r}, expected a BT.601/SMPTE170M tag "
-            "(old pipeline left the VUI untagged)",
-        )
-        self.assertNotIn("709", matrix)
+        frame = source_clip(str(mp4)).get_frame(0)
+        try:
+            props = dict(frame.props)
+        finally:
+            frame.close()
+
+        # H.273 code 6 = SMPTE 170M / BT.601; 1 would be BT.709, 2 "unspecified"
+        # (which is what the old untagged pipeline produced).
+        self.assertEqual(props.get("_Matrix"), 6,
+                         f"stream _Matrix is {props.get('_Matrix')!r}, expected 6 "
+                         "(SMPTE170M) — old pipeline left the VUI untagged")
+        self.assertEqual(props.get("_Primaries"), 6)
+        self.assertEqual(props.get("_Transfer"), 6)
+        self.assertEqual(props.get("_ColorRange"), 1, "expected limited (tv) range")
 
     def test_image_loop_honours_offcenter_crop(self):
         # Left half red, right half blue; crop selects the LEFT half.

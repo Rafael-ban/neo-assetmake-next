@@ -31,7 +31,6 @@ class RotationCropRemapTests(unittest.TestCase):
 
         w = VideoPreviewWidget()
         w.video_width, w.video_height = 240, 360
-        w._mpv_process = None
         w.set_target_resolution(*target)
         w.cropbox = list(crop)
         w._rotation = 0

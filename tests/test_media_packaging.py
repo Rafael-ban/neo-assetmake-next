@@ -7,13 +7,15 @@ class MediaPackagingTests(unittest.TestCase):
         self.build_source = Path("build.py").read_text(encoding="utf-8")
 
     def test_build_script_does_not_package_removed_media_dependencies(self):
-        for removed_token in ("ffmpeg.exe", "ffprobe.exe", "av.libs", "ffmpeg-sdk"):
+        # mpv.exe joined this list when preview moved to in-process VapourSynth:
+        # it was ~117MB of the installer and nothing loads it any more.
+        for removed_token in ("ffmpeg.exe", "ffprobe.exe", "av.libs", "ffmpeg-sdk",
+                              "mpv.exe"):
             with self.subTest(removed_token=removed_token):
                 self.assertNotIn(removed_token, self.build_source)
 
     def test_build_script_keeps_media_tool_candidates(self):
         expected_tokens = (
-            "mpv.exe",
             "VSPipe.exe",
             "x264-7mod.exe",
             "mp4box.exe",
@@ -53,6 +55,38 @@ class MediaPackagingTests(unittest.TestCase):
             for path in paths:
                 if path.suffix not in {".py", ".rs", ".toml"}:
                     continue
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                for token in disallowed_tokens:
+                    if token in text:
+                        offenders.append(f"{path}:{token}")
+
+        self.assertEqual([], offenders)
+
+    def test_runtime_source_has_no_executable_mpv_references(self):
+        """Regression lock: mpv must not come back as a code dependency.
+
+        Matches *identifiers and command strings*, not the word "mpv" — several
+        docstrings still explain why the VapourSynth design replaced the mpv one,
+        and that history is worth keeping.
+        """
+        disallowed_tokens = (
+            "mpv_path",           # toolchain field / constructor arg
+            "mpv.exe",
+            "_mpv_process",
+            "_mpv_socket",
+            "_send_mpv_command",
+            "_MpvMetadataSession",
+            "_MpvSurface",
+            "input-ipc-server",   # mpv CLI
+            "screenshot-to-file",
+            "video-rotate",
+            "MpvLaunchWorker",
+        )
+        offenders = []
+        for root in (Path("core"), Path("gui"), Path("config"), Path("utils"),
+                     Path("main.py"), Path("build.py")):
+            paths = [root] if root.is_file() else root.rglob("*.py")
+            for path in paths:
                 text = path.read_text(encoding="utf-8", errors="ignore")
                 for token in disallowed_tokens:
                     if token in text:

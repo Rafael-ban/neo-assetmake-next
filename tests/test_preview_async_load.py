@@ -4,8 +4,10 @@ Old code ran the blocking mpv metadata probe (waitForStarted/waitForConnected/
 waitForReadyRead chains, PyQt6 QtNetwork.pyi:202-205 + QtCore.pyi:6985-6988)
 directly inside load_video on the GUI thread, freezing the UI for up to tens
 of seconds per load, and tore mpv down with waitForFinished(3000) x2 on every
-reload. These tests pin the new contract: load_video = accepted + async
-outcome signals, epoch-guarded continuations, and non-blocking teardown.
+reload. These tests pin the contract that replaced it: load_video = accepted +
+async outcome signals, epoch-guarded continuations. The probe now runs
+in-process against a VapourSynth source node, still on a worker thread because
+building the lsmas .lwi index blocks just as long.
 """
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -30,7 +32,6 @@ from core.video_processor import VideoInfo
 
 REPO = Path(__file__).resolve().parent.parent
 TC = MediaToolchain.discover(str(REPO))
-MPV_OK = bool(TC.mpv_path)
 ENCODE_OK = HAS_CV2 and not TC.missing_for_export()
 
 
@@ -46,7 +47,7 @@ class FakeProbeWorker(QObject):
     finished = pyqtSignal()
     instances: list = []
 
-    def __init__(self, mpv_path, input_path, parent=None):
+    def __init__(self, input_path, parent=None):
         super().__init__(parent)
         self.input_path = input_path
         FakeProbeWorker.instances.append(self)
@@ -66,7 +67,7 @@ class FakeProbeWorker(QObject):
 def _info(width=240, height=360, fps=30.0, frames=90):
     return VideoInfo(
         width=width, height=height, duration=frames / fps,
-        fps=fps, total_frames=frames, codec="h264",
+        fps=fps, total_frames=frames,
     )
 
 
@@ -80,12 +81,10 @@ class AsyncLoadTests(unittest.TestCase):
         FakeProbeWorker.instances = []
 
         self.w = vp.VideoPreviewWidget()
-        self.w._media_toolchain = None  # replaced by discover() in load_video
-        self._orig_discover = vp.MediaToolchain.discover
-        vp.MediaToolchain.discover = staticmethod(
-            lambda *a, **k: type("TC", (), {"mpv_path": "mpv-fake"})()
-        )
-        self.w._start_mpv_preview = lambda path: True  # no real mpv in unit tests
+        # These are pure lifecycle tests: pretend the VS core is usable and that
+        # building the graph succeeded, so no real media/decoding is involved.
+        self.w._use_vs_preview = lambda: True
+        self.w._start_vs_preview = lambda path: True
 
         self.tmp = tempfile.mkdtemp()
         self.file_a = os.path.join(self.tmp, "a.mp4")
@@ -95,7 +94,6 @@ class AsyncLoadTests(unittest.TestCase):
 
     def tearDown(self):
         self.vp.MetadataProbeWorker = self._orig_worker
-        self.vp.MediaToolchain.discover = self._orig_discover
 
     def test_load_is_accepted_immediately_and_resolves_via_signal(self):
         loaded = {}
@@ -152,106 +150,9 @@ class AsyncLoadTests(unittest.TestCase):
         QCoreApplication.processEvents()
         self.assertEqual(failures, [], "failure from a cleared load must be dropped")
 
-    def test_stale_ipc_retry_is_discarded(self):
-        self.w._load_epoch = 7
-        called = {"n": 0}
-        self.w._try_mpv_ipc_connect = lambda: called.__setitem__("n", called["n"] + 1)
-        self.w._ipc_retry_epoch = 6  # scheduled before a newer load
-        self.w._on_ipc_retry_due()
-        self.assertEqual(called["n"], 0)
-        self.w._ipc_retry_epoch = 7
-        self.w._on_ipc_retry_due()
-        self.assertEqual(called["n"], 1)
 
-
-class _FakeProcess:
-    """QProcess stand-in that records blocking/kill calls."""
-
-    class _Sig:
-        def __init__(self):
-            self.slots = []
-
-        def connect(self, slot):
-            self.slots.append(slot)
-
-        def emit(self, *args):
-            for slot in list(self.slots):
-                slot(*args)
-
-    def __init__(self, running=True):
-        from PyQt6.QtCore import QProcess as QP
-
-        self._qp = QP
-        self._running = running
-        self.wait_calls = []
-        self.kill_calls = 0
-        self.deleted = False
-        self.parent_cleared = False
-        self.finished = self._Sig()
-
-    def setParent(self, parent):
-        if parent is None:
-            self.parent_cleared = True
-
-    def state(self):
-        from PyQt6.QtCore import QProcess as QP
-
-        return (
-            QP.ProcessState.Running if self._running else QP.ProcessState.NotRunning
-        )
-
-    def waitForFinished(self, ms):
-        self.wait_calls.append(ms)
-        return False
-
-    def kill(self):
-        self.kill_calls += 1
-        self._running = False
-
-    def deleteLater(self):
-        self.deleted = True
-
-
-class AsyncTeardownTests(unittest.TestCase):
-    def _widget(self):
-        import gui.widgets.video_preview as vp
-
-        w = vp.VideoPreviewWidget()
-        return vp, w
-
-    def test_async_stop_never_blocks_gui_thread(self):
-        vp, w = self._widget()
-        proc = _FakeProcess(running=True)
-        w._mpv_process = proc
-        w._mpv_socket = None
-        w._stop_mpv_process()  # default: async path
-        self.assertEqual(
-            proc.wait_calls, [],
-            "reload/clear teardown must not call the blocking waitForFinished "
-            "(QtCore.pyi:6985) on the GUI thread",
-        )
-        self.assertIn(proc, vp._DYING_MPV_PROCESSES)
-        self.assertTrue(
-            proc.parent_cleared,
-            "detached process must be un-parented so it outlives the widget",
-        )
-        proc.finished.emit(0)  # mpv exits on its own -> released
-        self.assertNotIn(proc, vp._DYING_MPV_PROCESSES)
-        self.assertTrue(proc.deleted)
-
-    def test_sync_stop_blocks_bounded_for_window_close(self):
-        vp, w = self._widget()
-        proc = _FakeProcess(running=True)
-        w._mpv_process = proc
-        w._mpv_socket = None
-        w._stop_mpv_process(sync=True)
-        self.assertTrue(proc.wait_calls, "sync path must wait (bounded) for exit")
-        self.assertTrue(proc.deleted)
-        self.assertNotIn(proc, vp._DYING_MPV_PROCESSES)
-
-
-@unittest.skipUnless(MPV_OK and ENCODE_OK, "mpv / encode toolchain (tools/media) unavailable")
-class AsyncLoadRealMpvTests(unittest.TestCase):
+@unittest.skipUnless(ENCODE_OK, "encode toolchain (tools/media) unavailable")
+class AsyncLoadRealMediaTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from core.media_pipeline import MediaEncoder, _quote_vs_string
@@ -293,16 +194,10 @@ class AsyncLoadRealMpvTests(unittest.TestCase):
         self.assertLess(accept_ms, 500, "acceptance must return without probing")
         self.assertTrue(self._pump_until(lambda: "n" in loaded, 20.0), "no video_loaded")
         self.assertGreater(loaded["n"], 0)
-        # Backend-neutral: the preview must end up showing a real frame,
-        # whether that came from the in-process VapourSynth graph or the
-        # legacy mpv fallback.
         self.assertTrue(
             self._pump_until(
-                lambda: (w._vs_active and w.current_frame is not None)
-                or w._mpv_ipc_connected,
-                20.0,
-            ),
-            "no preview backend became ready",
+                lambda: w._vs_active and w.current_frame is not None, 20.0),
+            "preview never produced a frame",
         )
 
     def test_reload_mid_probe_settles_on_second_video(self):

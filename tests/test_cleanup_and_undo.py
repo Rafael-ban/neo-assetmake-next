@@ -31,7 +31,7 @@ class DiscoverCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             media = Path(d) / "tools" / "media"
             media.mkdir(parents=True)
-            for name in ("mpv.exe", "VSPipe.exe", "x264-7mod.exe", "MP4Box.exe"):
+            for name in ("VSPipe.exe", "x264-7mod.exe", "MP4Box.exe"):
                 (media / name).write_text("", encoding="utf-8")
 
             MediaToolchain.refresh()

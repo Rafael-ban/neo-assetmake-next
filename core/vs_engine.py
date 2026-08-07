@@ -140,7 +140,8 @@ def prewarm() -> bool:
 
     Safe to call unconditionally at process start: a missing/broken bundle is
     logged and swallowed so the app still launches (export keeps using the
-    VSPipe subprocess, and the metadata probe falls back to mpv).
+    VSPipe subprocess), but preview and metadata probing both need this core,
+    so media loading fails loudly at load time when it did not come up.
     """
     try:
         get_core()

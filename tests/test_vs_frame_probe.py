@@ -5,7 +5,7 @@ with plane0=R/1=G/2=B (so this app's BGR convention needs [2,1,0]), planes are
 stride-padded (measured stride 384 for width 360), and plane views are VS-owned
 memory that must be copied before ``frame.close()``.
 
-The probe pins that metadata is now EXACT: the mpv path could only estimate
+The probe pins that metadata is now EXACT: the retired mpv path could only estimate
 (``round(duration*fps)`` for the frame count, a hardcoded 30.0 for fps).
 """
 import os
@@ -131,9 +131,9 @@ class InProcessProbeTests(unittest.TestCase):
         vs_engine.clear_caches()
 
     def test_probe_reports_exact_geometry_and_frame_count(self):
-        from core.video_processor import probe_video_info_vs
+        from core.video_processor import probe_video_info
 
-        info = probe_video_info_vs(str(self.mp4))
+        info = probe_video_info(str(self.mp4))
         self.assertEqual(info.width, 240)
         self.assertEqual(info.height, 360)
         self.assertEqual(info.total_frames, 45)   # exact, not round(duration*fps)
