@@ -314,7 +314,7 @@ GitHub Actions 工作流位于 `.github/workflows/`：
 - **build.yml** — push/PR 时触发 CI，并调用 `build-app.yml` 完成 Rust 编译、Python 打包和 Inno Setup 安装包构建
 - **release.yml** — `docs/CHANGELOG.md` 顶部版本号变更时自动创建 GitHub Release，并默认启用 PyArmor 混淆构建
 
-构建环境：Windows Latest, Python 3.11, uv, Rust stable, optional media tools, Inno Setup
+构建环境：Windows Latest, Python 3.12, uv, Rust stable, optional media tools, Inno Setup
 
 ### 媒体工具依赖
 

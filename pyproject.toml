@@ -3,7 +3,10 @@ name = "neo-assetmaker"
 version = "2.1.6"
 description = "明日方舟通行证素材工具箱"
 readme = "README.md"
-requires-python = ">=3.10"
+# VapourSynth 进程内渲染要求 3.12+：捆绑的 vapoursynth wheel 是 cp312-abi3
+# (稳定 ABI 下限 3.12)，其 .pyd 引用的 PyObject_Vectorcall / PyType_FromMetaclass
+# 等符号在 3.11 的 python3.dll 中不存在，import 会以 ERROR_PROC_NOT_FOUND 失败。
+requires-python = ">=3.12"
 dependencies = [
     "PyQt6>=6.5.0",
     "PyQt6-Fluent-Widgets>=1.5.0",
@@ -26,7 +29,6 @@ dependencies = [
 [dependency-groups]
 dev = [
     "cx-Freeze>=7.0.0,<8.0.0",
-    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [build-system]

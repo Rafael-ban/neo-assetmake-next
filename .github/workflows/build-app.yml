@@ -102,7 +102,8 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # 3.12 是进程内 VapourSynth 的下限（捆绑 wheel 为 cp312-abi3）
+          python-version: '3.12'
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
