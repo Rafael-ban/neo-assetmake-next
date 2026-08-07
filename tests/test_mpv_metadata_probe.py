@@ -130,5 +130,105 @@ class MpvMetadataProbeRealTests(unittest.TestCase):
         self.assertGreater(info.fps, 0)
 
 
+class ProbeWorkerBackendChoiceTests(unittest.TestCase):
+    """MetadataProbeWorker 先用进程内 VS(精确),失败才退回 mpv(估算)。"""
+
+    def _run_worker(self, mpv_path="mpv-fake"):
+        from PyQt6.QtCore import QCoreApplication
+        from core.video_processor import MetadataProbeWorker
+
+        path = Path(tempfile.mkdtemp()) / "x.mp4"
+        path.write_bytes(b"not really a video")
+        worker = MetadataProbeWorker(mpv_path, str(path))
+        box = {}
+        worker.result.connect(lambda info: box.setdefault("info", info))
+        worker.failed.connect(lambda msg: box.setdefault("err", msg))
+        worker.start()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not box:
+            QCoreApplication.processEvents()
+            time.sleep(0.01)
+        worker.wait(5000)
+        return box
+
+    def test_vs_probe_is_preferred(self):
+        import core.video_processor as vpm
+        from core.video_processor import VideoInfo
+
+        calls = []
+        orig_vs = vpm.probe_video_info_vs
+        orig_session = vpm._MpvMetadataSession
+        vpm.probe_video_info_vs = lambda p: (
+            calls.append("vs")
+            or VideoInfo(width=1, height=2, duration=1.0, fps=25.0,
+                         total_frames=47, codec="")
+        )
+
+        def _no_mpv(*a, **k):
+            calls.append("mpv")
+            raise AssertionError("mpv must not be probed when VS succeeded")
+
+        vpm._MpvMetadataSession = _no_mpv
+        try:
+            box = self._run_worker()
+        finally:
+            vpm.probe_video_info_vs = orig_vs
+            vpm._MpvMetadataSession = orig_session
+
+        self.assertIn("info", box, box)
+        self.assertEqual(calls, ["vs"])
+        self.assertEqual(box["info"].total_frames, 47)
+
+    def test_mpv_is_the_fallback_when_vs_cannot_open(self):
+        import core.video_processor as vpm
+
+        calls = []
+        orig_vs = vpm.probe_video_info_vs
+        orig_parse = vpm.parse_mpv_video_info
+        orig_session = vpm._MpvMetadataSession
+
+        def _vs_fails(_p):
+            calls.append("vs")
+            raise RuntimeError("lsmas: failed to construct index")
+
+        class _Session:
+            def __init__(self, mpv_path):
+                calls.append("mpv")
+
+            def probe(self, _p):
+                return {"width": 8, "height": 9, "duration": 2.0,
+                        "container-fps": 30.0}
+
+        vpm.probe_video_info_vs = _vs_fails
+        vpm._MpvMetadataSession = _Session
+        try:
+            box = self._run_worker()
+        finally:
+            vpm.probe_video_info_vs = orig_vs
+            vpm.parse_mpv_video_info = orig_parse
+            vpm._MpvMetadataSession = orig_session
+
+        self.assertEqual(calls, ["vs", "mpv"], "顺序必须是 VS 优先、mpv 兜底")
+        self.assertIn("info", box, box)
+        self.assertEqual((box["info"].width, box["info"].height), (8, 9))
+
+    def test_failure_surfaces_when_no_mpv_is_available(self):
+        import core.video_processor as vpm
+
+        orig_vs = vpm.probe_video_info_vs
+
+        def _vs_fails(_p):
+            raise RuntimeError("VapourSynth 不可用")
+
+        vpm.probe_video_info_vs = _vs_fails
+        try:
+            box = self._run_worker(mpv_path="")   # 无 mpv 可退
+        finally:
+            vpm.probe_video_info_vs = orig_vs
+
+        self.assertIn("err", box, box)
+        self.assertIn("VapourSynth", box["err"])
+
+
 if __name__ == "__main__":
     unittest.main()

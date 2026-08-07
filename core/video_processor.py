@@ -215,7 +215,15 @@ class VideoProcessor:
 
 
 class MetadataProbeWorker(QThread):
-    """Run the blocking mpv metadata probe off the GUI thread.
+    """Probe media metadata off the GUI thread.
+
+    Prefers the in-process VapourSynth probe (``probe_video_info_vs``): it is
+    EXACT where mpv could only estimate, and it reads the same source node the
+    export uses, so preview and export cannot disagree about frame indices. It
+    still belongs on a worker thread — ``lsmas`` builds a full ``.lwi`` index on
+    first open, which blocks just as long as the mpv probe did.
+
+    mpv remains the fallback for sources VapourSynth cannot open.
 
     ``_MpvMetadataSession`` is constructed and used entirely inside ``run()``,
     so its QProcess/QLocalSocket live on this worker thread and their blocking
@@ -240,11 +248,21 @@ class MetadataProbeWorker(QThread):
             if not Path(self.input_path).exists():
                 self.failed.emit(f"文件不存在: {self.input_path}")
                 return
+            try:
+                self.result.emit(probe_video_info_vs(self.input_path))
+                return
+            except Exception as vs_exc:
+                if not self._mpv_path:
+                    raise
+                logger.info(
+                    "VapourSynth probe unavailable for %s (%s); falling back to mpv",
+                    self.input_path, vs_exc,
+                )
             properties = _MpvMetadataSession(self._mpv_path).probe(self.input_path)
             self.result.emit(parse_mpv_video_info(properties))
         except Exception as exc:
             logger.error(
-                "mpv metadata probe failed for %s: %s", self.input_path, exc
+                "metadata probe failed for %s: %s", self.input_path, exc
             )
             self.failed.emit(str(exc))
 
