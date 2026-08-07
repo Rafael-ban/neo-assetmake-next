@@ -293,7 +293,17 @@ class AsyncLoadRealMpvTests(unittest.TestCase):
         self.assertLess(accept_ms, 500, "acceptance must return without probing")
         self.assertTrue(self._pump_until(lambda: "n" in loaded, 20.0), "no video_loaded")
         self.assertGreater(loaded["n"], 0)
-        self.assertTrue(self._pump_until(lambda: w._mpv_ipc_connected, 15.0))
+        # Backend-neutral: the preview must end up showing a real frame,
+        # whether that came from the in-process VapourSynth graph or the
+        # legacy mpv fallback.
+        self.assertTrue(
+            self._pump_until(
+                lambda: (w._vs_active and w.current_frame is not None)
+                or w._mpv_ipc_connected,
+                20.0,
+            ),
+            "no preview backend became ready",
+        )
 
     def test_reload_mid_probe_settles_on_second_video(self):
         from gui.widgets.video_preview import VideoPreviewWidget

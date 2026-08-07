@@ -160,6 +160,9 @@ class VideoPreviewWidget(QWidget):
         self._ipc_retry_timer: Optional[QTimer] = None
         self._ipc_retry_epoch = 0
         self._crop_mode = False  # editing the crop on a frozen frame (page 0)
+        # VapourSynth frame-request preview (the mpv player's replacement).
+        self._frame_requester = None
+        self._vs_active = False
         self._media_toolchain = MediaToolchain.discover()
         self._has_video = False
         self._loop_frame: Optional[np.ndarray] = None
@@ -228,6 +231,11 @@ class VideoPreviewWidget(QWidget):
         layout.addWidget(self.info_label)
 
     def _teardown_media(self, sync_shutdown: bool = False):
+        # Drop the VS graph first: no child process, so nothing to wait on.
+        self._stop_vs_preview()
+        return self._teardown_mpv(sync_shutdown=sync_shutdown)
+
+    def _teardown_mpv(self, sync_shutdown: bool = False):
         self._stop_mpv_process(sync=sync_shutdown)
         self._has_video = False
 
@@ -337,6 +345,94 @@ class VideoPreviewWidget(QWidget):
         if sys.platform == "win32":
             return name
         return os.path.join(tempfile.gettempdir(), name)
+
+    # ------------------------------------------------------------------
+    # VapourSynth frame-request preview (replaces the mpv IPC player)
+    # ------------------------------------------------------------------
+
+    def _use_vs_preview(self) -> bool:
+        """True when the in-process VapourSynth core is usable for preview.
+
+        The core must have been warmed BEFORE PyQt6 loaded (main.py /
+        tests.qt_harness call vs_engine.prewarm()); initializing it after Qt
+        segfaults on this bundle, so we never try to build it lazily here.
+        """
+        try:
+            from core import vs_engine
+
+            if vs_engine._core is None:      # not prewarmed -> do not risk it
+                return False
+            return not vs_engine.missing_plugins()
+        except Exception:
+            return False
+
+    def _ensure_requester(self):
+        from core.vs_player import FrameRequester
+
+        if self._frame_requester is None:
+            self._frame_requester = FrameRequester(self)
+            self._frame_requester.frame_ready.connect(self._on_vs_frame_ready)
+            self._frame_requester.frame_failed.connect(self._on_vs_frame_failed)
+        return self._frame_requester
+
+    def _start_vs_preview(self, path: str) -> bool:
+        """Point the requester at a source graph and pull the first frame."""
+        if not self._use_vs_preview():
+            return False
+        try:
+            from core.vs_graph import build_source_graph
+
+            clip = build_source_graph(path, is_image=False, rotation=self._rotation)
+            requester = self._ensure_requester()
+            requester.set_clip(clip, self._load_epoch)
+            self._vs_active = True
+            # Display page 0 (the QLabel) — with no mpv child window there is
+            # nothing to occlude the painted cropbox, so cropping is live.
+            self._display_stack.setCurrentIndex(0)
+            requester.request(self.current_frame_index)
+            return True
+        except Exception as exc:
+            logger.warning("VapourSynth preview unavailable for %s: %s", path, exc)
+            self._vs_active = False
+            return False
+
+    def _rebuild_vs_graph(self) -> None:
+        """Re-derive the graph after a rotation change and refresh the frame."""
+        if not self._vs_active or not self.video_path:
+            return
+        try:
+            from core.vs_graph import build_source_graph
+
+            clip = build_source_graph(self.video_path, is_image=False,
+                                      rotation=self._rotation)
+            self._ensure_requester().set_clip(clip, self._load_epoch)
+            self._request_current_frame()
+        except Exception as exc:
+            logger.warning("VapourSynth graph rebuild failed: %s", exc)
+
+    def _request_current_frame(self, *, coalesce: bool = False) -> None:
+        if not self._vs_active or self._frame_requester is None:
+            return
+        self._frame_requester.request(self.current_frame_index, coalesce=coalesce)
+
+    def _on_vs_frame_ready(self, epoch: int, index: int, array) -> None:
+        """A decoded frame arrived (queued from a VS worker thread)."""
+        if epoch != self._load_epoch or array is None:
+            return  # superseded load: drop the late frame
+        self.current_frame = array
+        if self.video_width <= 0 or self.video_height <= 0:
+            self.video_height, self.video_width = array.shape[:2]
+        self._display_frame(array)
+
+    def _on_vs_frame_failed(self, epoch: int, index: int, message: str) -> None:
+        if epoch != self._load_epoch:
+            return
+        logger.warning("VapourSynth frame %s failed: %s", index, message)
+
+    def _stop_vs_preview(self) -> None:
+        self._vs_active = False
+        if self._frame_requester is not None:
+            self._frame_requester.clear()
 
     def _start_mpv_preview(self, path: str) -> bool:
         """启动 mpv 预览（异步方式，不阻塞 UI）"""
@@ -543,14 +639,14 @@ class VideoPreviewWidget(QWidget):
         here on the GUI thread, freezing the UI for up to tens of seconds per
         load (QtNetwork.pyi:202-205, QtCore.pyi:6985-6988 — blocking calls).
         """
-        logger.info("Loading video with mpv: %s", path)
+        logger.info("Loading video: %s", path)
         if not os.path.exists(path):
             self.video_label.setText(f"File not found: {path}")
             return False
 
         self._media_toolchain = MediaToolchain.discover()
-        if not self._media_toolchain.mpv_path:
-            self.video_label.setText("mpv not found")
+        if not (self._use_vs_preview() or self._media_toolchain.mpv_path):
+            self.video_label.setText("无可用的视频后端(VapourSynth / mpv)")
             return False
 
         self._load_epoch += 1
@@ -600,13 +696,22 @@ class VideoPreviewWidget(QWidget):
         self.video_height = max(1, info.height)
         self.total_frames = max(1, info.total_frames)
         self.current_frame_index = 0
-        self.current_frame = np.zeros(
-            (self.video_height, self.video_width, 3), dtype=np.uint8
+        # The mpv path needs a placeholder because mpv renders into its own
+        # child window and the widget never sees pixels until a screenshot
+        # round trip. The VapourSynth path fills current_frame from the first
+        # frame request instead, so DON'T seed a black frame there — a consumer
+        # (截取帧 / crop) that reads it too early would otherwise get black.
+        self.current_frame = (
+            None if self._use_vs_preview()
+            else np.zeros((self.video_height, self.video_width, 3), dtype=np.uint8)
         )
         self._has_video = True
         self._init_cropbox()
         self._update_info_label()
-        self._start_mpv_preview(path)
+        if not self._start_vs_preview(path):
+            # VapourSynth unavailable (no bundle / plugin / Qt-order issue):
+            # keep the legacy mpv preview so media still plays.
+            self._start_mpv_preview(path)
         self.video_loaded.emit(self.total_frames, self.video_fps)
 
     def _on_probe_failed(self, epoch: int, message: str):
@@ -876,13 +981,17 @@ class VideoPreviewWidget(QWidget):
     def _on_timer_tick(self):
         if not (self._has_video or self._loop_frame is not None):
             return
-        # When mpv is playing, the frame index is driven by observed time-pos
-        # (_handle_mpv_message), so don't also free-run the counter here (drift).
+        # mpv path: the frame index is driven by observed time-pos
+        # (_handle_mpv_message), so don't also free-run the counter (drift).
         if self._mpv_process is not None:
             return
         self.current_frame_index += 1
         if self.current_frame_index >= max(1, self.total_frames):
             self.current_frame_index = 0
+        # VapourSynth path: THIS timer is the playback clock. Ask for the frame
+        # we just advanced to; coalesce so a slow decode drops frames instead of
+        # queueing a backlog that is already stale by the time it lands.
+        self._request_current_frame(coalesce=True)
         self.frame_changed.emit(self.current_frame_index)
         self._update_info_label()
 
@@ -893,6 +1002,8 @@ class VideoPreviewWidget(QWidget):
             return
         if self._mpv_process is not None:
             self._send_mpv_command(["set_property", "pause", False])
+        # VapourSynth path: `self.timer` IS the playback clock (_on_timer_tick
+        # advances the index and requests that frame).
         interval = max(1, round(1000 / max(self.video_fps, 1.0)))
         self.timer.start(interval)
         self.is_playing = True
@@ -925,7 +1036,7 @@ class VideoPreviewWidget(QWidget):
         self.current_frame_index = min(
             self.current_frame_index + 1, max(0, self.total_frames - 1)
         )
-        self._seek_mpv_to_current_frame()
+        self._seek_backend_to_current_frame()
         self.frame_changed.emit(self.current_frame_index)
         self._update_info_label()
 
@@ -936,7 +1047,7 @@ class VideoPreviewWidget(QWidget):
             return
         self.pause()
         self.current_frame_index = max(self.current_frame_index - 1, 0)
-        self._seek_mpv_to_current_frame()
+        self._seek_backend_to_current_frame()
         self.frame_changed.emit(self.current_frame_index)
         self._update_info_label()
 
@@ -947,9 +1058,21 @@ class VideoPreviewWidget(QWidget):
             return
         self.pause()
         self.current_frame_index = max(0, min(index, max(0, self.total_frames - 1)))
-        self._seek_mpv_to_current_frame()
+        self._seek_backend_to_current_frame()
         self.frame_changed.emit(self.current_frame_index)
         self._update_info_label()
+
+    def _seek_backend_to_current_frame(self):
+        """Seek whichever backend is active to ``current_frame_index``.
+
+        VapourSynth is frame-indexed, so a seek is just a frame request — no
+        fps→seconds→re-quantize round trip and no ±1 drift on VFR sources,
+        which is what ``round(time_pos * fps)`` could produce on the mpv path.
+        """
+        if self._vs_active:
+            self._request_current_frame(coalesce=True)
+            return
+        self._seek_mpv_to_current_frame()
 
     def _seek_mpv_to_current_frame(self):
         if self._mpv_process is None or self.video_fps <= 0:
@@ -1046,12 +1169,54 @@ class VideoPreviewWidget(QWidget):
             return
         self.request_screenshot(None)
 
+    def _capture_frame_vs(self, callback) -> bool:
+        """Deliver the current frame from the VS graph. No PNG round trip.
+
+        The mpv path had to write a temp PNG via ``screenshot-to-file``, decode
+        it, undo mpv's baked-in ``video-rotate`` and retry while mpv refused the
+        command during loading. With VapourSynth the frame is already in memory
+        and ``current_frame`` is kept in source orientation, so this is a plain
+        hand-off.
+        """
+        if not self._vs_active:
+            return False
+        if self.current_frame is not None:
+            callback(self.current_frame)
+            return True
+        requester = self._frame_requester
+        if requester is None:
+            return False
+        epoch = self._load_epoch
+        index = self.current_frame_index
+
+        def _once(got_epoch: int, got_index: int, array) -> None:
+            if got_epoch != epoch:
+                return
+            try:
+                requester.frame_ready.disconnect(_once)
+            except Exception:
+                pass
+            callback(array)
+
+        requester.frame_ready.connect(_once)
+        if not requester.request(index):
+            try:
+                requester.frame_ready.disconnect(_once)
+            except Exception:
+                pass
+            callback(self.current_frame)
+        return True
+
     def capture_frame_async(self, callback):
         """Deliver the current frame (source orientation) to ``callback``.
 
-        mpv-backed video pauses and reads the frame back over IPC; static
-        images / image loops already hold the frame in memory.
+        VapourSynth hands the frame over directly; mpv-backed video pauses and
+        reads it back over IPC; static images / image loops already hold it.
         """
+        if self._vs_active:
+            self.pause()
+            if self._capture_frame_vs(callback):
+                return
         if self._mpv_process is not None and self._mpv_ipc_connected:
             self.pause()
             if self._screenshot_refresh_timer is not None:
@@ -1073,6 +1238,25 @@ class VideoPreviewWidget(QWidget):
         绘制/拖拽路径)。返回 True 表示已进入或已受理(mpv 截图为异步)。
         """
         if self._crop_mode:
+            return True
+        if self._vs_active:
+            # No mpv child window to occlude the overlay: the crop box is
+            # already live on the QLabel page, so "crop mode" is a no-op that
+            # only exists to keep the timeline button's state coherent. Wait for
+            # the first real frame so consumers never observe an empty one.
+            self.pause()
+
+            def _engage(*_args) -> None:
+                if self._crop_mode:
+                    return
+                self._crop_mode = True
+                self.crop_mode_changed.emit(True)
+                self._refresh_display()
+
+            if self.current_frame is not None:
+                _engage()
+            else:
+                self._capture_frame_vs(lambda _arr: _engage())
             return True
         if self._mpv_process is None or not self._mpv_ipc_connected:
             # 静态图 / 图片循环本就显示在 QLabel 页,裁剪路径已经可用。
@@ -1154,6 +1338,10 @@ class VideoPreviewWidget(QWidget):
         self._rotation = degrees
         if self._mpv_process is not None:
             self._send_mpv_command(["set_property", "video-rotate", degrees])
+        if self._vs_active:
+            # Rotation is part of the graph, so re-derive it (and refresh the
+            # displayed frame) instead of asking a player to rotate for us.
+            self._rebuild_vs_graph()
         if has_video:
             if original_box is not None:
                 self.cropbox = list(self._original_to_rotated_coords(*original_box))

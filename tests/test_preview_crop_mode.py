@@ -208,7 +208,11 @@ class CropModeRealMpvTests(unittest.TestCase):
         w = VideoPreviewWidget()
         self.addCleanup(lambda: w.clear(sync_shutdown=True))
         self.assertTrue(w.load_video(str(self.mp4)))
-        self.assertTrue(self._pump_until(lambda: w._mpv_ipc_connected, 20.0))
+        # Backend-neutral readiness: VapourSynth delivers a frame straight into
+        # current_frame; the mpv fallback signals readiness via its IPC socket.
+        self.assertTrue(self._pump_until(
+            lambda: (w._vs_active and w.current_frame is not None)
+            or w._mpv_ipc_connected, 20.0))
         self.assertTrue(w.enter_crop_mode())
         self.assertTrue(self._pump_until(w.is_crop_mode, 15.0), "crop mode never engaged")
         self.assertEqual(w._display_stack.currentIndex(), 0)

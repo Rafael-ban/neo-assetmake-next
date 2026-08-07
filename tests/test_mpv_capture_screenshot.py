@@ -78,6 +78,9 @@ class MpvScreenshotCaptureTests(unittest.TestCase):
         from gui.widgets.video_preview import VideoPreviewWidget
 
         w = VideoPreviewWidget()
+        # These tests exercise the mpv screenshot path specifically, so force
+        # the legacy backend even when the in-process VapourSynth core is up.
+        w._use_vs_preview = lambda: False
         self.assertTrue(w.load_video(str(self.mp4)))
         self.assertTrue(
             _pump_until(lambda: w._mpv_ipc_connected, 15.0),
