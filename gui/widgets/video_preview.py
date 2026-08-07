@@ -232,7 +232,7 @@ class VideoPreviewWidget(QWidget):
 
     def _teardown_media(self, sync_shutdown: bool = False):
         # Drop the VS graph first: no child process, so nothing to wait on.
-        self._stop_vs_preview()
+        self._stop_vs_preview(permanent=sync_shutdown)
         return self._teardown_mpv(sync_shutdown=sync_shutdown)
 
     def _teardown_mpv(self, sync_shutdown: bool = False):
@@ -462,10 +462,20 @@ class VideoPreviewWidget(QWidget):
             return
         logger.warning("VapourSynth frame %s failed: %s", index, message)
 
-    def _stop_vs_preview(self) -> None:
+    def _stop_vs_preview(self, *, permanent: bool = False) -> None:
+        """Drop the graph. ``permanent`` = the widget itself is going away.
+
+        A reload only needs ``clear()`` (the requester is reused for the next
+        media). Window teardown must ``close()`` it: frames already handed to
+        VapourSynth still call back, and by then Qt may have deleted this
+        widget's children.
+        """
         self._vs_active = False
         if self._frame_requester is not None:
-            self._frame_requester.clear()
+            if permanent:
+                self._frame_requester.close()
+            else:
+                self._frame_requester.clear()
 
     def _start_mpv_preview(self, path: str) -> bool:
         """启动 mpv 预览（异步方式，不阻塞 UI）"""

@@ -55,6 +55,7 @@ class FrameRequester(QObject):
         self._lock = threading.Lock()
         self._inflight: set = set()
         self._latest_wanted: Optional[int] = None
+        self._closed = False
 
     # ---- graph / lifecycle -------------------------------------------------
 
@@ -80,6 +81,22 @@ class FrameRequester(QObject):
     def clear(self) -> None:
         self.set_clip(None, self._epoch + 1)
 
+    def close(self) -> None:
+        """Permanently stop emitting. Call before the owner is destroyed.
+
+        ``clear()`` only drops the clip: requests already handed to VapourSynth
+        still call back, and emitting a Qt signal from a QObject whose C++ side
+        has been deleted (owner destroyed, or interpreter shutdown with frames
+        in flight) is undefined behaviour — that is how a completed run can
+        still end in a segfault. Once closed, callbacks do their pure-Python
+        cleanup and return silently. Not reversible on purpose.
+        """
+        with self._lock:
+            self._closed = True
+            self._clip = None
+            self._inflight.clear()
+            self._latest_wanted = None
+
     # ---- requests ----------------------------------------------------------
 
     def request(self, index: int, *, coalesce: bool = False) -> bool:
@@ -91,7 +108,7 @@ class FrameRequester(QObject):
         """
         with self._lock:
             clip = self._clip
-            if clip is None:
+            if clip is None or self._closed:
                 return False
             total = int(getattr(clip, "num_frames", 0) or 0)
             if total <= 0:
@@ -130,14 +147,22 @@ class FrameRequester(QObject):
             follow_up = None
             with self._lock:
                 self._inflight.discard(index)
+                if self._closed:
+                    return  # owner is going away: never touch the Qt side
                 if epoch == self._epoch and self._latest_wanted is not None:
                     follow_up = self._latest_wanted
                     self._latest_wanted = None
 
-            if arr is not None:
-                self.frame_ready.emit(epoch, index, arr)
-            else:
-                self.frame_failed.emit(epoch, index, error)
+            try:
+                if arr is not None:
+                    self.frame_ready.emit(epoch, index, arr)
+                else:
+                    self.frame_failed.emit(epoch, index, error)
+            except RuntimeError:
+                # Wrapper outlived its C++ object (deleted between the check
+                # above and here). Swallow it: this frame is on a VS worker
+                # thread whose callback is declared noexcept.
+                return
             if follow_up is not None and follow_up != index:
                 self.request(follow_up, coalesce=True)
 

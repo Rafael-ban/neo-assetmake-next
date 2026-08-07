@@ -216,10 +216,76 @@ class FrameRequesterTests(unittest.TestCase):
 
         req = FrameRequester()
         req.set_clip(self._clip(length=200), epoch=5)
-        # Fire far more than the budget; extras must be dropped, not queued.
-        accepted = sum(1 for i in range(50) if req.request(i, coalesce=True))
-        self.assertLessEqual(accepted, FrameRequester.MAX_INFLIGHT)
+        # Fire far more than the budget. What the cap bounds is CONCURRENCY, not
+        # the accepted total: a request that completes mid-loop frees its slot,
+        # so more than MAX_INFLIGHT may legitimately be accepted over time (this
+        # is why asserting on the total was flaky under a warm VS core).
+        peak = 0
+        for i in range(50):
+            req.request(i, coalesce=True)
+            peak = max(peak, req.inflight_count())
+        self.assertLessEqual(peak, FrameRequester.MAX_INFLIGHT,
+                             "a scrub must never queue more than the budget")
         self.assertTrue(self._pump(lambda: req.inflight_count() == 0, 15.0))
+
+    def test_budget_drops_extras_and_keeps_only_the_latest_target(self):
+        """Deterministic budget check: nothing completes, so nothing frees up."""
+        from concurrent.futures import Future
+        from core.vs_player import FrameRequester
+
+        pending = []
+
+        class _StuckClip:
+            num_frames = 200
+
+            def get_frame_async(self, index):
+                fut = Future()
+                pending.append((index, fut))
+                return fut
+
+        req = FrameRequester()
+        req.set_clip(_StuckClip(), epoch=1)
+        accepted = [req.request(i, coalesce=True) for i in range(10)]
+        self.assertEqual(accepted.count(True), FrameRequester.MAX_INFLIGHT)
+        self.assertEqual(accepted[:FrameRequester.MAX_INFLIGHT],
+                         [True] * FrameRequester.MAX_INFLIGHT)
+        self.assertEqual(req.inflight_count(), FrameRequester.MAX_INFLIGHT)
+        self.assertEqual([i for i, _ in pending],
+                         list(range(FrameRequester.MAX_INFLIGHT)))
+        # Only the most recent dropped target is remembered, and it is picked up
+        # when a slot frees — a scrub lands on where the user actually stopped.
+        self.assertEqual(req._latest_wanted, 9)
+        pending[0][1].set_result(None)   # frame_to_bgr(None) -> failure path
+        self.assertEqual([i for i, _ in pending][-1], 9,
+                         "freeing a slot must re-request the latest target")
+
+    def test_close_silences_callbacks_that_land_after_teardown(self):
+        """The in-flight-at-teardown race: callback must not touch the Qt side."""
+        from concurrent.futures import Future
+        from core.vs_player import FrameRequester
+
+        pending = []
+
+        class _StuckClip:
+            num_frames = 50
+
+            def get_frame_async(self, index):
+                fut = Future()
+                pending.append(fut)
+                return fut
+
+        req = FrameRequester()
+        req.set_clip(_StuckClip(), epoch=1)
+        events = []
+        req.frame_ready.connect(lambda *a: events.append("ready"))
+        req.frame_failed.connect(lambda *a: events.append("failed"))
+        self.assertTrue(req.request(0))
+
+        req.close()                    # owner going away, frame still decoding
+        pending[0].set_result(None)    # VS finally calls back
+        self.assertEqual(events, [], "a closed requester must emit nothing")
+        self.assertFalse(req.request(1), "a closed requester accepts no work")
+        self.assertEqual(req.inflight_count(), 0)
 
     def test_clear_drops_the_clip(self):
         from core.vs_player import FrameRequester
