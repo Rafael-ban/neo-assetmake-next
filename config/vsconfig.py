@@ -69,6 +69,10 @@ class VSConfig:
     resampler_kernel: str = "Bicubic"
     matrix_s: str = "170m"
     heuristic: MatrixHeuristic = field(default_factory=MatrixHeuristic)
+    # In-process core tuning (0 = leave VapourSynth's own default: thread count
+    # = CPU count, cache = 4096MB as measured on R73).
+    num_threads: int = 0
+    max_cache_size_mb: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -82,6 +86,10 @@ class VSConfig:
                 "matrix_s": self.matrix_s,
                 "heuristic": self.heuristic.to_dict(),
             },
+            "core": {
+                "num_threads": self.num_threads,
+                "max_cache_size_mb": self.max_cache_size_mb,
+            },
         }
 
     @classmethod
@@ -90,6 +98,8 @@ class VSConfig:
             return cls()
         colour = data.get("colour")
         colour = colour if isinstance(colour, dict) else {}
+        core_cfg = data.get("core")
+        core_cfg = core_cfg if isinstance(core_cfg, dict) else {}
         req = data.get("required_plugins")
         dirs = data.get("extra_plugin_dirs")
         return cls(
@@ -103,6 +113,8 @@ class VSConfig:
             resampler_kernel=str(data.get("resampler_kernel", "Bicubic")),
             matrix_s=str(colour.get("matrix_s", "170m")),
             heuristic=MatrixHeuristic.from_dict(colour.get("heuristic")),
+            num_threads=int(core_cfg.get("num_threads", 0) or 0),
+            max_cache_size_mb=int(core_cfg.get("max_cache_size_mb", 0) or 0),
         )
 
 

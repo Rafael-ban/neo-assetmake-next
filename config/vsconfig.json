@@ -8,5 +8,6 @@
   "colour": {
     "matrix_s": "170m",
     "heuristic": { "height_threshold": 720, "hd_matrix": 1, "sd_matrix": 6 }
-  }
+  },
+  "core": { "num_threads": 0, "max_cache_size_mb": 0 }
 }

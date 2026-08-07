@@ -135,8 +135,40 @@ def parse_mpv_video_info(properties: dict[str, Any]) -> VideoInfo:
     )
 
 
+def probe_video_info_vs(input_path: str) -> VideoInfo:
+    """Read metadata straight off a VapourSynth clip (in-process, EXACT).
+
+    Preferred over the mpv JSON-IPC probe: mpv could only report estimates —
+    ``parse_mpv_video_info`` falls back to ``round(duration * fps)`` for the
+    frame count and to a hardcoded 30.0 for fps. A VS clip carries the real
+    values as attributes (VS R73 stub: ``width``/``height``/``fps_num``/
+    ``fps_den``/``num_frames``), and it is the SAME source node the export uses,
+    so preview and export can no longer disagree about frame indices.
+
+    Raises VSUnavailable when VapourSynth or a required plugin is missing.
+    """
+    from core.vs_engine import source_clip
+
+    clip = source_clip(input_path)
+    fps_num = int(getattr(clip, "fps_num", 0) or 0)
+    fps_den = int(getattr(clip, "fps_den", 0) or 0)
+    fps = (fps_num / fps_den) if fps_num > 0 and fps_den > 0 else 30.0
+    total_frames = max(1, int(clip.num_frames))
+    duration = total_frames / fps if fps > 0 else 0.0
+    return VideoInfo(
+        width=int(clip.width),
+        height=int(clip.height),
+        duration=duration,
+        fps=fps,
+        total_frames=total_frames,
+        # lsmas exposes no codec name on the node; nothing consumes this field
+        # beyond storing it, so report the source family instead of guessing.
+        codec="",
+    )
+
+
 class VideoProcessor:
-    """Probe video metadata through mpv JSON IPC."""
+    """Probe video metadata (VapourSynth in-process, mpv as fallback)."""
 
     def __init__(self, mpv_path: str = "") -> None:
         self.mpv_path = mpv_path or find_mpv() or "mpv"
@@ -158,10 +190,22 @@ class VideoProcessor:
         return True, output.splitlines()[0] if output else "mpv"
 
     def get_video_info(self, input_path: str) -> Optional[VideoInfo]:
-        """Return metadata for the first video stream in ``input_path``."""
+        """Return metadata for the first video stream in ``input_path``.
+
+        Tries the in-process VapourSynth probe first (exact values, same source
+        node as export); falls back to the mpv JSON-IPC probe so a machine
+        without a working VS bundle keeps loading media.
+        """
         if not Path(input_path).exists():
             logger.error("Video file does not exist: %s", input_path)
             return None
+        try:
+            return probe_video_info_vs(input_path)
+        except Exception as exc:
+            logger.warning(
+                "VapourSynth probe unavailable for %s (%s); falling back to mpv",
+                input_path, exc,
+            )
         try:
             properties = _MpvMetadataSession(self.mpv_path).probe(input_path)
             return parse_mpv_video_info(properties)
