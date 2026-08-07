@@ -1233,6 +1233,10 @@ class MainWindow(QMainWindow):
         target_w, target_h = self._get_target_resolution()
         self.video_preview.set_target_resolution(target_w, target_h)
         self.intro_preview.set_target_resolution(target_w, target_h)
+        # 过渡图预览此前从不接收目标分辨率(TransitionPreviewWidget.
+        # set_target_resolution 有定义但全仓零调用),裁剪框永远锁在默认
+        # 360x640 比例 —— 720x1080 工程里过渡图会被拉伸约 15.6%。
+        self.transition_preview.set_target_resolution(target_w, target_h)
 
         load_failures: list[str] = []
         if self._config.loop.file:
@@ -1985,6 +1989,9 @@ class MainWindow(QMainWindow):
                     preview.set_rotation(track.rotation)
                 if track.crop:
                     preview.set_cropbox(*track.crop)
+                    if list(preview.get_cropbox()) != [int(v) for v in track.crop]:
+                        self.status_bar.showMessage(
+                            "裁剪框已按当前屏幕比例修正", 5000)
                 if 0 <= track.in_frame <= track.out_frame:
                     total = max(1, int(getattr(preview, "total_frames", 1)))
                     in_f, out_f = min(track.in_frame, total - 1), min(track.out_frame, total - 1)
@@ -2744,6 +2751,8 @@ class MainWindow(QMainWindow):
             target_w, target_h = self._get_target_resolution()
             self.video_preview.set_target_resolution(target_w, target_h)
             self.intro_preview.set_target_resolution(target_w, target_h)
+            # 分辨率改变时过渡图裁剪框也要跟着换比例(见 _apply_project_config)。
+            self.transition_preview.set_target_resolution(target_w, target_h)
 
     def _on_video_file_selected(self, path: str):
         """视频文件被选择"""
@@ -3765,10 +3774,15 @@ class MainWindow(QMainWindow):
         self._restoring_editor_state = True
         try:
             if track.rotation:
-                # 先旋转再设裁剪框:set_rotation 会重置裁剪框到默认。
+                # 先旋转再设裁剪框:旋转会按目标比例重新适配裁剪框。
                 preview.set_rotation(track.rotation)
             if track.crop:
                 preview.set_cropbox(*track.crop)
+                # set_cropbox 会把框规整到当前屏幕比例。若被改动(旧工程存的
+                # 框比例不符、或来自其它分辨率),明确告知用户而非静默变更。
+                if list(preview.get_cropbox()) != [int(v) for v in track.crop]:
+                    self.status_bar.showMessage(
+                        "裁剪框已按当前屏幕比例修正", 5000)
             if 0 <= track.in_frame <= track.out_frame:
                 total = max(1, int(getattr(preview, "total_frames", 1)))
                 in_f = min(track.in_frame, total - 1)

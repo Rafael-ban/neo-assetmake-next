@@ -85,15 +85,35 @@ class VpyScriptBuilder:
             self._lines.append("clip = core.std.FlipVertical(core.std.Transpose(clip))")
         return self
 
-    def crop(self, x: int, y: int, w: int, h: int) -> "VpyScriptBuilder":
+    def crop(self, x: int, y: int, w: int, h: int, target_ar: float = 0.0) -> "VpyScriptBuilder":
+        """Emit an eval-time clamped, even-aligned, RATIO-PRESERVING CropAbs.
+
+        Clamping is needed because CropAbs on YUV420 rejects odd/oversized
+        boxes and aborts the encode. It used to clamp width and height
+        INDEPENDENTLY, which changes the box's aspect ratio whenever it
+        overruns one axis (e.g. a 600x1066 box at x=1500 on a 1920-wide clip
+        became 420x1066: ratio 0.563 -> 0.394). Since `colour_convert` then
+        resizes straight to the target with no aspect-preserving parameter
+        (VS R73 `resize.Bicubic` takes independent width/height), that shows up
+        as anisotropic stretching in the exported video. When `target_ar` is
+        given, both axes are shrunk by ONE shared factor so the ratio survives.
+        """
         if w <= 0 or h <= 0:
             return self
-        # Clamp to the ACTUAL post-rotation clip dims at eval time and force even
-        # (CropAbs on YUV420 rejects odd/oversized boxes and aborts the encode).
         self._lines.append(f"_cx = min(max(0, {x}), clip.width - 2) & ~1")
         self._lines.append(f"_cy = min(max(0, {y}), clip.height - 2) & ~1")
-        self._lines.append(f"_cw = min({w}, clip.width - _cx) & ~1")
-        self._lines.append(f"_ch = min({h}, clip.height - _cy) & ~1")
+        self._lines.append(f"_cw = min({w}, clip.width - _cx)")
+        self._lines.append(f"_ch = min({h}, clip.height - _cy)")
+        if target_ar > 0:
+            # Shrink proportionally to the tighter axis, then re-derive the
+            # other from the target ratio (single scale => ratio preserved).
+            self._lines.append(f"_ar = {target_ar!r}")
+            self._lines.append("_scale = min(_cw / ({0} * 1.0), _ch / ({1} * 1.0))".format(w, h))
+            self._lines.append(f"_cw = int(min(_cw, round({w} * _scale)))")
+            self._lines.append("_ch = int(min(_ch, round(_cw / _ar)))")
+            self._lines.append("_cw = int(min(_cw, round(_ch * _ar)))")
+        self._lines.append("_cw = _cw & ~1")
+        self._lines.append("_ch = _ch & ~1")
         self._lines.append("if _cw >= 2 and _ch >= 2:")
         self._lines.append("    clip = core.std.CropAbs(clip, width=_cw, height=_ch, left=_cx, top=_cy)")
         return self
@@ -169,8 +189,13 @@ def write_vpy_script(script_path: "str | os.PathLike[str]", params) -> None:
         builder.source_video(params.video_path, cache_file, start_frame, end_frame)
 
     # Rotation + crop apply to BOTH branches (format-generic VS ops).
+    # target_ar makes the eval-time clamp shrink both axes by one shared factor,
+    # so a box that overruns the frame can no longer come out anisotropically
+    # stretched by the resize below (the GUI locks the ratio too; this is the
+    # defence-in-depth for historical//programmatic boxes).
     builder.rotation(rotation)
-    builder.crop(crop_x, crop_y, crop_w, crop_h)
+    builder.crop(crop_x, crop_y, crop_w, crop_h,
+                 target_ar=(target_w / target_h) if target_h else 0.0)
 
     if params.is_image:
         # Loop AFTER rotate/crop: one processed frame repeated.

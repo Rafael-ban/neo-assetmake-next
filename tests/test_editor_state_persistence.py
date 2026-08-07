@@ -80,6 +80,11 @@ class _FakePreview:
     def get_cropbox_in_rotated_space(self):
         return self.cropbox
 
+    def get_cropbox(self):
+        # The restore path compares this against the requested box to detect
+        # an aspect-ratio correction; the real widget re-fits the box.
+        return self.cropbox
+
     def get_rotation(self):
         return self.rotation
 
@@ -88,6 +93,7 @@ class _FakePreview:
 
     def set_cropbox(self, *box):
         self.calls.append(("crop", box))
+        self.cropbox = tuple(box)
 
 
 class EditorSyncTests(unittest.TestCase):

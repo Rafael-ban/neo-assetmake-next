@@ -12,34 +12,65 @@ def setUpModule():
 
 
 class RotationCropRemapTests(unittest.TestCase):
-    def _widget(self, crop):
+    """Rotation behaviour under the strict target-ratio lock.
+
+    TRADE-OFF (deliberate): rotating by 90/270 swaps the box's w/h, which
+    INVERTS its aspect ratio relative to the target (measured: 0.5625 ->
+    1.7778). Since the export resizes the cropped region straight to the
+    target with no aspect-preserving parameter (VS R73 `resize.Bicubic` takes
+    independent width/height), an inverted-ratio box would be exported
+    anisotropically stretched. Ratio correctness therefore wins over
+    "the box covers the exact same source pixels after a rotation":
+    `set_rotation` re-fits the box to the target ratio around its centre.
+    The two tests that previously asserted round-trip pixel identity were
+    rewritten accordingly.
+    """
+
+    def _widget(self, crop, target=(360, 640)):
         from gui.widgets.video_preview import VideoPreviewWidget
 
         w = VideoPreviewWidget()
         w.video_width, w.video_height = 240, 360
         w._mpv_process = None
+        w.set_target_resolution(*target)
         w.cropbox = list(crop)
         w._rotation = 0
         return w
 
-    def test_rotation_keeps_box_over_same_original_pixels(self):
+    def _ar_off(self, w):
+        bw, bh = w.cropbox[2], w.cropbox[3]
+        return abs(bw / bh - w.target_aspect_ratio) / w.target_aspect_ratio
+
+    def test_rotation_keeps_target_ratio_at_every_angle(self):
         w = self._widget([20, 40, 100, 150])
-        original = w._cropbox_to_original_coords(*w.cropbox)  # at rotation 0
         for angle in (90, 180, 270, 0):
             w.set_rotation(angle)
-            mapped_back = w._cropbox_to_original_coords(*w.cropbox)
-            self.assertEqual(
-                mapped_back, original,
-                f"crop drifted after rotating to {angle}° "
-                f"(box={w.cropbox}, back={mapped_back}, want={original})",
+            self.assertLess(
+                self._ar_off(w), 0.02,
+                f"box left the target ratio after rotating to {angle}° "
+                f"(box={w.cropbox}, AR={w.cropbox[2]/w.cropbox[3]:.4f}, "
+                f"target={w.target_aspect_ratio:.4f})",
             )
 
-    def test_full_turn_is_identity(self):
-        w = self._widget([16, 48, 80, 120])
-        start = list(w.cropbox)
+    def test_rotation_keeps_box_inside_frame_and_centred(self):
+        w = self._widget([20, 40, 100, 150])
         for angle in (90, 180, 270, 0):
             w.set_rotation(angle)
-        self.assertEqual(w.cropbox, start)
+            rw, rh = w._get_rotated_video_size()
+            x, y, bw, bh = w.cropbox
+            self.assertGreaterEqual(x, 0)
+            self.assertGreaterEqual(y, 0)
+            self.assertLessEqual(x + bw, rw, f"box overruns width at {angle}°")
+            self.assertLessEqual(y + bh, rh, f"box overruns height at {angle}°")
+
+    def test_full_turn_returns_to_target_ratio(self):
+        # A full turn no longer restores the exact original (non-conforming)
+        # box; it restores a target-ratio box at rotation 0.
+        w = self._widget([16, 48, 80, 120])
+        for angle in (90, 180, 270, 0):
+            w.set_rotation(angle)
+        self.assertEqual(w._rotation, 0)
+        self.assertLess(self._ar_off(w), 0.02)
 
     def test_rotation_does_not_reset_to_default_center(self):
         w = self._widget([10, 10, 60, 90])

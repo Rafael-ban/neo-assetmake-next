@@ -68,6 +68,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_TARGET_WIDTH = 360
 DEFAULT_TARGET_HEIGHT = 640
 
+# Smallest crop side (px) the ratio lock will shrink to. Below ~64px the
+# integer rounding of w/h can no longer express a ratio like 0.5625 or 0.6667
+# accurately (w=2 -> 2/4 = 0.5, i.e. 11% off), so the lock would appear to
+# "break" at extreme zoom-out. 64px keeps the error well under 1%.
+_MIN_CROP_SIDE = 64
+
 
 class _PreviewLabel(QLabel):
     def __init__(self, owner: "VideoPreviewWidget"):
@@ -517,6 +523,15 @@ class VideoPreviewWidget(QWidget):
         if self.video_width > 0 and self.video_height > 0:
             self._init_cropbox()
             self._refresh_display()
+        else:
+            # No media yet: re-fit the standing box to the NEW ratio anyway.
+            # Previously this branch did nothing, so the aspect ratio changed
+            # while the box kept the OLD ratio — and _apply_project_config
+            # calls clear() (zeroing video_width) BEFORE set_target_resolution,
+            # so this was the common path on every project open.
+            self.cropbox = self._fit_cropbox_to_ratio(*self.cropbox) if (
+                self.video_width > 0
+            ) else [0, 0, width, height]
 
     def load_video(self, path: str) -> bool:
         """Begin loading a video (asynchronous).
@@ -667,37 +682,99 @@ class VideoPreviewWidget(QWidget):
         self._display_frame(frame)
         return True
 
+    def _fit_cropbox_to_ratio(self, x, y, w, h) -> list:
+        """Regularize any box to the TARGET aspect ratio inside the frame.
+
+        Single ratio guard for every crop-box write. The export resizes the
+        cropped region straight to the target with `core.resize.<kernel>(clip,
+        width=..., height=...)` — the VS R73 API has no aspect-preserving
+        parameter (stub `resize.Bicubic` takes independent width/height; no
+        keep_aspect/pad), so ANY box whose ratio != target is scaled
+        anisotropically, i.e. geometrically distorted, in the exported mp4.
+
+        The old `_bound_cropbox` clamped w and h INDEPENDENTLY against the
+        frame edges, which silently destroyed the ratio the drag handles had
+        just enforced (measured: a landscape source drifted 7.8% -> 40.7% off
+        target in a single drag, yielding a 1.41x anisotropic stretch). Here
+        both axes are derived from ONE scale factor, so the ratio survives:
+        the box shrinks proportionally instead of collapsing on one axis.
+
+        Keeps the box centred on its original centre, as large as fits, and
+        even-sized-safe (>= 2px) for the YUV420 crop downstream.
+        """
+        rotated_w, rotated_h = self._get_rotated_video_size()
+        ar = self.target_aspect_ratio if self.target_aspect_ratio > 0 else 1.0
+        if rotated_w <= 0 or rotated_h <= 0:
+            return [int(x), int(y), int(w), int(h)]
+
+        # Largest target-ratio box that fits the frame.
+        if rotated_w / rotated_h > ar:
+            max_h = float(rotated_h)
+            max_w = max_h * ar
+        else:
+            max_w = float(rotated_w)
+            max_h = max_w / ar
+
+        # A box must be big enough for the ratio to be expressible in integers:
+        # at w=2 a 0.5625 target can only round to 2/4 = 0.5 (11% off), and at
+        # w=11 a 0.6667 target rounds to 11/16 = 0.6875 (3.1% off). Require at
+        # least MIN_CROP_SIDE px on BOTH axes so the rounding error stays well
+        # under 1%, while never exceeding what the frame can hold.
+        min_w = float(_MIN_CROP_SIDE if ar >= 1.0 else _MIN_CROP_SIDE * ar)
+        min_w = max(min_w, float(_MIN_CROP_SIDE) * ar)
+        min_w = min(max(2.0, min_w), max_w)
+
+        # Requested size, ratio-locked: honour the larger requested axis but
+        # never exceed the fitting box (one shared scale -> ratio preserved).
+        req_w = max(2.0, float(w))
+        req_h = max(2.0, float(h))
+        want_w = max(min_w, min(max_w, max(req_w, req_h * ar)))
+        new_w = max(2, int(round(want_w)))
+        new_h = max(2, int(round(new_w / ar)))
+        # Rounding can push one axis 1px past the frame; step down together
+        # while the box is still large enough to express the ratio.
+        while (new_w > rotated_w or new_h > rotated_h) and new_w > int(min_w):
+            new_w -= 1
+            new_h = max(2, int(round(new_w / ar)))
+        new_w = min(new_w, rotated_w)
+        new_h = min(new_h, rotated_h)
+
+        # Preserve the requested centre, then clamp translation only.
+        cx = float(x) + float(w) / 2.0
+        cy = float(y) + float(h) / 2.0
+        new_x = int(round(cx - new_w / 2.0))
+        new_y = int(round(cy - new_h / 2.0))
+        new_x = max(0, min(new_x, max(0, rotated_w - new_w)))
+        new_y = max(0, min(new_y, max(0, rotated_h - new_h)))
+        return [new_x, new_y, new_w, new_h]
+
     def _init_cropbox(self):
         rotated_w, rotated_h = self._get_rotated_video_size()
         if rotated_w <= 0 or rotated_h <= 0:
             self.cropbox = [0, 0, self.target_width, self.target_height]
             return
+        # 75% of the largest fitting target-ratio box, centred. Sizing/centring
+        # and the ratio itself are delegated to the single guard so the initial
+        # box can no longer differ from every other write path.
         if rotated_w / rotated_h > self.target_aspect_ratio:
-            max_h = rotated_h
-            max_w = int(max_h * self.target_aspect_ratio)
+            max_w = rotated_h * self.target_aspect_ratio
         else:
-            max_w = rotated_w
-            max_h = int(max_w / self.target_aspect_ratio)
-        crop_w = max(1, int(max_w * 0.75))
-        crop_h = max(1, int(crop_w / self.target_aspect_ratio))
-        self.cropbox = [
-            max(0, (rotated_w - crop_w) // 2),
-            max(0, (rotated_h - crop_h) // 2),
-            crop_w,
-            crop_h,
-        ]
+            max_w = float(rotated_w)
+        want_w = max(2.0, max_w * 0.75)
+        self.cropbox = self._fit_cropbox_to_ratio(
+            (rotated_w - want_w) / 2.0,
+            (rotated_h - want_w / self.target_aspect_ratio) / 2.0,
+            want_w,
+            want_w / self.target_aspect_ratio,
+        )
         self._emit_cropbox_changed()
 
     def _bound_cropbox(self):
+        """Clamp + re-lock the crop box (delegates to the single ratio guard)."""
         rotated_w, rotated_h = self._get_rotated_video_size()
         if rotated_w <= 0 or rotated_h <= 0:
             return
-        x, y, w, h = [int(v) for v in self.cropbox]
-        w = max(1, min(w, rotated_w))
-        h = max(1, min(h, rotated_h))
-        x = max(0, min(x, max(0, rotated_w - w)))
-        y = max(0, min(y, max(0, rotated_h - h)))
-        self.cropbox = [x, y, w, h]
+        self.cropbox = self._fit_cropbox_to_ratio(*self.cropbox)
 
     def _emit_cropbox_changed(self):
         x, y, w, h = self.cropbox

@@ -5,8 +5,15 @@ clip = clip if clip.format.id == vs.RGB24 else core.resize.Bicubic(clip, format=
 clip = core.std.FlipHorizontal(core.std.Transpose(clip))
 _cx = min(max(0, 10), clip.width - 2) & ~1
 _cy = min(max(0, 20), clip.height - 2) & ~1
-_cw = min(100, clip.width - _cx) & ~1
-_ch = min(200, clip.height - _cy) & ~1
+_cw = min(100, clip.width - _cx)
+_ch = min(200, clip.height - _cy)
+_ar = 0.5625
+_scale = min(_cw / (100 * 1.0), _ch / (200 * 1.0))
+_cw = int(min(_cw, round(100 * _scale)))
+_ch = int(min(_ch, round(_cw / _ar)))
+_cw = int(min(_cw, round(_ch * _ar)))
+_cw = _cw & ~1
+_ch = _ch & ~1
 if _cw >= 2 and _ch >= 2:
     clip = core.std.CropAbs(clip, width=_cw, height=_ch, left=_cx, top=_cy)
 clip = core.std.Loop(clip, times=30)

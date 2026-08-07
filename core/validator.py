@@ -78,6 +78,7 @@ class EPConfigValidator:
         self._validate_transition(config, "transition_in")
         self._validate_transition(config, "transition_loop")
         self._validate_overlay(config)
+        self._validate_editor_crop(config)
 
         return self.results
 
@@ -177,6 +178,46 @@ class EPConfigValidator:
         icon = config.get("icon", "")
         if icon:
             self._validate_optional_image("icon", icon)
+
+    # 裁剪框比例偏离目标超过此阈值即警告(整数量化误差远小于它)。
+    CROP_ASPECT_TOLERANCE = 0.02
+
+    def _validate_editor_crop(self, config: dict):
+        """校验编辑器裁剪框比例是否与屏幕比例一致。
+
+        导出会把裁剪区域直接缩放到目标分辨率,而 VapourSynth 的 resize 没有
+        保持宽高比的参数(独立的 width/height),所以比例不一致会导致导出画面
+        被各向异性拉伸。此前完全没有任何 crop 校验,问题全程静默。
+        """
+        editor = config.get("editor")
+        if not isinstance(editor, dict):
+            return
+        screen = config.get("screen", "")
+        spec = RESOLUTION_SPECS.get(screen)
+        if not spec:
+            return
+        target_ar = float(spec["width"]) / float(spec["height"])
+        for track in ("loop", "intro"):
+            data = editor.get(track)
+            if not isinstance(data, dict):
+                continue
+            crop = data.get("crop")
+            if not (isinstance(crop, (list, tuple)) and len(crop) == 4):
+                continue
+            try:
+                w, h = float(crop[2]), float(crop[3])
+            except (TypeError, ValueError):
+                continue
+            if w <= 0 or h <= 0:
+                self._add_result(
+                    ValidationLevel.WARNING, f"editor.{track}.crop",
+                    f"裁剪框尺寸无效,将被重新适配: {crop}")
+                continue
+            if abs(w / h - target_ar) / target_ar > self.CROP_ASPECT_TOLERANCE:
+                self._add_result(
+                    ValidationLevel.WARNING, f"editor.{track}.crop",
+                    f"裁剪框比例 {w/h:.4f} 与屏幕比例 {target_ar:.4f} 不一致,"
+                    f"打开项目时会按屏幕比例自动修正")
 
     def _validate_loop(self, config: dict):
         """校验循环动画配置"""
