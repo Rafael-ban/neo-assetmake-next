@@ -24,8 +24,15 @@ from PyQt6.QtGui import (
     QPen,
     QPixmap,
 )
-from PyQt6.QtWidgets import QLabel, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel, setCustomStyleSheet
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QSizePolicy,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+from qfluentwidgets import CaptionLabel, PushButton, Slider, setCustomStyleSheet
 
 from core.media_tools import MediaToolchain
 from core.video_processor import MetadataProbeWorker
@@ -123,6 +130,11 @@ class VideoPreviewWidget(QWidget):
         self._epconfig: Optional["EPConfig"] = None
         self._overlay_renderer = None
         self._rotation = 0
+        self._zoom_factor = 1.0
+        # Point keeps pixel edges hard, so single source pixels stay countable
+        # at 10000% — that is what the zoom is for (checking crop boundaries).
+        self._zoom_kernel = "Point"
+        self._zoom_pan = (0.5, 0.5)  # normalised centre of the magnified window
 
         self.is_playing = False
         self.timer = QTimer(self)
@@ -177,6 +189,33 @@ class VideoPreviewWidget(QWidget):
             "color: #777; padding: 4px 10px; background-color: transparent; border: none;",
         )
         layout.addWidget(self.info_label)
+
+        # Zoom controls
+        zoom_container = QWidget()
+        zoom_layout = QHBoxLayout(zoom_container)
+        zoom_layout.setContentsMargins(10, 0, 10, 0)
+        zoom_layout.setSpacing(10)
+
+        # 对数刻度:slider 0..200 → 10^(v/100) → 1.0x..100.0x(100%..10000%)
+        self.zoom_slider = Slider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setMinimum(0)
+        self.zoom_slider.setMaximum(200)
+        self.zoom_slider.setValue(0)
+        self.zoom_slider.valueChanged.connect(self._on_zoom_slider_changed)
+        zoom_layout.addWidget(CaptionLabel("缩放:"))
+        zoom_layout.addWidget(self.zoom_slider, 1)
+
+        self.zoom_label = CaptionLabel("100%")
+        self.zoom_label.setMinimumWidth(60)
+        zoom_layout.addWidget(self.zoom_label)
+
+        for percent in (100, 1000, 10000):
+            btn = PushButton(f"{percent}%")
+            btn.setMaximumWidth(70)
+            btn.clicked.connect(lambda checked, p=percent: self._set_zoom_percent(p))
+            zoom_layout.addWidget(btn)
+
+        layout.addWidget(zoom_container)
 
     def _teardown_media(self, sync_shutdown: bool = False):
         """Release the preview backend. No child process, so nothing to wait on.
@@ -269,13 +308,36 @@ class VideoPreviewWidget(QWidget):
         to RGB, so what is on screen is the pixels the device gets — including
         the export's own resizer, padding and final 180° turn. Edit mode shows
         the whole (rotated) source with the crop rectangle painted over it.
+
+        Zoom is a final viewport magnifier stage (see
+        ``vs_graph.apply_preview_zoom``) — it crops the visible window first, so
+        cost stays flat instead of scaling with the factor.
         """
-        from core.vs_graph import build_display_graph, build_source_graph
+        from core.vs_graph import (apply_preview_zoom, build_display_graph,
+                                   build_source_graph)
 
         if not self._preview_mode:
-            return build_source_graph(self.video_path, is_image=self._is_image_source(),
+            clip = build_source_graph(self.video_path, is_image=self._is_image_source(),
                                       rotation=self._rotation)
-        return build_display_graph(self._build_export_params())
+        else:
+            clip = build_display_graph(self._build_export_params())
+
+        if self._zoom_factor > 1.0:
+            clip = apply_preview_zoom(
+                clip,
+                zoom_factor=self._zoom_factor,
+                viewport=self._viewport_size(),
+                pan=self._zoom_pan,
+                kernel=self._zoom_kernel,
+            )
+        return clip
+
+    def _viewport_size(self) -> Tuple[int, int]:
+        """Visible preview area in device pixels (what zoom renders into)."""
+        size = self.video_label.size()
+        dpr = self.video_label.devicePixelRatioF()
+        return (max(2, round(size.width() * dpr)),
+                max(2, round(size.height() * dpr)))
 
     def _rebuild_vs_graph(self) -> None:
         """Re-derive the graph (rotation / crop / preview-mode change)."""
@@ -677,6 +739,12 @@ class VideoPreviewWidget(QWidget):
     def _paint_cropbox(self, widget: QWidget):
         if self._preview_mode or self.video_width <= 0 or self.video_height <= 0:
             return
+        # Zoomed frames are a magnified VIEWPORT WINDOW of the source, not the
+        # whole (scaled) source, so display_scale/offset no longer map source
+        # coordinates onto the label — the rectangle would be drawn in the wrong
+        # place. Zoom is an inspection mode; the box is hidden and locked.
+        if self._zoom_factor > 1.0:
+            return
         rotated_w, rotated_h = self._get_rotated_video_size()
         self._update_display_geometry(widget, rotated_w, rotated_h)
         x, y, w, h = self.cropbox
@@ -981,9 +1049,12 @@ class VideoPreviewWidget(QWidget):
         return self.DRAG_NONE
 
     def _handle_mouse_press(self, widget: QWidget, event: QMouseEvent):
-        if event.button() != Qt.MouseButton.LeftButton or self._preview_mode:
+        if (event.button() != Qt.MouseButton.LeftButton or self._preview_mode
+                or self._zoom_factor > 1.0):
             # 预览模式下画面是导出结果(已裁剪/缩放/补边),裁剪框不绘制,
             # 此时的拖拽会按导出几何去改框——无反馈且坐标系不对。
+            # 放大后画面是源的一个视口窗口,display_scale 不再对应源坐标,
+            # 同理拖拽会错位——放大是查看模式,裁剪框锁定(见 _paint_cropbox)。
             return
         vx, vy = self._display_to_rotated_coords(widget, event.pos())
         self.drag_mode = self._get_drag_mode(vx, vy)
@@ -1059,6 +1130,15 @@ class VideoPreviewWidget(QWidget):
             self.cropbox[0] -= 10
         elif key == Qt.Key.Key_D and not has_modifier:
             self.cropbox[0] += 10
+        elif key == Qt.Key.Key_Equal and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            # Ctrl+= (zoom in)
+            self.zoom_slider.setValue(self.zoom_slider.value() + 10)
+        elif key == Qt.Key.Key_Minus and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            # Ctrl+- (zoom out)
+            self.zoom_slider.setValue(self.zoom_slider.value() - 10)
+        elif key == Qt.Key.Key_0 and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
+            # Ctrl+0 (reset zoom to 100%)
+            self.zoom_slider.setValue(0)
         else:
             super().keyPressEvent(event)
             return
@@ -1075,6 +1155,37 @@ class VideoPreviewWidget(QWidget):
         # (bounded) shutdown — async kill-escalation timers would never fire.
         self.clear(sync_shutdown=True)
         super().closeEvent(event)
+
+    def _on_zoom_slider_changed(self, value: int):
+        """Slider position → zoom factor (logarithmic 1% ~ 10000%)."""
+        import math
+        # value 0 → 1.0x, value 100 → 10.0x, value 200 → 100.0x
+        factor = 10 ** (value / 100.0)
+        if abs(factor - self._zoom_factor) < 0.001:
+            return
+        self._zoom_factor = factor
+        self.zoom_label.setText(f"{int(factor * 100)}%")
+        self._rebuild_vs_graph()
+
+    def _set_zoom_percent(self, percent: int):
+        """Quick-zoom button: set zoom to an exact percentage."""
+        import math
+        factor = percent / 100.0
+        # Convert back to slider position
+        slider_val = int(100.0 * math.log10(factor))
+        self.zoom_slider.setValue(slider_val)
+
+    def set_zoom_factor(self, factor: float):
+        """Public API: set zoom programmatically (factor = 1.0 means 100%)."""
+        import math
+        if factor < 0.01 or factor > 100.0:
+            raise ValueError(f"zoom factor {factor} out of range [0.01, 100.0]")
+        slider_val = int(100.0 * math.log10(factor))
+        self.zoom_slider.setValue(slider_val)
+
+    def get_zoom_factor(self) -> float:
+        """Public API: current zoom factor."""
+        return self._zoom_factor
 
     def clear(self, sync_shutdown: bool = False):
         self._load_epoch += 1  # invalidate pending probe/retry continuations

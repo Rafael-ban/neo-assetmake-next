@@ -13,6 +13,7 @@ stay in step; ``tests/test_preview_export_parity`` is what proves it.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Optional
 
 from config.constants import get_resolution_spec
@@ -147,3 +148,55 @@ def build_display_graph(params, *, config: Optional[VSConfig] = None) -> Any:
     vs = vs_engine.load_vapoursynth()
     return to_display_rgb_clip(build_export_graph(params, config=cfg), vs,
                                cfg.resampler_kernel)
+
+
+# Zoom is a VIEWPORT magnifier, not a whole-frame resize. Rendering the full
+# frame at 100x measured 38400x64000 = 7.37 GB per RGB24 frame and 9.3 s to
+# pull frame 0 (probed on this bundle) — and the viewport can only ever show
+# ~1000x1800 of it. Cropping the source window FIRST keeps the cost flat at
+# roughly viewport size regardless of the factor.
+def apply_preview_zoom(clip, *, zoom_factor: float, viewport: tuple[int, int],
+                       pan: tuple[float, float] = (0.5, 0.5),
+                       kernel: str = "Point",
+                       config: Optional[VSConfig] = None) -> Any:
+    """Magnify the region of ``clip`` the viewport can actually show.
+
+    Args:
+        clip: RGB24 display clip (from build_display_graph/build_source_graph).
+        zoom_factor: 1.0 = fit as-is; 100.0 = 10000%.
+        viewport: (width, height) of the on-screen area, in device pixels.
+        pan: Normalised centre of interest in (0..1, 0..1) source coordinates.
+        kernel: resize kernel; ``Point`` keeps pixel edges hard so single
+            source pixels stay countable at high factors (that is the point of
+            a 10000% zoom — checking crop boundaries pixel by pixel).
+
+    Returns:
+        A clip no larger than the viewport, or ``clip`` unchanged at 1.0x.
+    """
+    from core import vs_engine
+
+    if zoom_factor <= 1.0:
+        return clip
+
+    cfg = config or load_vsconfig()
+    core = vs_engine.get_core(cfg)
+
+    vw = max(2, int(viewport[0]))
+    vh = max(2, int(viewport[1]))
+    # The source window that maps onto the viewport at this magnification.
+    win_w = max(2, min(clip.width, int(math.ceil(vw / zoom_factor))))
+    win_h = max(2, min(clip.height, int(math.ceil(vh / zoom_factor))))
+    # CropAbs needs even offsets/sizes for subsampled formats; RGB24 is not
+    # subsampled, but staying even keeps this valid if the format ever changes.
+    win_w &= ~1
+    win_h &= ~1
+    win_w = max(2, win_w)
+    win_h = max(2, win_h)
+
+    cx = min(max(float(pan[0]), 0.0), 1.0) * clip.width
+    cy = min(max(float(pan[1]), 0.0), 1.0) * clip.height
+    left = int(min(max(cx - win_w / 2.0, 0), clip.width - win_w)) & ~1
+    top = int(min(max(cy - win_h / 2.0, 0), clip.height - win_h)) & ~1
+
+    clip = core.std.CropAbs(clip, width=win_w, height=win_h, left=left, top=top)
+    return _resizer(core, kernel)(clip, width=vw, height=vh)
