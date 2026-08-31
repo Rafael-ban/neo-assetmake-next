@@ -54,6 +54,12 @@ def build_export_graph(params, *, config: Optional[VSConfig] = None) -> Any:
 
     is_image = bool(params.is_image)
     clip = vs_engine.source_clip(params.video_path, is_image=is_image)
+    # Capture the SOURCE height before rotate/crop — the SD/HD matrix heuristic
+    # below describes how the SOURCE was encoded, so our own editing must not
+    # influence it. Measured after CropAbs, a crop dipping under the threshold
+    # flipped the guessed matrix and visibly changed exported colours (probed:
+    # a real BT.709 source cropped 800 -> 718 high went from ΔE 1 to ΔE 22).
+    src_height = clip.height
     if not is_image:
         clip = clip[start_frame:end_frame]
 
@@ -96,7 +102,7 @@ def build_export_graph(params, *, config: Optional[VSConfig] = None) -> Any:
         matrix = clip.get_frame(0).props.get("_Matrix", 2)
         if matrix == 2:
             h = cfg.heuristic
-            stamped = h.hd_matrix if clip.height >= h.height_threshold else h.sd_matrix
+            stamped = h.hd_matrix if src_height >= h.height_threshold else h.sd_matrix
             clip = core.std.SetFrameProps(clip, _Matrix=stamped)
     clip = resizer(clip, width=target_w, height=target_h,
                    format=out_fmt, matrix_s=cfg.matrix_s)

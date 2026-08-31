@@ -16,7 +16,6 @@ CONFIG_FILENAME = "epconfig.json"
 class ScreenType(Enum):
     """屏幕分辨率类型"""
     S360x640 = "360x640"
-    S480x854 = "480x854"
     S720x1080 = "720x1080"
 
     @classmethod

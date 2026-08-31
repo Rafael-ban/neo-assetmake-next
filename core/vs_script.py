@@ -70,6 +70,12 @@ class VpyScriptBuilder:
             f"clip = core.lsmas.LWLibavSource({_quote_vs_string(path)}, "
             f"cachefile={_quote_vs_string(cache_file)})"
         )
+        # Capture the SOURCE height before rotate/crop: the SD/HD matrix
+        # heuristic in colour_convert() describes how the SOURCE was encoded,
+        # which our own editing must not influence. Measuring it after CropAbs
+        # made a crop that dips below the threshold flip the guessed matrix, so
+        # dragging the crop box visibly changed exported colours.
+        self._lines.append("_src_height = clip.height")
         self._lines.append(f"clip = clip[{start}:{end}]")
         return self
 
@@ -131,7 +137,7 @@ class VpyScriptBuilder:
             self._lines.append("if clip.get_frame(0).props.get('_Matrix', 2) == 2:")
             self._lines.append(
                 f"    clip = core.std.SetFrameProps(clip, "
-                f"_Matrix={h.hd_matrix} if clip.height >= {h.height_threshold} else {h.sd_matrix})"
+                f"_Matrix={h.hd_matrix} if _src_height >= {h.height_threshold} else {h.sd_matrix})"
             )
         self._lines.append(
             f"clip = core.resize.{cfg.resampler_kernel}(clip, width={target_w}, height={target_h}, "

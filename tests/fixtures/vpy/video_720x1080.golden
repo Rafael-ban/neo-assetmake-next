@@ -1,8 +1,9 @@
 import vapoursynth as vs
 core = vs.core
 clip = core.lsmas.LWLibavSource('C:/media/hd.mp4', cachefile={CACHE})
+_src_height = clip.height
 clip = clip[0:120]
 if clip.get_frame(0).props.get('_Matrix', 2) == 2:
-    clip = core.std.SetFrameProps(clip, _Matrix=1 if clip.height >= 720 else 6)
+    clip = core.std.SetFrameProps(clip, _Matrix=1 if _src_height >= 720 else 6)
 clip = core.resize.Bicubic(clip, width=720, height=1080, format=vs.YUV420P8, matrix_s='170m')
 clip.set_output()
