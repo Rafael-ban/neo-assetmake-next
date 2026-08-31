@@ -206,6 +206,42 @@ def verify_plugins(config: Optional[VSConfig] = None) -> None:
         )
 
 
+def resize_filter(core_obj: Any, kernel: str):
+    """Resolve ``core.resize.<kernel>``, failing loudly on an unknown name.
+
+    The single place this lookup happens. It used to be spelled three ways with
+    three different outcomes for the same bad value: `getattr(..., Bicubic)` in
+    core/vs_graph.py silently substituted Bicubic (so a misspelt kernel looked
+    like it worked), a bare `getattr` here raised AttributeError from deep in
+    the preview path, and core/vs_script.py pasted the name into a .vpy where it
+    only failed inside the VSPipe subprocess. Config values are whitelisted in
+    config/vsconfig.py; this guards the remaining case — a caller passing one
+    directly, e.g. apply_preview_zoom(kernel=...).
+    """
+    fn = getattr(core_obj.resize, kernel, None)
+    if fn is None:
+        available = sorted(
+            n for n in dir(core_obj.resize) if not n.startswith("_")
+        )
+        raise VSUnavailable(
+            f"未知的 resize 内核 {kernel!r};可用: {', '.join(available)}"
+        )
+    return fn
+
+
+def preset_format(vs_module: Any, name: str):
+    """Resolve ``vs.<NAME>`` (a preset video format), failing loudly.
+
+    Previously a name that is a valid identifier but not a real format (e.g.
+    ``RGB25``) resolved to None and the caller SKIPPED the conversion, letting
+    the clip continue in an unexpected format until something downstream broke.
+    """
+    fmt = getattr(vs_module, name, None)
+    if fmt is None:
+        raise VSUnavailable(f"未知的 VapourSynth 像素格式 vs.{name}")
+    return fmt
+
+
 def lwi_cache_path(video_path: str) -> str:
     """Stable per-app .lwi index location for PREVIEW sources.
 
@@ -243,9 +279,9 @@ def source_clip(video_path: str, *, is_image: bool = False, use_cache: bool = Tr
 
     if is_image:
         clip = core.imwri.Read(video_path)
-        want = getattr(vs, cfg.image_source_format, None)
-        if want is not None and clip.format.id != want:
-            clip = getattr(core.resize, cfg.resampler_kernel)(clip, format=want)
+        want = preset_format(vs, cfg.image_source_format)
+        if clip.format.id != want:
+            clip = resize_filter(core, cfg.resampler_kernel)(clip, format=want)
     else:
         clip = core.lsmas.LWLibavSource(
             video_path, cachefile=lwi_cache_path(video_path)

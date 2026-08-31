@@ -23,7 +23,15 @@ logger = logging.getLogger(__name__)
 
 
 def _resizer(core: Any, kernel: str):
-    return getattr(core.resize, kernel, core.resize.Bicubic)
+    """Delegate to the single authoritative lookup (raises on unknown names).
+
+    This used to be `getattr(core.resize, kernel, core.resize.Bicubic)` — a
+    misspelt kernel silently became Bicubic, so the config looked honoured when
+    it was not.
+    """
+    from core import vs_engine
+
+    return vs_engine.resize_filter(core, kernel)
 
 
 def build_export_graph(params, *, config: Optional[VSConfig] = None) -> Any:
@@ -97,7 +105,7 @@ def build_export_graph(params, *, config: Optional[VSConfig] = None) -> Any:
 
     # --- colour: normalize to the configured output format/matrix ---
     resizer = _resizer(core, cfg.resampler_kernel)
-    out_fmt = getattr(vs, cfg.output_format)
+    out_fmt = vs_engine.preset_format(vs, cfg.output_format)
     if not is_image:
         matrix = clip.get_frame(0).props.get("_Matrix", 2)
         if matrix == 2:

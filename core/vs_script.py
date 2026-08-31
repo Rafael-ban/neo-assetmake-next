@@ -34,6 +34,19 @@ def _quote_vs_string(value: str) -> str:
     return repr(_vs_path(value))
 
 
+def _quote_vs_literal(value: str) -> str:
+    """Quote a plain string VALUE (not a path) for embedding in the .vpy.
+
+    `matrix_s` reaches the script as `matrix_s='...'` built by hand, so a value
+    containing a quote produced a .vpy that fails to parse — inside the VSPipe
+    subprocess, far from the config file that caused it. `repr()` of the default
+    '170m' is byte-identical to the old hand-written form, so goldens are
+    unaffected. Identifier positions (kernel/format names) are whitelisted in
+    config/vsconfig.py instead, since they cannot be quoted.
+    """
+    return repr(value)
+
+
 class VpyScriptBuilder:
     """Assemble a .vpy line-by-line; one method per filter step.
 

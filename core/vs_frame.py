@@ -88,9 +88,13 @@ def to_display_rgb_clip(clip: Any, vs_module: Any, kernel: str = "Bicubic") -> A
     than building a separate RGB chain) is what makes the preview show the
     exported pixels — "看到什么 = 导出什么".
     """
+    from core import vs_engine
+
     core = vs_module.core
     if clip.format.id == vs_module.RGB24:
         return clip
-    resizer = getattr(core.resize, kernel, core.resize.Bicubic)
+    # Single authoritative lookup: a misspelt kernel must not silently become
+    # Bicubic (that made a wrong config look like it was honoured).
+    resizer = vs_engine.resize_filter(core, kernel)
     # matrix_in_s tells zimg how to interpret the YUV it is converting FROM.
     return resizer(clip, format=vs_module.RGB24, matrix_in_s="170m")
