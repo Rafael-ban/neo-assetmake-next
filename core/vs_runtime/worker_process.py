@@ -87,6 +87,10 @@ WORKER_START_ERROR_CODE = "worker.start_failed"
 class WorkerProcessError(RuntimeError):
     """worker 传输或生命周期错误。"""
 
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        self.code = code
+        super().__init__(message)
+
 
 class WorkerCrashedError(WorkerProcessError):
     def __init__(self, message: str, *, exit_code: int | None = None) -> None:
@@ -98,13 +102,16 @@ class WorkerRequestError(WorkerProcessError):
     def __init__(self, response: dict[str, Any]) -> None:
         self.response = response
         self.error_type = str(response.get("error_type", "request_error"))
-        self.code = response.get("code")
+        code = response.get("code")
         self.field = response.get("field")
         self.path = response.get("path")
         self.expected = response.get("expected")
         self.actual = response.get("actual")
         self.hint = response.get("hint")
-        super().__init__(str(response.get("message", self.error_type)))
+        super().__init__(
+            str(response.get("message", self.error_type)),
+            code=code if isinstance(code, str) else None,
+        )
 
 
 class FrameDiscardedError(WorkerProcessError):
@@ -128,6 +135,25 @@ class _PendingRequest:
     index: int | None = None
     surface: str | None = None
     mode: str | None = None
+
+
+@dataclass(frozen=True)
+class _StagingCleanupResult:
+    ok: bool
+    code: str | None = None
+    detail: str = ""
+
+    @classmethod
+    def success(cls) -> _StagingCleanupResult:
+        return cls(ok=True)
+
+    @classmethod
+    def failure(cls, detail: str) -> _StagingCleanupResult:
+        return cls(
+            ok=False,
+            code=STAGING_CLEANUP_ERROR_CODE,
+            detail=detail,
+        )
 
 
 class WorkerProcess:
@@ -230,31 +256,34 @@ class WorkerProcess:
     @staticmethod
     def _safe_error_text(error: BaseException) -> str:
         try:
-            return str(error)
+            detail = str(error)
         except BaseException:
             return type(error).__name__
+        return detail or type(error).__name__
 
     @classmethod
     def _close_generation_staging(
         cls, generation_staging: GenerationStagingRoot
-    ) -> str:
+    ) -> _StagingCleanupResult:
         """尽力关闭精确代际根；文件系统异常只作为稳定诊断返回。"""
         try:
             generation_staging.close()
         except BaseException as error:
-            return cls._safe_error_text(error)
-        return ""
+            return _StagingCleanupResult.failure(
+                cls._safe_error_text(error)
+            )
+        return _StagingCleanupResult.success()
 
     def _release_generation_staging(
         self, generation_staging: GenerationStagingRoot
-    ) -> str:
+    ) -> _StagingCleanupResult:
         """尽力释放精确 owner；成功后才清除 transport 持有的引用。"""
-        failure = self._close_generation_staging(generation_staging)
-        if not failure:
+        result = self._close_generation_staging(generation_staging)
+        if result.ok:
             with self._state_lock:
                 if self._generation_staging is generation_staging:
                     self._generation_staging = None
-        return failure
+        return result
 
     def _reap_failed_start(
         self,
@@ -264,7 +293,7 @@ class WorkerProcess:
         stdout_done: threading.Event,
         stderr_done: threading.Event,
         started_threads: Sequence[threading.Thread],
-    ) -> tuple[int, str]:
+    ) -> tuple[int, _StagingCleanupResult]:
         """不可抛地收束 Popen 后尚未成功启动的 generation。"""
         try:
             write_queue.put(None)
@@ -307,18 +336,21 @@ class WorkerProcess:
                     thread.join(timeout=1)
             except BaseException:
                 pass
-        staging_failure = self._release_generation_staging(
+        staging_cleanup = self._release_generation_staging(
             generation_staging
         )
-        return (code if type(code) is int else -1), staging_failure
+        return (code if type(code) is int else -1), staging_cleanup
 
     @staticmethod
-    def _failure_detail(message: str, staging_failure: str) -> str:
-        if not staging_failure:
+    def _failure_detail(
+        message: str, staging_cleanup: _StagingCleanupResult
+    ) -> str:
+        if staging_cleanup.ok:
             return message
         return (
-            f"{message}; [{STAGING_CLEANUP_ERROR_CODE}] "
-            f"generation staging cleanup failed: {staging_failure}"
+            f"{message}; [{staging_cleanup.code}] "
+            "generation staging cleanup failed: "
+            f"{staging_cleanup.detail}"
         )
 
     def start(self) -> int:
@@ -331,14 +363,15 @@ class WorkerProcess:
                 raise WorkerProcessError("上一代 worker 仍在收尾")
             retained_staging = self._generation_staging
             if retained_staging is not None:
-                retained_failure = self._release_generation_staging(
+                retained_cleanup = self._release_generation_staging(
                     retained_staging
                 )
-                if retained_failure:
+                if not retained_cleanup.ok:
                     raise WorkerProcessError(
-                        f"[{STAGING_CLEANUP_ERROR_CODE}] retained generation "
+                        f"[{retained_cleanup.code}] retained generation "
                         "staging cleanup failed: "
-                        f"{retained_failure}"
+                        f"{retained_cleanup.detail}",
+                        code=retained_cleanup.code,
                     )
             generation = self._generation + 1
             exit_event = threading.Event()
@@ -358,16 +391,18 @@ class WorkerProcess:
             try:
                 generation_staging.initialize_marker()
             except BaseException as error:
-                staging_failure = self._release_generation_staging(
+                staging_cleanup = self._release_generation_staging(
                     generation_staging
                 )
                 detail = self._failure_detail(
                     f"[{STAGING_IDENTITY_ERROR_CODE}] worker generation "
                     "staging marker initialization failed: "
                     f"{self._safe_error_text(error)}",
-                    staging_failure,
+                    staging_cleanup,
                 )
-                raise WorkerProcessError(detail) from error
+                raise WorkerProcessError(
+                    detail, code=STAGING_IDENTITY_ERROR_CODE
+                ) from error
             try:
                 command = list(self.command)
                 if self.self_test:
@@ -388,28 +423,28 @@ class WorkerProcess:
                 if sys_platform_is_windows():
                     kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             except BaseException as error:
-                staging_failure = self._release_generation_staging(
+                staging_cleanup = self._release_generation_staging(
                     generation_staging
                 )
                 detail = self._failure_detail(
                     "worker 启动准备失败: "
                     f"{self._safe_error_text(error)}",
-                    staging_failure,
+                    staging_cleanup,
                 )
                 raise WorkerProcessError(detail) from error
             try:
                 process = subprocess.Popen(command, **kwargs)
             except (OSError, subprocess.SubprocessError, ValueError) as exc:
-                staging_failure = self._release_generation_staging(
+                staging_cleanup = self._release_generation_staging(
                     generation_staging
                 )
                 detail = self._failure_detail(
                     f"worker 启动失败: {self._safe_error_text(exc)}",
-                    staging_failure,
+                    staging_cleanup,
                 )
                 raise WorkerProcessError(detail) from exc
             if process.stdin is None or process.stdout is None or process.stderr is None:
-                _code, staging_failure = self._reap_failed_start(
+                _code, staging_cleanup = self._reap_failed_start(
                     process,
                     generation_staging,
                     write_queue,
@@ -419,7 +454,7 @@ class WorkerProcess:
                 )
                 raise WorkerProcessError(
                     self._failure_detail(
-                        "worker binary PIPE 创建失败", staging_failure
+                        "worker binary PIPE 创建失败", staging_cleanup
                     )
                 )
             try:
@@ -459,7 +494,7 @@ class WorkerProcess:
                     ),
                 ]
             except BaseException as error:
-                _code, staging_failure = self._reap_failed_start(
+                _code, staging_cleanup = self._reap_failed_start(
                     process,
                     generation_staging,
                     write_queue,
@@ -470,7 +505,7 @@ class WorkerProcess:
                 detail = self._failure_detail(
                     "worker 协议线程构造失败: "
                     f"{self._safe_error_text(error)}",
-                    staging_failure,
+                    staging_cleanup,
                 )
                 raise WorkerProcessError(detail) from error
             # Popen 与 PIPE 均成功后才发布新代，避免一次 spawn 失败把
@@ -505,7 +540,7 @@ class WorkerProcess:
 
         # 线程资源耗尽等半启动失败必须在 start() 返回前彻底收束；此时
         # exit_event 仍未置位，其他 start() 会被“上一代仍在收尾”挡住。
-        code, staging_failure = self._reap_failed_start(
+        code, staging_cleanup = self._reap_failed_start(
             process,
             generation_staging,
             write_queue,
@@ -516,7 +551,7 @@ class WorkerProcess:
         detail = self._failure_detail(
             "worker 协议线程启动失败: "
             f"{self._safe_error_text(start_error)}",
-            staging_failure,
+            staging_cleanup,
         )
         should_emit = False
         with self._state_lock:
@@ -533,14 +568,21 @@ class WorkerProcess:
                     "generation": generation,
                     "exit_code": code,
                     "code": (
-                        STAGING_CLEANUP_ERROR_CODE
-                        if staging_failure
+                        staging_cleanup.code
+                        if not staging_cleanup.ok
                         else WORKER_START_ERROR_CODE
                     ),
                     "message": detail,
                 }
             )
-        raise WorkerProcessError(detail) from start_error
+        raise WorkerProcessError(
+            detail,
+            code=(
+                staging_cleanup.code
+                if not staging_cleanup.ok
+                else WORKER_START_ERROR_CODE
+            ),
+        ) from start_error
 
     def _writer_loop(
         self,
@@ -680,7 +722,7 @@ class WorkerProcess:
                     stream.close()
             except OSError:
                 pass
-        staging_failure = self._release_generation_staging(
+        staging_cleanup = self._release_generation_staging(
             generation_staging
         )
         detail_parts = [f"worker exit code {code}"]
@@ -688,10 +730,11 @@ class WorkerProcess:
             detail_parts.append(failure)
         if stderr_lines:
             detail_parts.append("\n".join(stderr_lines))
-        if staging_failure:
+        if not staging_cleanup.ok:
             detail_parts.append(
-                f"[{STAGING_CLEANUP_ERROR_CODE}] "
-                f"generation staging cleanup failed: {staging_failure}"
+                f"[{staging_cleanup.code}] "
+                "generation staging cleanup failed: "
+                f"{staging_cleanup.detail}"
             )
         should_emit = False
         with self._state_lock:
@@ -701,7 +744,7 @@ class WorkerProcess:
             if not exit_event.is_set():
                 self._exit_code = code
                 self._exit_codes[generation] = code
-                if staging_failure:
+                if not staging_cleanup.ok:
                     self._transport_failure = detail_parts[-1]
                 should_emit = True
                 exit_event.set()
@@ -709,15 +752,15 @@ class WorkerProcess:
             event = {
                 "type": (
                     "worker_exited"
-                    if expected and code == 0 and not staging_failure
+                    if expected and code == 0 and staging_cleanup.ok
                     else "worker_crashed"
                 ),
                 "generation": generation,
                 "exit_code": code,
                 "message": "; ".join(detail_parts),
             }
-            if staging_failure:
-                event["code"] = STAGING_CLEANUP_ERROR_CODE
+            if not staging_cleanup.ok:
+                event["code"] = staging_cleanup.code
             self._emit(event)
 
     def _fail_transport(self, generation: int, message: str) -> None:
@@ -1316,22 +1359,22 @@ class WorkerProcess:
                         code = None
                 if exit_event.is_set():
                     return
-                staging_failure = (
+                staging_cleanup = (
                     self._release_generation_staging(generation_staging)
                     if generation_staging is not None
-                    else ""
+                    else _StagingCleanupResult.success()
                 )
                 if type(code) is not int:
                     code = -1
                 detail = self._failure_detail(
-                    f"worker exit code {code}", staging_failure
+                    f"worker exit code {code}", staging_cleanup
                 )
                 should_emit = False
                 with self._state_lock:
                     if not exit_event.is_set():
                         self._exit_code = code
                         self._exit_codes[generation] = code
-                        if staging_failure:
+                        if not staging_cleanup.ok:
                             self._transport_failure = detail
                         should_emit = True
                         exit_event.set()
@@ -1339,15 +1382,15 @@ class WorkerProcess:
                     event = {
                         "type": (
                             "worker_crashed"
-                            if staging_failure or code != 0
+                            if not staging_cleanup.ok or code != 0
                             else "worker_exited"
                         ),
                         "generation": generation,
                         "exit_code": code,
                         "message": detail,
                     }
-                    if staging_failure:
-                        event["code"] = STAGING_CLEANUP_ERROR_CODE
+                    if not staging_cleanup.ok:
+                        event["code"] = staging_cleanup.code
                     self._emit(event)
 
 

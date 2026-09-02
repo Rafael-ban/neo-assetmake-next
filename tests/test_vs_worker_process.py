@@ -44,6 +44,7 @@ from core.vs_runtime.vs_loader import (
     compute_runtime_fingerprint,
 )
 from core.vs_runtime.worker_process import (
+    STAGING_CLEANUP_ERROR_CODE,
     SyncVSWorkerProcess,
     WorkerCrashedError,
     WorkerProcess,
@@ -797,6 +798,68 @@ class WorkerProcessTransportTests(unittest.TestCase):
             for root in roots:
                 if root.exists():
                     real_remove(root)
+
+    def test_retained_cleanup_result_is_not_inferred_from_error_text(self):
+        class HostileCleanupError(PermissionError):
+            def __str__(self):
+                raise ValueError("broken cleanup error string")
+
+        for error_type in (PermissionError, HostileCleanupError):
+            with self.subTest(error_type=error_type.__name__):
+                process = WorkerProcess(
+                    command=[
+                        str(Path(sys.executable).resolve()),
+                        "-B",
+                        "-c",
+                        "pass",
+                    ]
+                )
+                process._generation = 4
+                staging = mock.Mock()
+                staging.close.side_effect = [
+                    error_type(),
+                    error_type(),
+                    None,
+                ]
+                process._generation_staging = staging
+                events = []
+                process.add_listener(events.append)
+
+                with (
+                    mock.patch.object(
+                        GenerationStagingRoot,
+                        "create",
+                        side_effect=AssertionError("allocated a fresh root"),
+                    ) as create_root,
+                    mock.patch(
+                        "core.vs_runtime.worker_process.subprocess.Popen"
+                    ) as popen,
+                ):
+                    for _attempt in range(2):
+                        with self.assertRaises(WorkerProcessError) as raised:
+                            process.start()
+                        self.assertIs(process._generation_staging, staging)
+                        self.assertEqual(
+                            getattr(raised.exception, "code", None),
+                            STAGING_CLEANUP_ERROR_CODE,
+                        )
+                        self.assertIn(
+                            STAGING_CLEANUP_ERROR_CODE,
+                            str(raised.exception),
+                        )
+                        self.assertIn(
+                            error_type.__name__, str(raised.exception)
+                        )
+
+                    create_root.assert_not_called()
+                    popen.assert_not_called()
+                    self.assertEqual(process.generation, 4)
+
+                process.close()
+
+                self.assertEqual(staging.close.call_count, 3)
+                self.assertIsNone(process._generation_staging)
+                self.assertEqual(events, [])
 
     def test_close_retries_retained_owner_without_async_terminal(self):
         process = WorkerProcess(

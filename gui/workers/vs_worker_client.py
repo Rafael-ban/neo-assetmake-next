@@ -180,7 +180,12 @@ class VSWorkerClient(QObject):
         )
         return request_id
 
-    def _report_restart_failure(self, error: BaseException) -> None:
+    def _report_restart_failure(
+        self,
+        error: BaseException,
+        *,
+        cleanup_terminal_already_reported: bool = False,
+    ) -> None:
         """把 queued 自动重启的本地异常收敛为单次稳定 terminal。"""
         self._restart_requested = False
         generation = self.transport.generation
@@ -198,6 +203,15 @@ class VSWorkerClient(QObject):
                 self.transport.kill()
             except BaseException:
                 pass
+        try:
+            error_code = getattr(error, "code", None)
+        except BaseException:
+            error_code = None
+        if (
+            cleanup_terminal_already_reported
+            and error_code == STAGING_CLEANUP_ERROR_CODE
+        ):
+            return
         try:
             detail = str(error)
         except BaseException:
@@ -403,7 +417,12 @@ class VSWorkerClient(QObject):
                 try:
                     self._start_transport()
                 except BaseException as error:
-                    self._report_restart_failure(error)
+                    self._report_restart_failure(
+                        error,
+                        cleanup_terminal_already_reported=(
+                            self._failure_reported_generation == generation
+                        ),
+                    )
                 return
             if (
                 event_type == "worker_crashed"

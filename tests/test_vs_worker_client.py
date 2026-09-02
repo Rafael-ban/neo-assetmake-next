@@ -11,6 +11,7 @@ from PyQt6.QtCore import QCoreApplication, QEvent, QObject, QThread, QTimer, pyq
 
 from config.vs_runtime import WorkerConfig
 from core.vs_runtime.session import NodeMetadata, SessionMetadata
+from core.vs_runtime.worker_process import STAGING_CLEANUP_ERROR_CODE
 from gui.workers.vs_worker_client import VSWorkerClient
 
 
@@ -452,6 +453,65 @@ class VSWorkerClientTests(unittest.TestCase):
                     0,
                     "worker.staging_cleanup_failed",
                     "[worker.staging_cleanup_failed] "
+                    "generation staging cleanup failed",
+                )
+            ],
+        )
+        self.assertEqual(crashes, [])
+
+    def test_cleanup_terminal_suppresses_same_cleanup_restart_failure(self):
+        class RetainedCleanupError(RuntimeError):
+            code = STAGING_CLEANUP_ERROR_CODE
+
+        class RetainedCleanupTransport(_FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.start_count = 0
+
+            def start(self):
+                self.start_count += 1
+                if self.start_count == 2:
+                    raise RetainedCleanupError("retained cleanup still denied")
+                return super().start()
+
+        transport = RetainedCleanupTransport()
+        client = VSWorkerClient(
+            transport=transport,
+            worker_config=self.client.worker_config,
+            timer_factory=_FakeTimer,
+        )
+        self.addCleanup(client.close)
+        failures = []
+        crashes = []
+        client.request_failed.connect(
+            lambda request_id, code, message: failures.append(
+                (request_id, code, message)
+            )
+        )
+        client.worker_crashed.connect(crashes.append)
+
+        client.start()
+        client.terminate_and_restart()
+        cleanup_event = {
+            "type": "worker_crashed",
+            "generation": 1,
+            "exit_code": 0,
+            "code": STAGING_CLEANUP_ERROR_CODE,
+            "message": "generation staging cleanup failed",
+        }
+        transport.emit(cleanup_event)
+        self._drain_events()
+        transport.emit(cleanup_event)
+        self._drain_events()
+
+        self.assertEqual(transport.start_count, 2)
+        self.assertEqual(transport.generation, 1)
+        self.assertEqual(
+            failures,
+            [
+                (
+                    0,
+                    STAGING_CLEANUP_ERROR_CODE,
                     "generation staging cleanup failed",
                 )
             ],
