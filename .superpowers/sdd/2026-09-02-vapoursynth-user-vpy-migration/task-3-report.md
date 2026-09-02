@@ -84,14 +84,16 @@
   子进程执行。
 - 未修改 CHANGELOG 顶部版本、`config/user_settings.json`、`tools` junction、GUI、
   旧导出切换点或本地构建产物；未推送、未 amend、提交不含共同作者。
-- 无阻塞 concern。按仓库约定，本次修改属于 source tree；既有已安装
-  `ArknightsPassMaker` 不会自动变化，需后续完成迁移阶段并重新构建/发布后生效。
+- **事后更正**：初始实现当时仍有后续 Fix round 1 所处理的 I1/I2/I3，以及
+  Fix round 2 最终关闭的 mixed namespace C1；原“无阻塞 concern”结论撤回。按仓库
+  约定，本次修改属于 source tree；既有已安装 `ArknightsPassMaker` 不会自动变化，
+  需后续完成迁移阶段并重新构建/发布后生效。
 
 ---
 
 ## Fix round 1/5（2026-09-02）
 
-状态：DONE
+状态：CHANGES_REQUESTED（事后更正；原 `DONE` 结论已由独立复审撤回）
 
 基线提交：`8a17563aa2985bf2b197ebc660ce12a171301caa`
 
@@ -122,11 +124,12 @@
 
 ### Finding 关闭映射
 
-- **C1 — CLOSED**：`ExecutedGraph.close()` 只在调用者确认该图全部 inflight 已到
-  终态后恢复执行环境，并按退休图自身 `script_root` 精确驱逐模块；操作幂等，失败
-  执行也清理半加载模块。来源识别同时覆盖 `__file__` 与 namespace `__path__`，
-  真实 A→B 同名模块回归证明 B 加载 B；stdlib、外部模块、`assetmaker_vs` 与图关闭
-  前仍在使用的 A 模块均受保护。
+- **C1 — NOT CLOSED（事后更正）**：Fix round 1 只修复了普通模块和单来源
+  namespace；它在恢复 `sys.path` 后才扫描动态 namespace `__path__`，会漏掉 mixed
+  namespace 的脚本贡献，并残留父包上的 A 子模块属性。原报告据此概括“namespace
+  来源识别完成、外部模块均受保护”并不成立：stdlib、helper 和普通外部模块的窄用例
+  虽通过，但 `python_module_dirs` 参与的外部 namespace 父子 identity 会被破坏，B
+  也可能继续执行 A。该 Critical 由下方 Fix round 2 修复。
 - **I1 — CLOSED**：`_Matrix`、`_Transfer`、`_Primaries`、`_Range`、
   `_ColorRange` 统一要求 `type(value) is int`，不再通过 `int()` 修正 bool、float、
   str 或 bytes。fake 覆盖五字段四种非法类型；真实 R73 和固定 runner 覆盖五字段
@@ -155,7 +158,7 @@
 - 语法/导入：
   `uv --cache-dir .uv-cache run python -m compileall -q main.py config core gui utils _mext build.py tests resources/vapoursynth/python`
   - 结果：退出码 0。
-- 全量：
+- 全量（Fix round 1 当时的历史结果，不作为 Fix round 2 的验证证据）：
   `uv --cache-dir .uv-cache run python -m unittest discover -s tests -p "test_*.py"`
   - 结果：361 tests，OK，51.017s；0 skip。
 - `git diff --check` / 提交前 `git diff --cached --check`：退出码 0。
@@ -170,7 +173,98 @@
   输出，提交正文没有共同作者；未 amend、未推送。
 - portable helper 继续只依赖标准库和包内模块；共享解析/契约没有复制到 core
   adapter，单一规则源保持不变。
-- 无本轮阻塞 concern。后续 M3 worker 必须继续遵守既定调用契约：只有旧图所有
-  frame future 到终态后才调用 `ExecutedGraph.close()`；若无法及时排空则重启
-  worker。另因本仓库是 source tree，已安装的 `ArknightsPassMaker` 仍需后续重建
-  或发布后才会获得本修复。
+- **阻塞结论更正**：Fix round 1 结束时仍有 mixed namespace Critical，并且
+  executor 会接受重叠图；原“无本轮阻塞 concern”结论撤回。后续 M3 worker 仍必须
+  只在旧图所有 frame future 到终态后调用 `ExecutedGraph.close()`，无法及时排空则
+  重启 worker。另因本仓库是 source tree，已安装的 `ArknightsPassMaker` 仍需后续
+  重建或发布后才会获得修复。
+
+---
+
+## Fix round 2/5（2026-09-02）
+
+状态：DONE（实现完成，待独立复审）
+
+基线提交：`da3d07f7892c3717628ba2dd1c19010b560c3530`
+
+实现提交：`8a22e46764c68b8feba0a39e6085ae2c9f89504e`
+（`fix: 修复混合命名空间与图生命周期`）
+
+### Round 1 不准确结论的正式更正
+
+1. Round 1 的 **C1 — CLOSED** 已在原段落直接更正为 **NOT CLOSED**；普通模块与
+   单来源 namespace 通过，不能证明 mixed namespace 正确退休。
+2. “stdlib、外部模块、`assetmaker_vs` 均受保护”已限定为当时实际覆盖的
+   stdlib/helper/普通外部模块；运行时注入的外部 namespace 父包与子模块 identity
+   当时并未受到保护。
+3. Round 1 的“无本轮阻塞 concern”已撤回；mixed namespace 是可跨 bundle 执行
+   A 代码的 Critical，重叠图则会复用旧模块并破坏全局路径快照。
+4. Round 1 的 361 tests 保留为历史记录并明确限定；本轮结论只使用下述新鲜验证。
+
+### 红灯与特征锁定证据
+
+1. 修改前 runner/contract 基线：38 tests，14.364s，0 skip，OK。
+2. C1 新增三个真实 R73 子进程场景后，生产代码未改时运行 3 tests，9.154s，
+   failures=3：
+   - 第三方目录预先在 `sys.path`：父包 identity 尚在，但 `shared_ns.local_piece`
+     属性仍指向 A；
+   - 第三方目录仅由 `python_module_dirs` 注入：父包被删除重建，外部子模块仍缓存，
+     旧父包还残留 A 属性；
+   - A 脚本抛错的半加载路径复现同一父包/属性不一致。
+3. N1 新增四个生命周期场景后，生产代码未改时运行 4 tests，16.521s，
+   failures=3：同步 overlap 被接受、两线程 barrier 得到两个赢家、异常 close 会重复
+   清理；脚本执行失败后的复用原本通过，作为不得回归的基线。
+4. N2 是独立复审已确认产品正确的持久测试缺口；新增循环容器、坏 Mapping、坏
+   repr、非有限 float 和超大整数后首次即通过，没有为制造红灯改动产品代码。
+
+### 实现摘要
+
+- C1：在 `ExecutionEnvironment` 仍激活时冻结 `_ModuleRetirementPlan`，记录具体模块
+  对象与父包属性 identity。普通脚本模块和纯脚本 namespace 退休；mixed namespace
+  父包、外部子模块及普通第三方对象保留；本地子模块同时从 `sys.modules` 和父包
+  陈旧属性删除。正常 close 与执行失败共用同一清理顺序。
+- N1：portable executor 在 import VapourSynth、模块退休、`clear_outputs()` 和
+  `sys.path` 激活前原子获取进程级 graph lease。第二张活图立即抛
+  `GraphLifecycleError(code="executor.graph_active")`；token 由 `ExecutedGraph` 持有
+  到 close，失败回滚和异常 close 均在最外层 `finally` 幂等释放。close 在清理前先
+  标记终态，因此 double close 与异常后的再次 close 不会重复执行。
+- N2：永久覆盖循环 list/dict、`Mapping.items()` 抛异常、`repr()` 抛异常、
+  NaN/±Infinity 和正负百万 bit 整数；逐项固定稳定结构，并断言 marker UTF-8 小于
+  4096 bytes、`allow_nan=False` JSON 编码成功及 decode 后 `to_dict()` 等价。
+- `core.vs_runtime.executor` 只 re-export 新生命周期错误，portable helper 仍只依赖
+  标准库和包内模块，没有复制执行规则。
+
+### 修复后验证
+
+- C1 三个 mixed namespace 定向：3 tests，10.323s，0 skip，OK；A→B 得到 B，
+  两种第三方路径变体及失败清理均保持外部父/子/属性 identity。
+- N1 四个生命周期定向：4 tests，13.650s，0 skip，OK；副作用补充探针 2 tests，
+  5.447s，OK，证明被拒 overlap 不改变活动 `sys.path`、不再次 clear outputs，线程
+  竞态也只执行一次全局清理。
+- 完整 runner：27 tests，38.007s，0 skip，OK；真实固定 VSPipe 用例全部执行。
+- 完整 output contract：19 tests，1.842s，0 skip，OK；新增极端值及真实 R73
+  子进程全部通过。
+- Task 3 最终定向：
+  `uv --cache-dir .uv-cache run python -m unittest tests.test_vs_runner tests.test_vs_output_contract tests.test_vs_display tests.test_default_vpy_pipeline -v`
+  - 结果：53 tests，50.319s，0 skip，OK；真实 VSPipe/R73/default pipeline 均执行。
+- 既有导出色彩与预览缩放：14 tests，2.748s，0 skip，OK。
+- 语法/导入：
+  `uv --cache-dir .uv-cache run python -m compileall -q main.py config core gui utils _mext build.py tests resources/vapoursynth/python`
+  - 结果：退出码 0。
+- 全量：
+  `uv --cache-dir .uv-cache run python -m unittest discover -s tests -p "test_*.py"`
+  - 结果：369 tests，77.886s，0 skip，OK。
+- `git diff --check` 与实现提交前 `git diff --cached --check`：退出码 0。
+
+全量输出中的 `encode boom`、无效图片编码、RNDIS 超时、缺失视频和 PyArmor
+不完整输出均为既有负向测试主动触发；最终 suite 为 OK。
+
+### 范围与剩余边界
+
+- 实现提交恰好修改 5 个文件：portable executor、core re-export、真实子进程 helper
+  和两份测试；未修改 CHANGELOG、`tools/`、用户配置、GUI 或构建输出。
+- 实现提交无共同作者；未 amend、未推送。
+- executor lease 是非法 overlap 的进程级防线，不替代 M3 worker 的 inflight 编排。
+  M3 仍须等待旧 future 全终态后 close；超时必须重启 worker，不能提前抢占 lease。
+- 本仓库是 source tree；已安装的 `ArknightsPassMaker` 只有后续重建或发布后才会获得
+  本轮修复。
