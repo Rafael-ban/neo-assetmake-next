@@ -100,7 +100,6 @@ def _source_path_and_hash(
 ) -> tuple[Path, str | None]:
     """解析旧配置源并计算 hash，统一 public 路径错误边界。"""
     source_input: Any = legacy_path
-    source: Path | None = None
     try:
         source = (
             Path(source_input)
@@ -108,18 +107,35 @@ def _source_path_and_hash(
             else runtime_config.default_vs_runtime_path().with_name(
                 "vsconfig.json"
             )
-        ).resolve()
-        if not source.exists():
-            return source, None
-        return source, sha256_file(source)
+        )
     except (OSError, TypeError, ValueError) as exc:
-        context = source if source is not None else source_input
+        context = source_input
         if context is None:
             context = "legacy vsconfig"
         try:
             label = str(context)
         except (TypeError, ValueError):
             label = repr(context)
+        raise VSRuntimeConfigError(f"{label}: {exc}") from exc
+
+    try:
+        source = source.resolve()
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        try:
+            label = str(source)
+        except (TypeError, ValueError):
+            label = repr(source)
+        raise VSRuntimeConfigError(f"{label}: {exc}") from exc
+
+    try:
+        if not source.exists():
+            return source, None
+        return source, sha256_file(source)
+    except (OSError, TypeError, ValueError) as exc:
+        try:
+            label = str(source)
+        except (TypeError, ValueError):
+            label = repr(source)
         raise VSRuntimeConfigError(f"{label}: {exc}") from exc
 
 

@@ -1040,6 +1040,19 @@ class LegacyVSConfigMigrationTests(unittest.TestCase):
                     )
                 self.assertIn(expected_path, str(raised.exception))
 
+    def test_legacy_source_resolve_runtime_error_is_wrapped(self):
+        resolve_error = RuntimeError("symlink loop")
+        with mock.patch.object(Path, "resolve", side_effect=resolve_error):
+            with self.assertRaises(VSRuntimeConfigError) as raised:
+                migrate_legacy_vsconfig_once(
+                    self.legacy_path, self.user_path, self.marker_path
+                )
+
+        self.assertIn(str(self.legacy_path), str(raised.exception))
+        self.assertIn(str(resolve_error), str(raised.exception))
+        self.assertFalse(self.user_path.exists())
+        self.assertFalse(self.marker_path.exists())
+
     def test_missing_relative_legacy_source_remains_a_noop(self):
         worktree_temp = tempfile.TemporaryDirectory(dir=Path.cwd())
         self.addCleanup(worktree_temp.cleanup)
