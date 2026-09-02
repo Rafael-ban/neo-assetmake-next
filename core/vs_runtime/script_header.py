@@ -60,12 +60,20 @@ def _comma_list(value: str, field: str, *, allow_empty: bool) -> tuple[str, ...]
     return items
 
 
+def _decode_header_window(data: bytes) -> str:
+    window = data[:HEADER_LIMIT_BYTES]
+    if len(data) > HEADER_LIMIT_BYTES and not window.endswith(b"\n"):
+        last_complete_line = window.rfind(b"\n")
+        window = window[: last_complete_line + 1] if last_complete_line >= 0 else b""
+    try:
+        return window.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ScriptHeaderError(f"脚本 header 不是合法 UTF-8: {exc}") from exc
+
+
 def parse_script_header_text(text: str) -> ScriptHeader:
     """解析文本最前方连续注释/空行中的 assetmaker 声明。"""
-    prefix = text.encode("utf-8")[:HEADER_LIMIT_BYTES].decode(
-        "utf-8", errors="ignore"
-    )
-    prefix = prefix.removeprefix("\ufeff")
+    prefix = _decode_header_window(text.encode("utf-8"))
     declarations: dict[str, str] = {}
     for line in prefix.splitlines():
         stripped = line.lstrip()
@@ -150,9 +158,7 @@ def parse_script_header(path: str | os.PathLike[str]) -> ScriptHeader:
     script_path = Path(path)
     try:
         with script_path.open("rb") as handle:
-            text = handle.read(HEADER_LIMIT_BYTES).decode(
-                "utf-8-sig", errors="ignore"
-            )
+            text = _decode_header_window(handle.read(HEADER_LIMIT_BYTES + 1))
         return parse_script_header_text(text)
     except (OSError, ScriptHeaderError) as exc:
         raise ScriptHeaderError(f"{script_path.resolve()}: {exc}") from exc

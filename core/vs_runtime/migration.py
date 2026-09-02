@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ from config.vs_runtime import (
     save_vs_runtime_override,
 )
 from core.file_utils import atomic_write_json, sha256_file
+from utils.windows_paths import canonicalize_windows_absolute_path
 
 
 LEGACY_FIELD_MAP = {
@@ -82,6 +84,33 @@ def _deep_merge(
     return merged
 
 
+def _canonicalize_legacy_plugin_dirs(value: Any, source: Path) -> Any:
+    if not isinstance(value, list):
+        return value
+    install_root = (
+        source.parent.parent
+        if source.parent.name.casefold() == "config"
+        else source.parent
+    )
+    media_root = install_root / "tools" / "media"
+    canonical = []
+    for item in value:
+        if not isinstance(item, str):
+            canonical.append(item)
+            continue
+        candidate = (
+            item
+            if ntpath.isabs(item.replace("/", "\\"))
+            else str(media_root / item)
+        )
+        canonical.append(
+            canonicalize_windows_absolute_path(
+                candidate, "plugins.native_plugin_dirs"
+            )
+        )
+    return canonical
+
+
 def migrate_legacy_vsconfig_once(
     legacy_path: str | os.PathLike[str] | None = None,
     user_path: str | os.PathLike[str] | None = None,
@@ -113,6 +142,8 @@ def migrate_legacy_vsconfig_once(
     for old_field, new_field in LEGACY_FIELD_MAP.items():
         present, value = _get_nested(legacy, old_field)
         if present:
+            if old_field == "extra_plugin_dirs":
+                value = _canonicalize_legacy_plugin_dirs(value, source)
             _set_nested(migrated, new_field, value)
             migrated_fields.append(old_field)
     ignored_fields = tuple(

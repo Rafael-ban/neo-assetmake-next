@@ -6,7 +6,7 @@
   "additionalProperties": false,
   "required": ["schema_version", "worker", "core", "plugins", "scripts"],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"type": "integer", "const": 1},
     "worker": {
       "type": "object",
       "additionalProperties": false,
@@ -37,11 +37,11 @@
       "properties": {
         "native_plugin_dirs": {
           "type": "array",
-          "items": {"type": "string", "minLength": 1}
+          "items": {"$ref": "#/$defs/canonicalWindowsPath"}
         },
         "python_module_dirs": {
           "type": "array",
-          "items": {"type": "string", "minLength": 1}
+          "items": {"$ref": "#/$defs/canonicalWindowsPath"}
         }
       }
     },
@@ -50,7 +50,21 @@
       "additionalProperties": false,
       "required": ["global_script_path"],
       "properties": {
-        "global_script_path": {"type": "string"}
+        "global_script_path": {
+          "oneOf": [
+            {"const": ""},
+            {"$ref": "#/$defs/canonicalWindowsPath"}
+          ]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "canonicalWindowsPath": {
+      "type": "string",
+      "pattern": "^(?:[A-Za-z]:\\\\(?:[^\\\\/<>:\u0022|?*]+(?:\\\\[^\\\\/<>:\u0022|?*]+)*)?|\\\\\\\\[^\\\\/<>:\u0022|?*]+\\\\[^\\\\/<>:\u0022|?*]+(?:\\\\[^\\\\/<>:\u0022|?*]+)*)$",
+      "not": {
+        "pattern": "(?:^|\\\\)\\.{1,2}(?:\\\\|$)"
       }
     }
   }

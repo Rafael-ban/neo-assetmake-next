@@ -79,7 +79,10 @@ Type: files; Name: "{app}\crash.log"
 Type: dirifempty; Name: "{app}"
 
 [Files]
-Source: "ArknightsPassMaker\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 升级时保留用户可能编辑过的 legacy 配置，供首次启动迁移读取。
+Source: "ArknightsPassMaker\*"; Excludes: "config\vsconfig.json"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; 全新安装仍需放置 legacy 默认文件；已有文件永不被安装器覆盖。
+Source: "ArknightsPassMaker\config\vsconfig.json"; DestDir: "{app}\config"; Flags: ignoreversion onlyifdoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppNameCN}"; Filename: "{app}\{#MyAppExeName}"

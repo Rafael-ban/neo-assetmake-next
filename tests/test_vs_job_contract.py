@@ -1,8 +1,12 @@
+import concurrent.futures
 import json
+import multiprocessing
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from jsonschema import Draft202012Validator, ValidationError
 
@@ -25,6 +29,26 @@ ROOT = Path(__file__).resolve().parents[1]
 JOB_SCHEMA = json.loads(
     (ROOT / "schemas" / "vs_job.schema.json").read_text(encoding="utf-8")
 )
+
+
+def _process_write_job(payload, barrier, results):
+    """Spawn-safe contender that preserves real atomic-write side effects."""
+    from core.vs_runtime import job as job_module
+
+    real_atomic_write = job_module.atomic_write_json
+
+    def synchronized_write(path, value, *, indent=2):
+        barrier.wait(timeout=10)
+        real_atomic_write(path, value, indent=indent)
+
+    job_module.atomic_write_json = synchronized_write
+    job = RenderJob.from_dict(payload)
+    try:
+        write_render_job(job)
+    except RenderJobError:
+        results.put(("error", job.track))
+    else:
+        results.put(("ok", job.track))
 
 
 def make_job(
@@ -117,6 +141,43 @@ class RenderJobContractTests(unittest.TestCase):
         with self.assertRaises(RenderJobError):
             OutputSpec.from_profile("1080x1920")
 
+    def test_every_profile_has_full_schema_roundtrip(self):
+        expected_outputs = {
+            "360x640": {
+                "profile": "360x640",
+                "display_width": 360,
+                "display_height": 640,
+                "coded_width": 384,
+                "coded_height": 640,
+                "pixel_format": "YUV420P8",
+                "matrix": "170m",
+                "transfer": "170m",
+                "primaries": "170m",
+                "range": "limited",
+                "final_rotate_180": False,
+            },
+            "720x1080": {
+                "profile": "720x1080",
+                "display_width": 720,
+                "display_height": 1080,
+                "coded_width": 720,
+                "coded_height": 1080,
+                "pixel_format": "YUV420P8",
+                "matrix": "170m",
+                "transfer": "170m",
+                "primaries": "170m",
+                "range": "limited",
+                "final_rotate_180": False,
+            },
+        }
+        for profile, expected in expected_outputs.items():
+            with self.subTest(profile=profile):
+                job = make_job(profile=profile)
+                payload = job.to_dict()
+                Draft202012Validator(JOB_SCHEMA).validate(payload)
+                self.assertEqual(payload["output"], expected)
+                self.assertEqual(RenderJob.from_dict(payload), job)
+
     def test_mismatched_profile_dimensions_are_rejected(self):
         job = make_job()
         invalid_output = replace(job.output, coded_width=360)
@@ -157,6 +218,48 @@ class RenderJobContractTests(unittest.TestCase):
         self.assertEqual(restored.source.virtual_frame_count, 240)
         self.assertEqual(restored.timeline.end_frame, 120)
 
+    def test_image_timeline_is_always_resolved_and_within_virtual_count(self):
+        invalid_jobs = (
+            make_job(
+                source_path=r"D:\media\still.png",
+                source_kind="image",
+                virtual_frame_count=10,
+                end_frame=None,
+                fps=None,
+            ),
+            make_job(
+                source_path=r"D:\media\still.png",
+                source_kind="image",
+                virtual_frame_count=10,
+                end_frame=11,
+            ),
+            make_job(
+                source_path=r"D:\media\still.png",
+                source_kind="image",
+                virtual_frame_count=10,
+                start_frame=10,
+                end_frame=11,
+            ),
+        )
+        for invalid in invalid_jobs:
+            with self.subTest(job=invalid):
+                with self.assertRaises(RenderJobError):
+                    invalid.validate(for_export=False)
+
+        null_payload = invalid_jobs[0].to_dict()
+        with self.assertRaises(ValidationError):
+            Draft202012Validator(JOB_SCHEMA).validate(null_payload)
+
+        valid = make_job(
+            source_path=r"D:\media\still.png",
+            source_kind="image",
+            virtual_frame_count=10,
+            start_frame=3,
+            end_frame=10,
+        )
+        valid.validate(for_export=False)
+        valid.validate(for_export=True)
+
     def test_timeline_crop_rotation_and_paths_are_strict(self):
         invalid_jobs = (
             make_job(start_frame=-1),
@@ -174,6 +277,51 @@ class RenderJobContractTests(unittest.TestCase):
                 with self.assertRaises(RenderJobError):
                     job.validate()
 
+    def test_job_paths_share_canonical_windows_wire_contract(self):
+        valid_paths = (
+            r"D:\素材\黍\loop.mp4",
+            r"\\server\share\素材\loop.mp4",
+        )
+        for valid_path in valid_paths:
+            with self.subTest(valid=valid_path):
+                job = make_job(source_path=valid_path)
+                Draft202012Validator(JOB_SCHEMA).validate(job.to_dict())
+                job.validate()
+
+        invalid_paths = (
+            "D:/media/loop.mp4",
+            r"D:\media\..\loop.mp4",
+            r"\media\loop.mp4",
+            r"relative\loop.mp4",
+            r"D:\bad?name\loop.mp4",
+        )
+        for invalid_path in invalid_paths:
+            payload = make_job().to_dict()
+            payload["source"]["path"] = invalid_path
+            with self.subTest(invalid=invalid_path):
+                with self.assertRaises(ValidationError):
+                    Draft202012Validator(JOB_SCHEMA).validate(payload)
+                with self.assertRaises(RenderJobError):
+                    RenderJob.from_dict(payload)
+
+    def test_float_api_version_and_rotation_tokens_are_rejected(self):
+        invalid_payloads = []
+        api_payload = make_job().to_dict()
+        api_payload["api_version"] = 1.0
+        invalid_payloads.append(api_payload)
+        rotation_payload = make_job().to_dict()
+        rotation_payload["transform"]["rotation"] = 90.0
+        invalid_payloads.append(rotation_payload)
+
+        for index, payload in enumerate(invalid_payloads):
+            with self.subTest(payload=payload):
+                with self.assertRaises(RenderJobError):
+                    RenderJob.from_dict(payload)
+                path = self.root / f"float-token-{index}.json"
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(RenderJobError):
+                    load_render_job(path)
+
     def test_write_uses_epoch_filename_and_never_overwrites(self):
         job = make_job(cache_dir=str(self.root), epoch=42)
 
@@ -185,6 +333,62 @@ class RenderJobContractTests(unittest.TestCase):
         with self.assertRaises(RenderJobError):
             write_render_job(replace(job, track="intro"))
         self.assertEqual(path.read_bytes(), before)
+
+    def test_same_epoch_thread_race_has_exactly_one_winner(self):
+        loop = make_job(cache_dir=str(self.root), epoch=77, track="loop")
+        intro = replace(loop, track="intro")
+        barrier = threading.Barrier(2)
+        from core.vs_runtime import job as job_module
+
+        real_atomic_write = job_module.atomic_write_json
+
+        def synchronized_write(path, payload, *, indent=2):
+            barrier.wait(timeout=10)
+            real_atomic_write(path, payload, indent=indent)
+
+        def contend(job):
+            try:
+                write_render_job(job)
+            except RenderJobError:
+                return "error", job.track
+            return "ok", job.track
+
+        with mock.patch.object(
+            job_module, "atomic_write_json", side_effect=synchronized_write
+        ):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(contend, (loop, intro)))
+
+        self.assertEqual([state for state, _ in results].count("ok"), 1)
+        winner = next(track for state, track in results if state == "ok")
+        saved = load_render_job(self.root / "job-77.json", for_export=True)
+        self.assertEqual(saved.track, winner)
+
+    def test_same_epoch_process_race_has_exactly_one_winner(self):
+        loop = make_job(cache_dir=str(self.root), epoch=88, track="loop")
+        intro = replace(loop, track="intro")
+        context = multiprocessing.get_context("spawn")
+        barrier = context.Barrier(2)
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_process_write_job,
+                args=(job.to_dict(), barrier, results),
+            )
+            for job in (loop, intro)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=15)
+            self.assertFalse(process.is_alive(), "竞争进程未按时退出")
+            self.assertEqual(process.exitcode, 0)
+
+        outcomes = [results.get(timeout=5) for _ in processes]
+        self.assertEqual([state for state, _ in outcomes].count("ok"), 1)
+        winner = next(track for state, track in outcomes if state == "ok")
+        saved = load_render_job(self.root / "job-88.json", for_export=True)
+        self.assertEqual(saved.track, winner)
 
     def test_load_reports_absolute_path_for_invalid_json(self):
         path = self.root / "job-1.json"

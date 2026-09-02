@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from core.vs_runtime.script_header import (
+    HEADER_LIMIT_BYTES,
     ScriptHeaderError,
     parse_script_header,
     parse_script_header_text,
@@ -122,6 +123,58 @@ class ScriptHeaderTests(unittest.TestCase):
 
             with self.assertRaises(ScriptHeaderError):
                 parse_script_header(path)
+
+    def test_complete_declaration_ending_at_8_kib_is_accepted(self):
+        base = VALID_HEADER.replace(
+            "# assetmaker-editor-output: 1\n", ""
+        ).encode("utf-8")
+        final_line = b"# assetmaker-editor-output: 1\n"
+        padding_size = HEADER_LIMIT_BYTES - len(base) - len(final_line)
+        padding = b"#" + (b" " * (padding_size - 2)) + b"\n"
+        payload = base + padding + final_line + b"import os\n"
+        self.assertEqual(len(payload[:HEADER_LIMIT_BYTES]), HEADER_LIMIT_BYTES)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "boundary.vpy"
+            path.write_bytes(payload)
+            self.assertEqual(parse_script_header(path).editor_output, 1)
+        self.assertEqual(
+            parse_script_header_text(payload.decode("utf-8")).editor_output,
+            1,
+        )
+
+    def test_value_suffix_crossing_8_kib_is_not_parsed_as_truncated_value(self):
+        base = VALID_HEADER.replace(
+            "# assetmaker-editor-output: 1\n", ""
+        ).encode("utf-8")
+        partial = b"# assetmaker-editor-output: 1"
+        padding_size = HEADER_LIMIT_BYTES - len(base) - len(partial)
+        padding = b"#" + (b" " * (padding_size - 2)) + b"\n"
+        payload = base + padding + partial + b"evil\n"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "partial-value.vpy"
+            path.write_bytes(payload)
+            with self.assertRaises(ScriptHeaderError):
+                parse_script_header(path)
+        with self.assertRaises(ScriptHeaderError):
+            parse_script_header_text(payload.decode("utf-8"))
+
+    def test_utf8_character_crossing_8_kib_discards_only_partial_comment(self):
+        base = VALID_HEADER.encode("utf-8")
+        ascii_size = HEADER_LIMIT_BYTES - len(base) - 1
+        partial_comment = b"#" + (b" " * (ascii_size - 1))
+        payload = base + partial_comment + "黍".encode("utf-8") + b"\n"
+        self.assertEqual(payload[HEADER_LIMIT_BYTES - 1], "黍".encode("utf-8")[0])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "utf8-boundary.vpy"
+            path.write_bytes(payload)
+            self.assertEqual(parse_script_header(path).api_version, 1)
+        self.assertEqual(
+            parse_script_header_text(payload.decode("utf-8")).api_version,
+            1,
+        )
 
     def test_parse_file_error_contains_absolute_path(self):
         with tempfile.TemporaryDirectory() as temp_dir:

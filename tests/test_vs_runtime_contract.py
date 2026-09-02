@@ -1,10 +1,13 @@
+import concurrent.futures
 import hashlib
 import json
+import multiprocessing
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, ValidationError
 
 from config.vs_runtime import (
     VSRuntimeConfig,
@@ -18,6 +21,17 @@ from core.vs_runtime.migration import migrate_legacy_vsconfig_once
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_PATH = ROOT / "schemas" / "vs_runtime.schema.json"
 CONFIG_PATH = ROOT / "config" / "vs_runtime.json"
+RUNTIME_SCHEMA = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _save_override_process(path, patch, barrier, results):
+    barrier.wait(timeout=10)
+    try:
+        save_vs_runtime_override(path, patch)
+    except Exception as exc:
+        results.put(("error", str(exc)))
+    else:
+        results.put(("ok", ""))
 
 
 class VSRuntimeContractTests(unittest.TestCase):
@@ -34,11 +48,10 @@ class VSRuntimeContractTests(unittest.TestCase):
         return path
 
     def test_shipped_runtime_matches_schema_and_model(self):
-        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         payload = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
-        Draft202012Validator.check_schema(schema)
-        Draft202012Validator(schema).validate(payload)
+        Draft202012Validator.check_schema(RUNTIME_SCHEMA)
+        Draft202012Validator(RUNTIME_SCHEMA).validate(payload)
         self.assertEqual(VSRuntimeConfig.from_dict(payload).to_dict(), payload)
 
     def test_filter_policy_is_not_a_runtime_field(self):
@@ -133,6 +146,154 @@ class VSRuntimeContractTests(unittest.TestCase):
         self.assertEqual(merged.worker.frame_timeout_ms, 30_000)
         self.assertEqual(merged.worker.shutdown_timeout_ms, 3_000)
 
+    def test_runtime_paths_share_one_canonical_windows_wire_contract(self):
+        valid_payloads = []
+        for script_path, plugin_path in (
+            (r"D:\VS\pipeline.vpy", r"D:\VS\plugins"),
+            (r"\\server\share\pipeline.vpy", r"\\server\share\plugins"),
+            ("", r"D:\VS\plugins"),
+        ):
+            payload = VSRuntimeConfig().to_dict()
+            payload["scripts"]["global_script_path"] = script_path
+            payload["plugins"]["native_plugin_dirs"] = [plugin_path]
+            valid_payloads.append(payload)
+        for payload in valid_payloads:
+            with self.subTest(valid=payload):
+                Draft202012Validator(RUNTIME_SCHEMA).validate(payload)
+                VSRuntimeConfig.from_dict(payload)
+
+        invalid_paths = (
+            "D:/VS/pipeline.vpy",
+            r"D:\VS\..\pipeline.vpy",
+            r"\VS\pipeline.vpy",
+            r"relative\pipeline.vpy",
+            r"D:\bad?name\pipeline.vpy",
+        )
+        for invalid_path in invalid_paths:
+            payload = VSRuntimeConfig().to_dict()
+            payload["scripts"]["global_script_path"] = invalid_path
+            with self.subTest(global_script_path=invalid_path):
+                with self.assertRaises(ValidationError):
+                    Draft202012Validator(RUNTIME_SCHEMA).validate(payload)
+                with self.assertRaises(VSRuntimeConfigError):
+                    VSRuntimeConfig.from_dict(payload)
+
+            payload = VSRuntimeConfig().to_dict()
+            payload["plugins"]["native_plugin_dirs"] = [invalid_path]
+            with self.subTest(plugin_dir=invalid_path):
+                with self.assertRaises(ValidationError):
+                    Draft202012Validator(RUNTIME_SCHEMA).validate(payload)
+                with self.assertRaises(VSRuntimeConfigError):
+                    VSRuntimeConfig.from_dict(payload)
+
+    def test_save_patch_canonicalizes_paths(self):
+        path = self.root / "vs_runtime.user.json"
+        save_vs_runtime_override(
+            path,
+            {
+                "plugins": {"native_plugin_dirs": ["D:/VS/./plugins"]},
+                "scripts": {"global_script_path": "D:/VS/./pipeline.vpy"},
+            },
+        )
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["plugins"]["native_plugin_dirs"], [r"D:\VS\plugins"]
+        )
+        self.assertEqual(
+            payload["scripts"]["global_script_path"], r"D:\VS\pipeline.vpy"
+        )
+
+    def test_save_patch_preserves_existing_fields(self):
+        path = self.root / "vs_runtime.user.json"
+        save_vs_runtime_override(
+            path,
+            {
+                "worker": {"frame_timeout_ms": 12_345},
+                "plugins": {"native_plugin_dirs": [r"D:\VS\plugins"]},
+            },
+        )
+
+        save_vs_runtime_override(
+            path,
+            {"scripts": {"global_script_path": r"D:\VS\pipeline.vpy"}},
+        )
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload.get("worker", {}).get("frame_timeout_ms"), 12_345
+        )
+        self.assertEqual(
+            payload.get("plugins", {}).get("native_plugin_dirs"),
+            [r"D:\VS\plugins"],
+        )
+
+    def test_save_patch_rejects_non_object(self):
+        with self.assertRaises(VSRuntimeConfigError):
+            save_vs_runtime_override(self.root / "invalid.user.json", [])
+
+    def test_concurrent_thread_patches_do_not_lose_fields(self):
+        path = self.root / "thread.user.json"
+        barrier = threading.Barrier(2)
+        patches = (
+            {"worker": {"frame_timeout_ms": 12_345}},
+            {"core": {"num_threads": 4}},
+        )
+
+        def apply_patch(patch):
+            barrier.wait(timeout=10)
+            save_vs_runtime_override(path, patch)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(apply_patch, patches))
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload.get("worker", {}).get("frame_timeout_ms"), 12_345
+        )
+        self.assertEqual(payload.get("core", {}).get("num_threads"), 4)
+
+    def test_concurrent_process_patches_do_not_lose_fields(self):
+        path = self.root / "process.user.json"
+        context = multiprocessing.get_context("spawn")
+        barrier = context.Barrier(2)
+        results = context.Queue()
+        patches = (
+            {"worker": {"frame_timeout_ms": 12_345}},
+            {"core": {"num_threads": 4}},
+        )
+        processes = [
+            context.Process(
+                target=_save_override_process,
+                args=(path, patch, barrier, results),
+            )
+            for patch in patches
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=15)
+            self.assertFalse(process.is_alive(), "patch 进程未按时退出")
+            self.assertEqual(process.exitcode, 0)
+        outcomes = [results.get(timeout=5) for _ in processes]
+        self.assertEqual([state for state, _ in outcomes], ["ok", "ok"])
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload.get("worker", {}).get("frame_timeout_ms"), 12_345
+        )
+        self.assertEqual(payload.get("core", {}).get("num_threads"), 4)
+
+    def test_float_schema_version_is_rejected_by_model_and_loader(self):
+        payload = VSRuntimeConfig().to_dict()
+        payload["schema_version"] = 1.0
+        path = self.write_json(payload, "float-version.json")
+
+        with self.assertRaises(VSRuntimeConfigError):
+            VSRuntimeConfig.from_dict(payload)
+        with self.assertRaises(VSRuntimeConfigError):
+            load_vs_runtime(path)
+
 
 class LegacyVSConfigMigrationTests(unittest.TestCase):
     def setUp(self):
@@ -221,6 +382,114 @@ class LegacyVSConfigMigrationTests(unittest.TestCase):
         self.assertFalse(second.applied)
         self.assertEqual(second.source_hash, first.source_hash)
         self.assertEqual(self.user_path.read_bytes(), user_before)
+
+    def test_existing_user_override_wins_over_legacy_values(self):
+        self.write_legacy()
+        self.user_path.parent.mkdir(parents=True)
+        self.user_path.write_text(
+            json.dumps(
+                {
+                    "core": {"num_threads": 9},
+                    "plugins": {
+                        "native_plugin_dirs": [r"D:\User\plugins"]
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        migrate_legacy_vsconfig_once(
+            self.legacy_path, self.user_path, self.marker_path
+        )
+
+        payload = json.loads(self.user_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["core"]["num_threads"], 9)
+        self.assertEqual(payload["core"]["max_cache_size_mb"], 512)
+        self.assertEqual(
+            payload["plugins"]["native_plugin_dirs"], [r"D:\User\plugins"]
+        )
+
+    def test_changed_hash_reapplies_and_migrates_new_allowlisted_field(self):
+        self.legacy_path.write_text(
+            json.dumps({"core": {"num_threads": 4}}), encoding="utf-8"
+        )
+        first = migrate_legacy_vsconfig_once(
+            self.legacy_path, self.user_path, self.marker_path
+        )
+        self.legacy_path.write_text(
+            json.dumps(
+                {"core": {"num_threads": 6, "max_cache_size_mb": 768}}
+            ),
+            encoding="utf-8",
+        )
+
+        second = migrate_legacy_vsconfig_once(
+            self.legacy_path, self.user_path, self.marker_path
+        )
+
+        self.assertTrue(second.applied)
+        self.assertNotEqual(second.source_hash, first.source_hash)
+        payload = json.loads(self.user_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["core"]["num_threads"], 4)
+        self.assertEqual(payload["core"]["max_cache_size_mb"], 768)
+
+    def test_corrupt_marker_and_target_fail_loudly_with_path(self):
+        self.write_legacy()
+        self.marker_path.parent.mkdir(parents=True)
+        self.marker_path.write_text("{", encoding="utf-8")
+        with self.assertRaises(VSRuntimeConfigError) as marker_error:
+            migrate_legacy_vsconfig_once(
+                self.legacy_path, self.user_path, self.marker_path
+            )
+        self.assertIn(str(self.marker_path.resolve()), str(marker_error.exception))
+
+        self.marker_path.unlink()
+        self.user_path.write_text("{", encoding="utf-8")
+        with self.assertRaises(VSRuntimeConfigError) as target_error:
+            migrate_legacy_vsconfig_once(
+                self.legacy_path, self.user_path, self.marker_path
+            )
+        self.assertIn(str(self.user_path.resolve()), str(target_error.exception))
+
+    def test_relative_legacy_plugin_dir_is_canonicalized_from_install_root(self):
+        install_root = self.root / "ArknightsPassMaker"
+        legacy_path = install_root / "config" / "vsconfig.json"
+        user_path = self.root / "user" / "vs_runtime.user.json"
+        marker_path = self.root / "user" / "migration.json"
+        legacy_path.parent.mkdir(parents=True)
+        legacy_path.write_text(
+            json.dumps({"extra_plugin_dirs": ["vs-plugins"]}),
+            encoding="utf-8",
+        )
+
+        migrate_legacy_vsconfig_once(legacy_path, user_path, marker_path)
+
+        payload = json.loads(user_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["plugins"]["native_plugin_dirs"],
+            [str(install_root / "tools" / "media" / "vs-plugins")],
+        )
+
+    def test_global_script_patch_after_migration_keeps_migrated_fields(self):
+        self.write_legacy()
+        migrate_legacy_vsconfig_once(
+            self.legacy_path, self.user_path, self.marker_path
+        )
+
+        save_vs_runtime_override(
+            self.user_path,
+            {"scripts": {"global_script_path": r"D:\VS\pipeline.vpy"}},
+        )
+
+        payload = json.loads(self.user_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["core"]["num_threads"], 4)
+        self.assertEqual(
+            payload["plugins"]["native_plugin_dirs"],
+            [r"D:\VS\plugins"],
+        )
+        self.assertEqual(
+            payload["scripts"]["global_script_path"], r"D:\VS\pipeline.vpy"
+        )
 
     def test_missing_legacy_file_is_a_noop(self):
         report = migrate_legacy_vsconfig_once(

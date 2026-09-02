@@ -16,7 +16,7 @@
     "paths"
   ],
   "properties": {
-    "api_version": {"const": 1},
+    "api_version": {"type": "integer", "const": 1},
     "epoch": {"type": "integer", "minimum": 0},
     "track": {"enum": ["loop", "intro"]},
     "project_root": {"$ref": "#/$defs/absolutePath"},
@@ -26,11 +26,35 @@
     "output": {"$ref": "#/$defs/output"},
     "paths": {"$ref": "#/$defs/paths"}
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "source": {
+            "properties": {"kind": {"const": "image"}}
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "timeline": {
+            "properties": {
+              "end_frame": {"type": "integer", "minimum": 1},
+              "fps": {"$ref": "#/$defs/fps"}
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "absolutePath": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?:[A-Za-z]:[\\\\/]|/|\\\\\\\\)"
+      "pattern": "^(?:[A-Za-z]:\\\\(?:[^\\\\/<>:\u0022|?*]+(?:\\\\[^\\\\/<>:\u0022|?*]+)*)?|\\\\\\\\[^\\\\/<>:\u0022|?*]+\\\\[^\\\\/<>:\u0022|?*]+(?:\\\\[^\\\\/<>:\u0022|?*]+)*)$",
+      "not": {
+        "pattern": "(?:^|\\\\)\\.{1,2}(?:\\\\|$)"
+      }
     },
     "fps": {
       "type": "object",
@@ -114,7 +138,7 @@
       "additionalProperties": false,
       "required": ["rotation", "crop"],
       "properties": {
-        "rotation": {"enum": [0, 90, 180, 270]},
+        "rotation": {"type": "integer", "enum": [0, 90, 180, 270]},
         "crop": {"$ref": "#/$defs/crop"}
       }
     },

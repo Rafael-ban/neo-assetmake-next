@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -15,6 +16,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from config.constants import RESOLUTION_SPECS
 from core.file_utils import atomic_write_json
 from utils.file_utils import get_app_dir
+from utils.windows_paths import require_canonical_windows_absolute_path
 
 
 class RenderJobError(ValueError):
@@ -41,21 +43,16 @@ def _keys(data: dict[str, Any], required: set[str], location: str) -> None:
 
 
 def _integer(value: Any, location: str, *, minimum: int = 0) -> int:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int)
-        or value < minimum
-    ):
+    if type(value) is not int or value < minimum:
         raise RenderJobError(f"{location} 必须是 >= {minimum} 的整数")
     return value
 
 
 def _normalized_absolute_path(value: Any, location: str) -> str:
-    if not isinstance(value, str) or not value:
-        raise RenderJobError(f"{location} 必须是非空字符串路径")
-    if not os.path.isabs(value) or os.path.normpath(value) != value:
-        raise RenderJobError(f"{location} 必须是规范化绝对路径: {value!r}")
-    return value
+    try:
+        return require_canonical_windows_absolute_path(value, location)
+    except ValueError as exc:
+        raise RenderJobError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -215,7 +212,7 @@ class TransformSpec:
     crop: CropSpec
 
     def validate(self) -> None:
-        if isinstance(self.rotation, bool) or self.rotation not in (
+        if type(self.rotation) is not int or self.rotation not in (
             0,
             90,
             180,
@@ -387,7 +384,7 @@ class RenderJob:
     paths: PathSpec
 
     def validate(self, *, for_export: bool = False) -> None:
-        if isinstance(self.api_version, bool) or self.api_version != 1:
+        if type(self.api_version) is not int or self.api_version != 1:
             raise RenderJobError(f"未知 api_version: {self.api_version!r}")
         _integer(self.epoch, "epoch")
         if self.track not in ("loop", "intro"):
@@ -403,6 +400,18 @@ class RenderJob:
             if not isinstance(value, expected_type):
                 raise RenderJobError(f"{location} 类型无效")
             value.validate()
+        if self.source.kind == "image":
+            end_frame = self.timeline.end_frame
+            virtual_count = self.source.virtual_frame_count
+            if end_frame is None or self.timeline.fps is None:
+                raise RenderJobError("image timeline 的 end_frame/fps 必须已解析")
+            if virtual_count is None or not (
+                0 <= self.timeline.start_frame < end_frame <= virtual_count
+            ):
+                raise RenderJobError(
+                    "image timeline 必须满足 0 <= start < end <= "
+                    "virtual_frame_count"
+                )
         if for_export and (
             self.timeline.end_frame is None or self.timeline.fps is None
         ):
@@ -490,10 +499,28 @@ def write_render_job(job: RenderJob) -> Path:
         raise RenderJobError("job 类型无效")
     job.validate()
     target = Path(job.paths.cache_dir) / f"job-{job.epoch}.json"
-    if target.exists():
-        raise RenderJobError(f"拒绝覆盖既有 RenderJob: {target.resolve()}")
+    temp_path: Path | None = None
     try:
-        atomic_write_json(target, job.to_dict(), indent=2)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".publish",
+            dir=target.parent,
+        )
+        os.close(descriptor)
+        temp_path = Path(temp_name)
+        atomic_write_json(temp_path, job.to_dict(), indent=2)
+        os.link(temp_path, target)
+    except FileExistsError as exc:
+        raise RenderJobError(
+            f"拒绝覆盖既有 RenderJob: {target.resolve()}"
+        ) from exc
     except OSError as exc:
         raise RenderJobError(f"{target.resolve()}: {exc}") from exc
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
     return target

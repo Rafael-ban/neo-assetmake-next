@@ -27,6 +27,12 @@ MEDIA_TOOL_CANDIDATES = [
     ("lsmash-muxer.exe", os.path.join(MEDIA_TOOL_DIR, "lsmash-muxer.exe")),
     ("muxer.exe", os.path.join(MEDIA_TOOL_DIR, "muxer.exe")),
 ]
+VS_CONTRACT_FILES = (
+    "config/vs_runtime.json",
+    "config/vsconfig.json",
+    "schemas/vs_runtime.schema.json",
+    "schemas/vs_job.schema.json",
+)
 
 
 def get_version() -> str:
@@ -388,12 +394,34 @@ def _collect_media_tool_include_files():
     return include_files
 
 
+def _collect_vs_contract_include_files(project_root):
+    """Return required VS contract files or fail before freezing starts."""
+    root = os.path.abspath(os.fspath(project_root))
+    include_files = [
+        (os.path.join(root, *relative.split("/")), relative)
+        for relative in VS_CONTRACT_FILES
+    ]
+    missing = [source for source, _ in include_files if not os.path.isfile(source)]
+    if missing:
+        raise FileNotFoundError(
+            "Required VS contract files missing: " + ", ".join(missing)
+        )
+    return include_files
+
+
 def run_cxfreeze(skip_flasher=False, source_root=None):
     """执行 cx_Freeze 打包"""
 
     # 确保项目根目录在 Python 路径中（防御性措施，正常应通过 uv sync --group dev 的 editable install 实现）
     project_root = os.path.dirname(os.path.abspath(__file__))
     source_root = os.path.abspath(source_root or project_root)
+    try:
+        vs_contract_include_files = _collect_vs_contract_include_files(
+            project_root
+        )
+    except FileNotFoundError as exc:
+        print(f"  FATAL: {exc}")
+        return False
     for path in (project_root, source_root):
         if path in sys.path:
             sys.path.remove(path)
@@ -570,18 +598,10 @@ def run_cxfreeze(skip_flasher=False, source_root=None):
         ),  # 运行时通过 class_icons/ 相对路径访问
     ]
 
-    # M1 同时分发严格的运行配置/作业 schema 和旧 vsconfig。旧文件暂留用于
-    # 一次性迁移；全局脚本等用户选择只写 APPDATA 下的 user override。
-    vs_contract_files = (
-        "config/vs_runtime.json",
-        "config/vsconfig.json",
-        "schemas/vs_runtime.schema.json",
-        "schemas/vs_job.schema.json",
-    )
-    for contract_path in vs_contract_files:
-        if os.path.exists(contract_path):
-            include_files.append((contract_path, contract_path))
-            print(f"  Including VS contract: {contract_path}")
+    # M1 同时分发严格 runtime/job contract 和供一次性迁移读取的旧配置。
+    include_files.extend(vs_contract_include_files)
+    for source_path, contract_path in vs_contract_include_files:
+        print(f"  Including VS contract: {source_path} -> {contract_path}")
     for runtime_name, runtime_path in pyarmor_runtimes:
         include_files.append((runtime_path, runtime_name))
         print(f"  Including PyArmor runtime: {runtime_path}")

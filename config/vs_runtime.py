@@ -9,16 +9,25 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 from core.file_utils import atomic_write_json
 from utils.file_utils import get_app_dir
+from utils.windows_paths import (
+    canonicalize_windows_absolute_path,
+    require_canonical_windows_absolute_path,
+)
 
 
 RUNTIME_CONFIG_FILENAME = "vs_runtime.json"
 USER_OVERRIDE_FILENAME = "vs_runtime.user.json"
+_OVERRIDE_LOCKS: dict[str, threading.RLock] = {}
+_OVERRIDE_LOCKS_GUARD = threading.Lock()
 
 
 class VSRuntimeConfigError(ValueError):
@@ -42,7 +51,7 @@ def _reject_unknown(
 
 
 def _non_negative_int(value: Any, location: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         raise VSRuntimeConfigError(f"{location} 必须是非负整数")
     return value
 
@@ -53,6 +62,17 @@ def _string_tuple(value: Any, location: str) -> tuple[str, ...]:
     ):
         raise VSRuntimeConfigError(f"{location} 必须是非空字符串数组")
     return tuple(value)
+
+
+def _path_tuple(value: Any, location: str) -> tuple[str, ...]:
+    paths = _string_tuple(value, location)
+    try:
+        return tuple(
+            require_canonical_windows_absolute_path(path, location)
+            for path in paths
+        )
+    except ValueError as exc:
+        raise VSRuntimeConfigError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -139,10 +159,10 @@ class PluginConfig:
         if set(data) != allowed:
             raise VSRuntimeConfigError("plugins 缺少必需字段")
         return cls(
-            native_plugin_dirs=_string_tuple(
+            native_plugin_dirs=_path_tuple(
                 data["native_plugin_dirs"], "plugins.native_plugin_dirs"
             ),
-            python_module_dirs=_string_tuple(
+            python_module_dirs=_path_tuple(
                 data["python_module_dirs"], "plugins.python_module_dirs"
             ),
         )
@@ -165,6 +185,13 @@ class ScriptConfig:
         path = data["global_script_path"]
         if not isinstance(path, str):
             raise VSRuntimeConfigError("scripts.global_script_path 必须是字符串")
+        if path:
+            try:
+                require_canonical_windows_absolute_path(
+                    path, "scripts.global_script_path"
+                )
+            except ValueError as exc:
+                raise VSRuntimeConfigError(str(exc)) from exc
         return cls(global_script_path=path)
 
 
@@ -193,7 +220,7 @@ class VSRuntimeConfig:
         if set(data) != allowed:
             raise VSRuntimeConfigError("runtime 缺少必需字段")
         version = data["schema_version"]
-        if isinstance(version, bool) or version != 1:
+        if type(version) is not int or version != 1:
             raise VSRuntimeConfigError(f"未知 schema_version: {version!r}")
         return cls(
             schema_version=1,
@@ -237,6 +264,37 @@ def _validate_partial(value: Any) -> dict[str, Any]:
     return data
 
 
+def _canonicalize_override_paths(value: dict[str, Any]) -> dict[str, Any]:
+    data = deepcopy(value)
+    plugins = data.get("plugins")
+    if isinstance(plugins, dict):
+        for field_name in ("native_plugin_dirs", "python_module_dirs"):
+            paths = plugins.get(field_name)
+            if isinstance(paths, list):
+                try:
+                    plugins[field_name] = [
+                        canonicalize_windows_absolute_path(
+                            path, f"plugins.{field_name}"
+                        )
+                        for path in paths
+                    ]
+                except ValueError as exc:
+                    raise VSRuntimeConfigError(str(exc)) from exc
+    scripts = data.get("scripts")
+    if isinstance(scripts, dict):
+        path = scripts.get("global_script_path")
+        if isinstance(path, str) and path:
+            try:
+                scripts["global_script_path"] = (
+                    canonicalize_windows_absolute_path(
+                        path, "scripts.global_script_path"
+                    )
+                )
+            except ValueError as exc:
+                raise VSRuntimeConfigError(str(exc)) from exc
+    return data
+
+
 def _deep_merge(
     base: dict[str, Any], override: dict[str, Any]
 ) -> dict[str, Any]:
@@ -247,6 +305,54 @@ def _deep_merge(
         else:
             merged[key] = value
     return merged
+
+
+def _thread_lock_for(path: Path) -> threading.RLock:
+    key = os.path.normcase(str(path.resolve()))
+    with _OVERRIDE_LOCKS_GUARD:
+        return _OVERRIDE_LOCKS.setdefault(key, threading.RLock())
+
+
+def _lock_file(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(handle) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _override_lock(path: Path) -> Iterator[None]:
+    thread_lock = _thread_lock_for(path)
+    with thread_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_name(f".{path.name}.lock")
+        with lock_path.open("a+b") as handle:
+            _lock_file(handle)
+            try:
+                yield
+            finally:
+                _unlock_file(handle)
 
 
 def load_vs_runtime(
@@ -290,8 +396,21 @@ def load_vs_runtime(
 
 
 def save_vs_runtime_override(
-    path: str | os.PathLike[str], override: dict[str, Any]
+    path: str | os.PathLike[str], override: Any
 ) -> None:
-    """严格校验并原子写入用户覆盖；不会修改随包配置。"""
-    payload = _validate_partial(override)
-    atomic_write_json(path, payload, indent=2)
+    """锁定读取已有 partial，深合并 patch 后校验并原子替换。"""
+    target = Path(path)
+    patch = _canonicalize_override_paths(_require_object(override, "override"))
+    _validate_partial(patch)
+    with _override_lock(target):
+        try:
+            existing = (
+                _validate_partial(_read_json(target)) if target.exists() else {}
+            )
+            payload = _deep_merge(existing, patch)
+            _validate_partial(payload)
+            atomic_write_json(target, payload, indent=2)
+        except VSRuntimeConfigError as exc:
+            if str(target.resolve()) in str(exc):
+                raise
+            raise VSRuntimeConfigError(f"{target.resolve()}: {exc}") from exc
