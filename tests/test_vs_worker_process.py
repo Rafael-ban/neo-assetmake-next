@@ -1,3 +1,4 @@
+import builtins
 import io
 import hashlib
 import json
@@ -31,6 +32,8 @@ from core.vs_runtime.protocol import (
     encode_message,
 )
 from core.vs_runtime.session import (
+    GENERATION_STAGING_ROOT_ENV,
+    GenerationStagingRoot,
     RenderSession,
     ScriptSelection,
     compute_script_bundle_hash,
@@ -458,9 +461,14 @@ class WorkerProcessTransportTests(unittest.TestCase):
     def test_exit_listener_can_restart_without_old_waiter_poisoning_new_generation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             marker = Path(temp_dir) / "first-run"
+            roots = Path(temp_dir) / "generation-roots.txt"
             child = (
-                "import pathlib,sys,time\n"
+                "import os,pathlib,sys,time\n"
                 f"marker=pathlib.Path({str(marker)!r})\n"
+                f"roots=pathlib.Path({str(roots)!r})\n"
+                f"root=pathlib.Path(os.environ[{GENERATION_STAGING_ROOT_ENV!r}])\n"
+                "with roots.open('a', encoding='utf-8') as stream:\n"
+                "    stream.write(str(root) + '\\n')\n"
                 "if marker.exists():\n"
                 "    time.sleep(60)\n"
                 "else:\n"
@@ -492,10 +500,27 @@ class WorkerProcessTransportTests(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertEqual(process.generation, 2)
             self.assertTrue(process.alive)
+            deadline = time.monotonic() + 5
+            while (
+                (not roots.exists() or len(roots.read_text(encoding="utf-8").splitlines()) < 2)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertTrue(roots.is_file())
+            old_root, new_root = [
+                Path(line)
+                for line in roots.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertFalse(old_root.exists())
+            self.assertTrue(new_root.is_dir())
 
     def test_spawn_failure_does_not_poison_next_start(self):
         process = WorkerProcess(
             command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        self.addCleanup(
+            lambda: process._generation_staging
+            and process._generation_staging.close()
         )
         previous_process = mock.Mock()
         previous_process.poll.return_value = 23
@@ -516,7 +541,7 @@ class WorkerProcessTransportTests(unittest.TestCase):
             mock.patch(
                 "core.vs_runtime.worker_process.subprocess.Popen",
                 side_effect=[OSError("spawn failed"), replacement],
-            ),
+            ) as popen,
             mock.patch("threading.Thread.start"),
         ):
             with self.assertRaises(WorkerProcessError):
@@ -527,11 +552,21 @@ class WorkerProcessTransportTests(unittest.TestCase):
             self.assertIs(process._exit_event, previous_exit)
             self.assertEqual(process.start(), 5)
 
+        failed_env = popen.call_args_list[0].kwargs["env"]
+        self.assertIsInstance(failed_env, dict)
+        self.assertIn(GENERATION_STAGING_ROOT_ENV, failed_env)
+        self.assertFalse(
+            Path(failed_env[GENERATION_STAGING_ROOT_ENV]).exists()
+        )
         self.assertTrue(process.alive)
 
     def test_thread_start_failure_reaps_child_and_allows_fresh_generation(self):
         process = WorkerProcess(
             command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        self.addCleanup(
+            lambda: process._generation_staging
+            and process._generation_staging.close()
         )
 
         def fake_process(pid):
@@ -557,7 +592,7 @@ class WorkerProcessTransportTests(unittest.TestCase):
             mock.patch(
                 "core.vs_runtime.worker_process.subprocess.Popen",
                 side_effect=[failed_child, replacement],
-            ),
+            ) as popen,
             mock.patch("threading.Thread.start", side_effect=starts),
         ):
             with self.assertRaises(WorkerProcessError):
@@ -568,7 +603,92 @@ class WorkerProcessTransportTests(unittest.TestCase):
             failed_child.terminate.assert_called_once()
             self.assertEqual(process.start(), 2)
 
+        failed_env = popen.call_args_list[0].kwargs["env"]
+        self.assertIsInstance(failed_env, dict)
+        self.assertIn(GENERATION_STAGING_ROOT_ENV, failed_env)
+        self.assertFalse(
+            Path(failed_env[GENERATION_STAGING_ROOT_ENV]).exists()
+        )
         self.assertTrue(process.alive)
+
+    def test_missing_binary_pipe_removes_unpublished_generation_root(self):
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        child = mock.Mock()
+        child.stdin = None
+        child.stdout = io.BytesIO()
+        child.stderr = io.BytesIO()
+        child.poll.return_value = None
+        child.wait.return_value = 1
+
+        with (
+            mock.patch(
+                "core.vs_runtime.worker_process.subprocess.Popen",
+                return_value=child,
+            ) as popen,
+            self.assertRaises(WorkerProcessError),
+        ):
+            process.start()
+
+        environment = popen.call_args.kwargs["env"]
+        self.assertIsInstance(environment, dict)
+        self.assertIn(GENERATION_STAGING_ROOT_ENV, environment)
+        self.assertFalse(Path(environment[GENERATION_STAGING_ROOT_ENV]).exists())
+
+    def test_child_helper_import_failure_removes_generation_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root_record = Path(temp_dir) / "helper-failure-root.txt"
+            child = (
+                "import os\n"
+                "from pathlib import Path\n"
+                f"root=Path(os.environ[{GENERATION_STAGING_ROOT_ENV!r}])\n"
+                "snapshot=root/'snapshot-helper-failure'\n"
+                "(snapshot/'bundle').mkdir(parents=True)\n"
+                "(snapshot/'bundle'/'pipeline.vpy').write_text('# code')\n"
+                "(snapshot/'job.json').write_text('{}')\n"
+                f"Path({str(root_record)!r}).write_text(str(root), encoding='utf-8')\n"
+                "raise ImportError('helper import failed')\n"
+            )
+            process = WorkerProcess(
+                app_dir=ROOT,
+                command=[str(Path(sys.executable).resolve()), "-B", "-c", child],
+            )
+            self.addCleanup(process.close)
+
+            process.start()
+            code = process.wait(timeout_ms=10_000)
+
+            self.assertNotEqual(code, 0)
+            self.assertTrue(root_record.is_file())
+            generation_root = Path(root_record.read_text(encoding="utf-8"))
+            self.assertFalse(generation_root.exists())
+
+    def test_close_removes_live_child_generation_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root_record = Path(temp_dir) / "close-root.txt"
+            child = (
+                "import os,time\n"
+                "from pathlib import Path\n"
+                f"root=Path(os.environ[{GENERATION_STAGING_ROOT_ENV!r}])\n"
+                "(root/'snapshot-live'/'bundle').mkdir(parents=True)\n"
+                f"Path({str(root_record)!r}).write_text(str(root), encoding='utf-8')\n"
+                "time.sleep(60)\n"
+            )
+            process = WorkerProcess(
+                app_dir=ROOT,
+                command=[str(Path(sys.executable).resolve()), "-B", "-c", child],
+            )
+            process.start()
+            deadline = time.monotonic() + 5
+            while not root_record.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(root_record.is_file())
+            generation_root = Path(root_record.read_text(encoding="utf-8"))
+
+            process.close()
+
+            self.assertFalse(generation_root.exists())
 
     def test_close_prevents_exit_listener_from_restarting_transport(self):
         process = WorkerProcess(
@@ -1207,7 +1327,14 @@ class WorkerServerFrameTests(unittest.TestCase):
             helper.write_text("VALUE = 'SAFE_HELPER'\n", encoding="utf-8")
             _write_job(job, epoch=7)
             session = _session(script, job, epoch=7)
-            server = WorkerServer(writer=Writer(), app_dir=ROOT, self_test=False)
+            generation_staging = GenerationStagingRoot.create()
+            self.addCleanup(generation_staging.close)
+            server = WorkerServer(
+                writer=Writer(),
+                app_dir=ROOT,
+                self_test=False,
+                generation_staging=generation_staging,
+            )
             original_retire = server._retire_current
 
             def mutate_source_during_retirement(*args, **kwargs):
@@ -1288,6 +1415,76 @@ class WorkerServerFrameTests(unittest.TestCase):
             self.assertFalse(snapshot_root.exists())
             self.assertEqual(messages[-1]["type"], "metadata")
 
+    def test_early_contract_helper_import_failure_closes_load_snapshot(self):
+        from core.vs_runtime.session import ScriptBundleSnapshot
+        from core.vs_runtime.worker_main import WorkerServer
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            script = root / "pipeline.vpy"
+            job = root / "job.json"
+            script.write_text(_valid_script(compatible=False), encoding="utf-8")
+            _write_job(job, epoch=7)
+            session = _session(script, job, epoch=7)
+            generation_staging = GenerationStagingRoot.create()
+            self.addCleanup(generation_staging.close)
+            server = WorkerServer(
+                writer=mock.Mock(),
+                app_dir=ROOT,
+                self_test=False,
+                generation_staging=generation_staging,
+            )
+            created = []
+            real_create = ScriptBundleSnapshot.create
+
+            def capture_snapshot(*args, **kwargs):
+                snapshot = real_create(*args, **kwargs)
+                created.append(snapshot)
+                return snapshot
+
+            real_import = builtins.__import__
+
+            def fail_contract_import(name, *args, **kwargs):
+                if name == (
+                    "resources.vapoursynth.python.assetmaker_vs.contract"
+                ):
+                    raise ImportError("contract helper import failed")
+                return real_import(name, *args, **kwargs)
+
+            try:
+                with (
+                    mock.patch.object(
+                        ScriptBundleSnapshot,
+                        "create",
+                        side_effect=capture_snapshot,
+                    ),
+                    mock.patch.object(server, "_assert_runtime_unchanged"),
+                    mock.patch.object(
+                        server,
+                        "_ensure_vs",
+                        return_value=SimpleNamespace(core=SimpleNamespace()),
+                    ),
+                    mock.patch.object(
+                        builtins,
+                        "__import__",
+                        side_effect=fail_contract_import,
+                    ),
+                    self.assertRaisesRegex(
+                        ImportError, "contract helper import failed"
+                    ),
+                ):
+                    server._handle_load(session.to_load_message(1))
+
+                self.assertEqual(len(created), 1)
+                self.assertEqual(
+                    created[0].root_path.parent,
+                    generation_staging.root_path,
+                )
+                self.assertFalse(created[0].root_path.exists())
+            finally:
+                for snapshot in created:
+                    snapshot.close()
+
     def test_runtime_change_since_worker_start_requires_fresh_process(self):
         from core.vs_runtime.worker_main import WorkerServer
 
@@ -1295,6 +1492,8 @@ class WorkerServerFrameTests(unittest.TestCase):
         server.app_dir = ROOT
         server.runtime = load_vs_runtime()
         server.runtime_fingerprint = "a" * 64
+        server.generation_staging = GenerationStagingRoot.create()
+        self.addCleanup(server.generation_staging.close)
         with tempfile.TemporaryDirectory() as temp_dir:
             script = Path(temp_dir) / "pipeline.vpy"
             job = Path(temp_dir) / "job.json"
@@ -1350,6 +1549,8 @@ class WorkerServerFrameTests(unittest.TestCase):
         server.app_dir = ROOT
         server.runtime = load_vs_runtime()
         server.runtime_fingerprint = "a" * 64
+        server.generation_staging = GenerationStagingRoot.create()
+        self.addCleanup(server.generation_staging.close)
         with tempfile.TemporaryDirectory() as temp_dir:
             script = Path(temp_dir) / "pipeline.vpy"
             job = Path(temp_dir) / "job.json"
@@ -1502,10 +1703,49 @@ class WorkerServerFrameTests(unittest.TestCase):
                 input_stream=io.BytesIO(),
                 app_dir=ROOT,
                 self_test=False,
+                generation_staging=object(),
             )
 
         self.assertEqual(result, 0)
         self.assertEqual(events, ["server", "stdout", "runtime-check"])
+
+    def test_main_defers_staging_import_until_worker_runtime_snapshot(self):
+        from core.vs_runtime import worker_main
+
+        events = []
+        real_import = builtins.__import__
+
+        def observe_import(name, *args, **kwargs):
+            if name == "core.vs_runtime.session":
+                events.append("session-import")
+            return real_import(name, *args, **kwargs)
+
+        def run_worker(**kwargs):
+            events.append("run-worker")
+            self.assertIsNone(kwargs["generation_staging"])
+            return 0
+
+        with (
+            mock.patch.object(
+                builtins,
+                "__import__",
+                side_effect=observe_import,
+            ),
+            mock.patch.object(
+                worker_main,
+                "run_worker",
+                side_effect=run_worker,
+            ),
+        ):
+            result = worker_main.main(
+                protocol_stream=io.BytesIO(),
+                input_stream=io.BytesIO(),
+                app_dir=ROOT,
+                self_test=False,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(events, ["run-worker"])
 
     def test_cancel_ack_cannot_overtake_committing_frame_terminal(self):
         write_started = threading.Event()
@@ -2118,6 +2358,7 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
         self.assertTrue(self.client.transport.alive)
 
     def test_os_exit_23_only_kills_child_and_same_transport_restarts(self):
+        root_record = self.root / "crash-generation-root.txt"
         crash = self._write_script(
             "崩溃脚本",
             "# assetmaker-api: 1\n"
@@ -2125,7 +2366,11 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
             "# assetmaker-capabilities: source\n"
             "# assetmaker-requires:\n"
             "# assetmaker-editor-output: 0\n\n"
-            "import os\nos._exit(23)\n",
+            "import os\n"
+            "from pathlib import Path\n"
+            f"Path({str(root_record)!r}).write_text("
+            f"os.environ.get({GENERATION_STAGING_ROOT_ENV!r}, ''), encoding='utf-8')\n"
+            "os._exit(23)\n",
         )
         valid = self._write_script("重启脚本", _valid_script(compatible=False))
         self.client.start(timeout_ms=15_000)
@@ -2136,6 +2381,11 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.exit_code, 23)
         self.assertIs(sys.modules.get("vapoursynth"), self.vs_before)
+        self.assertTrue(root_record.is_file())
+        crashed_root_text = root_record.read_text(encoding="utf-8")
+        self.assertTrue(crashed_root_text)
+        crashed_root = Path(crashed_root_text)
+        self.assertFalse(crashed_root.exists())
         self.client.terminate_and_restart(timeout_ms=15_000)
         self.assertGreater(self.client.generation, generation)
         metadata = self.client.load(self._session(valid), timeout_ms=15_000)
@@ -2378,12 +2628,15 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
         arm = self.root / "drain-arm.txt"
         entered = self.root / "drain-entered.txt"
         retired = self.root / "retirement-attempted.txt"
+        root_record = self.root / "drain-generation-root.txt"
         extra = (
-            "import sys, time, types\n"
+            "import os, sys, time, types\n"
             "from pathlib import Path\n"
             f"ARM = Path({str(arm)!r})\n"
             f"ENTERED = Path({str(entered)!r})\n"
             f"RETIRED = Path({str(retired)!r})\n"
+            f"Path({str(root_record)!r}).write_text("
+            f"os.environ.get({GENERATION_STAGING_ROOT_ENV!r}, ''), encoding='utf-8')\n"
             "class ObserveRetirement(types.ModuleType):\n"
             "    def __delattr__(self, name):\n"
             "        RETIRED.write_text(name, encoding='utf-8')\n"
@@ -2433,6 +2686,11 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "worker.drain_timeout")
         self.assertEqual(self.client.wait(timeout_ms=10_000), 71)
         self.assertFalse(retired.exists())
+        self.assertTrue(root_record.is_file())
+        drained_root_text = root_record.read_text(encoding="utf-8")
+        self.assertTrue(drained_root_text)
+        drained_root = Path(drained_root_text)
+        self.assertFalse(drained_root.exists())
         from core.vs_runtime.shared_frame import FrameSlot
 
         with self.assertRaises(FileNotFoundError):

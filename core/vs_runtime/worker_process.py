@@ -22,7 +22,12 @@ from core.vs_runtime.protocol import (
     encode_message,
     write_all,
 )
-from core.vs_runtime.session import RenderSession, SessionMetadata, resolve_worker_command
+from core.vs_runtime.session import (
+    GenerationStagingRoot,
+    RenderSession,
+    SessionMetadata,
+    resolve_worker_command,
+)
 from core.vs_runtime.shared_frame import FrameSlot, checked_frame_bytes
 from utils.file_utils import get_app_dir
 
@@ -169,6 +174,7 @@ class WorkerProcess:
         self._threads: list[threading.Thread] = []
         self._stdout_done = threading.Event()
         self._stderr_done = threading.Event()
+        self._generation_staging: GenerationStagingRoot | None = None
         self._closed = False
 
     @property
@@ -232,12 +238,17 @@ class WorkerProcess:
             stdout_done = threading.Event()
             stderr_done = threading.Event()
             stderr_tail: deque[str] = deque(maxlen=64)
+            generation_staging = GenerationStagingRoot.create()
             command = list(self.command)
             if self.self_test:
                 command.append("--self-test")
+            child_environment = (
+                dict(os.environ) if self.env is None else dict(self.env)
+            )
+            child_environment.update(generation_staging.to_environment())
             kwargs: dict[str, Any] = {
                 "cwd": str(self.app_dir),
-                "env": self.env,
+                "env": child_environment,
                 "stdin": subprocess.PIPE,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
@@ -249,6 +260,7 @@ class WorkerProcess:
             try:
                 process = subprocess.Popen(command, **kwargs)
             except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                generation_staging.close()
                 raise WorkerProcessError(f"worker 启动失败: {exc}") from exc
             if process.stdin is None or process.stdout is None or process.stderr is None:
                 try:
@@ -256,6 +268,7 @@ class WorkerProcess:
                     process.wait(timeout=5)
                 except (OSError, subprocess.SubprocessError):
                     pass
+                generation_staging.close()
                 raise WorkerProcessError("worker binary PIPE 创建失败")
             threads = [
                 threading.Thread(
@@ -286,6 +299,7 @@ class WorkerProcess:
                         write_queue,
                         exit_event,
                         stderr_tail,
+                        generation_staging,
                     ),
                     name=f"VSWorkerWaiter-{generation}",
                     daemon=True,
@@ -303,6 +317,7 @@ class WorkerProcess:
             self._latest_frame_sequence = 0
             self._stdout_done = stdout_done
             self._stderr_done = stderr_done
+            self._generation_staging = generation_staging
             self._process = process
             self._threads = threads
             started_threads: list[threading.Thread] = []
@@ -348,6 +363,7 @@ class WorkerProcess:
         for thread in started_threads:
             if thread.is_alive():
                 thread.join(timeout=1)
+        generation_staging.close()
         if type(code) is not int:
             code = -1
         with self._state_lock:
@@ -461,6 +477,7 @@ class WorkerProcess:
         write_queue: queue.Queue[tuple[int, bytes] | None],
         exit_event: threading.Event,
         stderr_tail: deque[str],
+        generation_staging: GenerationStagingRoot,
     ) -> None:
         code = process.wait()
         # 子进程会在退出前 flush 最后一条结构化错误。必须先让 stdout reader
@@ -476,7 +493,10 @@ class WorkerProcess:
                             stream.close()
                     except OSError:
                         pass
-                exit_event.set()
+                try:
+                    generation_staging.close()
+                finally:
+                    exit_event.set()
                 return
             expected = self._expected_exit
             failure = self._transport_failure
@@ -495,11 +515,21 @@ class WorkerProcess:
                     stream.close()
             except OSError:
                 pass
+        staging_failure = ""
+        try:
+            generation_staging.close()
+        except BaseException as error:
+            try:
+                staging_failure = str(error)
+            except BaseException:
+                staging_failure = type(error).__name__
         detail_parts = [f"worker exit code {code}"]
         if failure:
             detail_parts.append(failure)
         if stderr_lines:
             detail_parts.append("\n".join(stderr_lines))
+        if staging_failure:
+            detail_parts.append(f"generation staging cleanup failed: {staging_failure}")
         with self._state_lock:
             # 旧代的清理、slot 回收与 PIPE 关闭均已完成；从这里起才允许
             # listener 或其他线程启动下一代。exit_event 必须是本代捕获值，
@@ -1083,6 +1113,7 @@ class WorkerProcess:
             self._closed = True
             process = self._process
             exit_event = self._exit_event
+            generation_staging = self._generation_staging
             if process is not None:
                 self._expected_exit = True
         if process is None:
@@ -1098,7 +1129,8 @@ class WorkerProcess:
                     process.kill()
                 except OSError:
                     pass
-            exit_event.wait(1)
+            if not exit_event.wait(1) and generation_staging is not None:
+                generation_staging.close()
 
 
 def sys_platform_is_windows() -> bool:

@@ -4,19 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import re
+import secrets
 import shutil
 import stat
 import sys
 import tempfile
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from core.vs_runtime.protocol import ProtocolError
 from core.vs_runtime.script_header import ScriptHeader
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+GENERATION_STAGING_ROOT_ENV = "ASSETMAKER_VS_STAGING_ROOT"
+GENERATION_STAGING_TOKEN_ENV = "ASSETMAKER_VS_STAGING_TOKEN"
+_GENERATION_STAGING_PREFIX = "assetmaker-vs-generation-"
+_GENERATION_STAGING_MARKER = ".assetmaker-vs-owner"
 _NODE_FIELDS = {
     "width",
     "height",
@@ -326,6 +332,94 @@ def compute_script_bundle_hash(script_path: str | Path) -> str:
 
 
 @dataclass
+class GenerationStagingRoot:
+    """由 host 持有、跨越一个 worker generation 的 staging 根。"""
+
+    root_path: Path
+    owner_token: str
+    _closed: bool = False
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    @classmethod
+    def create(cls) -> "GenerationStagingRoot":
+        root = Path(tempfile.mkdtemp(prefix=_GENERATION_STAGING_PREFIX)).resolve()
+        token = secrets.token_hex(32)
+        try:
+            (root / _GENERATION_STAGING_MARKER).write_text(
+                token, encoding="ascii"
+            )
+            return cls(root_path=root, owner_token=token)
+        except BaseException:
+            ScriptBundleSnapshot._remove_tree(root)
+            raise
+
+    @classmethod
+    def from_environment(
+        cls, environment: Mapping[str, str]
+    ) -> "GenerationStagingRoot":
+        root_value = environment.get(GENERATION_STAGING_ROOT_ENV)
+        token = environment.get(GENERATION_STAGING_TOKEN_ENV)
+        if not root_value or not token:
+            raise RuntimeError("worker generation staging 身份缺失")
+        staging = cls(
+            root_path=Path(root_value).resolve(strict=True),
+            owner_token=token,
+        )
+        staging._verify_owner()
+        return staging
+
+    def to_environment(self) -> dict[str, str]:
+        self._verify_owner()
+        return {
+            GENERATION_STAGING_ROOT_ENV: str(self.root_path),
+            GENERATION_STAGING_TOKEN_ENV: self.owner_token,
+        }
+
+    def _verify_owner(self) -> None:
+        root = self.root_path.resolve(strict=True)
+        if not root.name.startswith(_GENERATION_STAGING_PREFIX):
+            raise RuntimeError("worker generation staging 根名称非法")
+        marker = root / _GENERATION_STAGING_MARKER
+        if (
+            not marker.is_file()
+            or marker.read_text(encoding="ascii") != self.owner_token
+        ):
+            raise RuntimeError("worker generation staging ownership marker 不匹配")
+
+    def create_snapshot_root(self) -> Path:
+        self._verify_owner()
+        snapshot = Path(
+            tempfile.mkdtemp(prefix="snapshot-", dir=self.root_path)
+        ).resolve(strict=True)
+        if snapshot.parent != self.root_path.resolve(strict=True):
+            ScriptBundleSnapshot._remove_tree(snapshot)
+            raise RuntimeError("snapshot 逃逸 worker generation staging 根")
+        return snapshot
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            if not self.root_path.exists():
+                self._closed = True
+                return
+            self._verify_owner()
+            ScriptBundleSnapshot._remove_tree(self.root_path)
+            self._closed = True
+
+    def __enter__(self) -> "GenerationStagingRoot":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.close()
+
+
+@dataclass
 class ScriptBundleSnapshot:
     """供一次 worker load 独占的代码与 job 磁盘快照。"""
 
@@ -339,11 +433,12 @@ class ScriptBundleSnapshot:
         cls,
         script_path: str | Path,
         job_path: str | Path,
+        generation_staging: GenerationStagingRoot,
     ) -> "ScriptBundleSnapshot":
         script, relative_files = _read_script_bundle(script_path)
         job = Path(job_path).resolve(strict=True)
         job_bytes = job.read_bytes()
-        root = Path(tempfile.mkdtemp(prefix="assetmaker-vs-snapshot-"))
+        root = generation_staging.create_snapshot_root()
         try:
             bundle_root = root / "bundle"
             for relative, data in relative_files:
@@ -383,6 +478,9 @@ class ScriptBundleSnapshot:
 
 
 __all__ = [
+    "GENERATION_STAGING_ROOT_ENV",
+    "GENERATION_STAGING_TOKEN_ENV",
+    "GenerationStagingRoot",
     "NodeMetadata",
     "RenderSession",
     "ScriptSelection",

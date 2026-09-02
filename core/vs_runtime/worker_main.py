@@ -429,6 +429,7 @@ class WorkerServer:
         writer: ProtocolWriter,
         app_dir: Path,
         self_test: bool,
+        generation_staging: Any | None,
     ) -> None:
         # 入口已先把 Python stdout 挪到 stderr；这里在导入受指纹保护的
         # helper 前建立基线，随后安装结构化 logger 并立即复核。
@@ -446,6 +447,13 @@ class WorkerServer:
             default_vs_runtime_user_path(),
         )
         self.runtime_fingerprint = compute_runtime_fingerprint(app_dir, self.runtime)
+        if generation_staging is None:
+            from core.vs_runtime.session import GenerationStagingRoot
+
+            generation_staging = GenerationStagingRoot.from_environment(
+                os.environ
+            )
+        self.generation_staging = generation_staging
         self._vs: Any | None = None
         self._loaded: _LoadedGraph | None = None
         self._cancelled_epochs: set[int] = set()
@@ -591,7 +599,9 @@ class WorkerServer:
                     code="protocol.invalid_request",
                 )
         snapshot = ScriptBundleSnapshot.create(
-            message["script_path"], message["job_path"]
+            message["script_path"],
+            message["job_path"],
+            self.generation_staging,
         )
         try:
             actual_bundle = compute_script_bundle_hash(snapshot.script_path)
@@ -741,16 +751,20 @@ class WorkerServer:
         except BaseException as error:
             self._close_snapshot(snapshot, error)
             raise
-        from resources.vapoursynth.python.assetmaker_vs.contract import (
-            OutputContractError,
-            RequirementError,
-            decode_output_contract_error,
-            validate_outputs,
-            verify_required_callables,
-        )
-        from resources.vapoursynth.python.assetmaker_vs.executor import (
-            execute_user_script,
-        )
+        try:
+            from resources.vapoursynth.python.assetmaker_vs.contract import (
+                OutputContractError,
+                RequirementError,
+                decode_output_contract_error,
+                validate_outputs,
+                verify_required_callables,
+            )
+            from resources.vapoursynth.python.assetmaker_vs.executor import (
+                execute_user_script,
+            )
+        except BaseException as error:
+            self._close_snapshot(snapshot, error)
+            raise
 
         try:
             # _retire_current() 可能等待旧图；_ensure_vs() 会加载受指纹保护
@@ -1280,9 +1294,15 @@ def run_worker(
     input_stream: BinaryIO,
     app_dir: Path,
     self_test: bool,
+    generation_staging: Any | None,
 ) -> int:
     writer = ProtocolWriter(protocol_stream)
-    server = WorkerServer(writer=writer, app_dir=app_dir, self_test=self_test)
+    server = WorkerServer(
+        writer=writer,
+        app_dir=app_dir,
+        self_test=self_test,
+        generation_staging=generation_staging,
+    )
     log_writer = _install_structured_stdout(writer)
     try:
         server._assert_runtime_unchanged(server.runtime_fingerprint)
@@ -1335,6 +1355,7 @@ def main(
     input_stream: BinaryIO | None = None,
     app_dir: str | os.PathLike[str] | None = None,
     self_test: bool | None = None,
+    generation_staging: Any | None = None,
 ) -> int:
     if protocol_stream is None:
         protocol_stream = sys.stdout.buffer
@@ -1353,6 +1374,7 @@ def main(
         input_stream=input_stream,
         app_dir=Path(app_dir).resolve(),
         self_test=self_test,
+        generation_staging=generation_staging,
     )
 
 
