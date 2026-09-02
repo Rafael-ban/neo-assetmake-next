@@ -492,6 +492,107 @@ class PortableExecutorTests(unittest.TestCase):
             ],
         )
 
+    def test_poison_package_metadata_does_not_abort_normal_retirement(self):
+        result = _run_child("executor_poison_close")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "first_value": "A",
+                "close_error": None,
+                "poison_preserved": True,
+                "a_marker_cached": False,
+                "second_value": "B",
+                "second_retired": True,
+                "helper_preserved": True,
+                "stdlib_preserved": True,
+            },
+        )
+
+    def test_poison_file_metadata_does_not_mask_script_failure(self):
+        result = _run_child("executor_poison_failure")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "execution_error": {
+                    "type": "RuntimeError",
+                    "message": "script failure",
+                },
+                "poison_preserved": True,
+                "a_marker_cached": False,
+                "second_value": "B",
+                "second_retired": True,
+                "helper_preserved": True,
+                "stdlib_preserved": True,
+            },
+        )
+
+    def test_parent_unbind_failure_does_not_abort_remaining_retirement(self):
+        result = _run_child("executor_retirement_unbind_close")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["close_error"]["type"], "GraphLifecycleError")
+        self.assertEqual(
+            payload["close_error"]["code"], "executor.retirement_failed"
+        )
+        self.assertIn(
+            "executor.retirement_failed", payload["close_error"]["message"]
+        )
+        self.assertEqual(
+            payload["state"],
+            {
+                "parent_preserved": True,
+                "bad_module_removed": True,
+                "bad_attr_remains": True,
+                "replacement_module_preserved": True,
+                "replacement_attr_preserved": True,
+                "later_module_removed": True,
+                "later_attr_removed": True,
+                "read_parent_preserved": True,
+                "read_child_removed": True,
+            },
+        )
+        self.assertFalse(payload["a_marker_cached"])
+        self.assertEqual(payload["second_value"], "B")
+        self.assertTrue(payload["second_retired"])
+
+    def test_retirement_failure_is_not_primary_over_script_failure(self):
+        result = _run_child("executor_retirement_unbind_failure")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["execution_error"]["type"], "RuntimeError")
+        self.assertEqual(
+            payload["execution_error"]["message"], "script failure"
+        )
+        self.assertTrue(
+            any(
+                "executor.retirement_failed" in note
+                for note in payload["execution_error"]["notes"]
+            )
+        )
+        self.assertEqual(
+            payload["state"],
+            {
+                "parent_preserved": True,
+                "bad_module_removed": True,
+                "bad_attr_remains": True,
+                "replacement_module_preserved": True,
+                "replacement_attr_preserved": True,
+                "later_module_removed": True,
+                "later_attr_removed": True,
+                "read_parent_preserved": True,
+                "read_child_removed": True,
+            },
+        )
+        self.assertFalse(payload["a_marker_cached"])
+        self.assertEqual(payload["second_value"], "B")
+        self.assertTrue(payload["second_retired"])
+
     def test_stdout_sink_is_thread_safe_and_chunks_below_protocol_limit(self):
         executor = _import_executor()
         lines: list[str] = []

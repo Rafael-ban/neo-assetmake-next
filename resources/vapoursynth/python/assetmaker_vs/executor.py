@@ -19,6 +19,8 @@ from .job_api import runtime_python_dirs_from_env
 
 MAX_PROTOCOL_BYTES = 4 * 1024 * 1024
 MAX_LOG_BODY_BYTES = MAX_PROTOCOL_BYTES - 1
+MAX_RETIREMENT_DIAGNOSTICS = 8
+MAX_RETIREMENT_DIAGNOSTIC_CHARS = 160
 
 
 class GraphLifecycleError(AssetmakerVSError):
@@ -97,37 +99,45 @@ def build_module_search_paths(
 def _is_under(path: Path, root: Path) -> bool:
     try:
         return os.path.commonpath((_path_key(path), _path_key(root))) == _path_key(root)
-    except (OSError, ValueError):
+    except BaseException:
         return False
 
 
 def _resolved_module_path(candidate: Any) -> Path | None:
-    if candidate is None:
-        return None
     try:
+        if candidate is None:
+            return None
         value = os.fsdecode(candidate)
-    except (TypeError, ValueError):
-        return None
-    if not value or value in {"built-in", "frozen"} or value.startswith("<"):
-        return None
-    try:
+        if (
+            not value
+            or value in {"built-in", "frozen"}
+            or value.startswith("<")
+        ):
+            return None
         return Path(value).resolve()
-    except (OSError, TypeError, ValueError):
+    except BaseException:
         return None
 
 
 def _module_file_path(module: Any) -> Path | None:
-    return _resolved_module_path(getattr(module, "__file__", None))
+    try:
+        candidate = getattr(module, "__file__", None)
+    except BaseException:
+        return None
+    return _resolved_module_path(candidate)
 
 
 def _package_paths(module: Any) -> tuple[Path, ...]:
-    package_paths = getattr(module, "__path__", ())
+    try:
+        package_paths = getattr(module, "__path__", ())
+    except BaseException:
+        return ()
     if isinstance(package_paths, (str, bytes, os.PathLike)):
         candidates = (package_paths,)
     else:
         try:
             candidates = tuple(package_paths)
-        except Exception:
+        except BaseException:
             # 失去父包的 _NamespacePath 可能在重算时抛 KeyError；单个坏模块
             # 不应中止整个退休扫描，其 __file__ 仍会被独立识别。
             candidates = ()
@@ -137,7 +147,10 @@ def _package_paths(module: Any) -> tuple[Path, ...]:
         path = _resolved_module_path(candidate)
         if path is None:
             continue
-        key = _path_key(path)
+        try:
+            key = _path_key(path)
+        except BaseException:
+            continue
         if key not in seen:
             seen.add(key)
             paths.append(path)
@@ -152,23 +165,122 @@ def _module_paths(module: Any) -> tuple[Path, ...]:
 
 
 @dataclass(frozen=True)
+class _ModuleRetirementResult:
+    removed: tuple[str, ...]
+    failure_count: int
+    diagnostics: tuple[str, ...]
+
+
+def _bounded_diagnostic(value: str) -> str:
+    if len(value) <= MAX_RETIREMENT_DIAGNOSTIC_CHARS:
+        return value
+    return value[: MAX_RETIREMENT_DIAGNOSTIC_CHARS - 1] + "…"
+
+
+def _exception_type_name(error: BaseException) -> str:
+    try:
+        name = type(error).__name__
+    except BaseException:
+        return "BaseException"
+    if type(name) is not str:
+        return "BaseException"
+    return _bounded_diagnostic(name)
+
+
+def _retirement_error(
+    result: _ModuleRetirementResult,
+) -> GraphLifecycleError:
+    return GraphLifecycleError(
+        "模块退休未完全完成，已继续处理其余退休项",
+        code="executor.retirement_failed",
+        field="script_modules",
+        expected="all captured modules and parent bindings retired",
+        actual={
+            "failure_count": result.failure_count,
+            "diagnostics": result.diagnostics,
+        },
+        hint="检查嵌入模块是否覆写模块属性访问或删除行为",
+    )
+
+
+def _stage_retirement_error(
+    operation: str, target: str, error: BaseException
+) -> GraphLifecycleError:
+    diagnostic = _bounded_diagnostic(
+        f"{operation}: {target}: {_exception_type_name(error)}"
+    )
+    return _retirement_error(
+        _ModuleRetirementResult(
+            removed=(),
+            failure_count=1,
+            diagnostics=(diagnostic,),
+        )
+    )
+
+
+def _add_cleanup_diagnostic(
+    primary: BaseException, secondary: BaseException
+) -> None:
+    try:
+        code = getattr(secondary, "code", None)
+    except BaseException:
+        code = None
+    if type(code) is str:
+        identity = f"[{_bounded_diagnostic(code)}]"
+    else:
+        identity = _exception_type_name(secondary)
+    note = f"脚本清理阶段另有异常：{identity}"
+    try:
+        BaseException.add_note(primary, note)
+    except BaseException:
+        # 清理诊断本身绝不能覆盖原始异常。
+        pass
+
+
+@dataclass(frozen=True)
 class _ModuleRetirementPlan:
     modules: tuple[tuple[str, Any], ...]
-    parent_bindings: tuple[tuple[Any, str, Any], ...]
+    parent_bindings: tuple[tuple[str, Any, str, Any], ...]
 
-    def retire(self) -> tuple[str, ...]:
+    def retire(self) -> _ModuleRetirementResult:
         removed: list[str] = []
+        diagnostics: list[str] = []
+        failure_count = 0
+
+        def record_failure(
+            operation: str, target: str, error: BaseException
+        ) -> None:
+            nonlocal failure_count
+            failure_count += 1
+            if len(diagnostics) >= MAX_RETIREMENT_DIAGNOSTICS:
+                return
+            diagnostics.append(
+                _bounded_diagnostic(
+                    f"{operation}: {target}: {_exception_type_name(error)}"
+                )
+            )
+
         for name, module in self.modules:
-            if sys.modules.get(name) is module:
-                sys.modules.pop(name, None)
-                removed.append(name)
-        for parent, attribute, child in self.parent_bindings:
             try:
+                if sys.modules.get(name) is module:
+                    sys.modules.pop(name, None)
+                    removed.append(name)
+            except BaseException as error:
+                record_failure("删除 sys.modules", name, error)
+        for parent_name, parent, attribute, child in self.parent_bindings:
+            target = f"{parent_name}.{attribute}"
+            try:
+                if sys.modules.get(parent_name) is not parent:
+                    continue
                 if getattr(parent, attribute, None) is child:
                     delattr(parent, attribute)
-            except (AttributeError, TypeError):
-                continue
-        return tuple(removed)
+            except BaseException as error:
+                record_failure("删除父包属性", target, error)
+        return _ModuleRetirementResult(
+            removed=tuple(removed),
+            failure_count=failure_count,
+            diagnostics=tuple(diagnostics),
+        )
 
 
 def _capture_module_retirement(
@@ -179,6 +291,8 @@ def _capture_module_retirement(
     helper_package = helper_root() / "assetmaker_vs"
     modules: list[tuple[str, Any]] = []
     for name, module in tuple(sys.modules.items()):
+        if type(name) is not str:
+            continue
         if name == "assetmaker_vs" or name.startswith("assetmaker_vs."):
             continue
         file_path = _module_file_path(module)
@@ -201,14 +315,20 @@ def _capture_module_retirement(
         if file_owned or script_only_namespace:
             modules.append((name, module))
 
-    parent_bindings: list[tuple[Any, str, Any]] = []
+    parent_bindings: list[tuple[str, Any, str, Any]] = []
     for name, module in modules:
         parent_name, separator, attribute = name.rpartition(".")
         if not separator:
             continue
-        parent = sys.modules.get(parent_name)
-        if parent is not None and getattr(parent, attribute, None) is module:
-            parent_bindings.append((parent, attribute, module))
+        try:
+            parent = sys.modules.get(parent_name)
+            if parent is not None and getattr(parent, attribute, None) is module:
+                parent_bindings.append(
+                    (parent_name, parent, attribute, module)
+                )
+        except BaseException:
+            # 父包可能是第三方自定义模块；无法读取一个绑定时只跳过该绑定。
+            continue
     return _ModuleRetirementPlan(
         modules=tuple(modules),
         parent_bindings=tuple(parent_bindings),
@@ -217,21 +337,67 @@ def _capture_module_retirement(
 
 def evict_modules_under(script_root: str | os.PathLike[str]) -> tuple[str, ...]:
     """只驱逐由当前脚本根加载的模块，永不驱逐 helper 自身。"""
-    return _capture_module_retirement(script_root).retire()
+    plan = _capture_module_retirement(script_root)
+    result = plan.retire()
+    if result.failure_count:
+        raise _retirement_error(result)
+    return result.removed
 
 
 def _close_execution_environment(
     environment: "ExecutionEnvironment", script_root: Path
 ) -> tuple[str, ...]:
     retirement: _ModuleRetirementPlan | None = None
+    retirement_failure: BaseException | None = None
+    environment_failure: BaseException | None = None
+    cache_failure: BaseException | None = None
+    removed: tuple[str, ...] = ()
     try:
         retirement = _capture_module_retirement(script_root)
-    finally:
+    except BaseException as error:
+        retirement_failure = _stage_retirement_error(
+            "捕获退休计划", "script_root", error
+        )
+
+    try:
+        environment.close()
+    except BaseException as error:
+        environment_failure = error
+
+    if retirement is not None:
         try:
-            environment.close()
-        finally:
-            removed = () if retirement is None else retirement.retire()
-            importlib.invalidate_caches()
+            result = retirement.retire()
+        except BaseException as error:
+            retirement_failure = _stage_retirement_error(
+                "执行退休计划", "script_root", error
+            )
+        else:
+            removed = result.removed
+            if result.failure_count:
+                retirement_failure = _retirement_error(result)
+
+    try:
+        importlib.invalidate_caches()
+    except BaseException as error:
+        cache_failure = error
+
+    primary_failure = (
+        environment_failure or retirement_failure or cache_failure
+    )
+    if primary_failure is not None:
+        for secondary_failure in (
+            environment_failure,
+            retirement_failure,
+            cache_failure,
+        ):
+            if (
+                secondary_failure is not None
+                and secondary_failure is not primary_failure
+            ):
+                _add_cleanup_diagnostic(
+                    primary_failure, secondary_failure
+                )
+        raise primary_failure
     return removed
 
 
@@ -400,11 +566,16 @@ def execute_user_script(
             environment=environment,
             _lease=lease,
         )
-    except BaseException:
+    except BaseException as execution_error:
+        cleanup_error: BaseException | None = None
         try:
             _close_execution_environment(environment, script.parent)
+        except BaseException as error:
+            cleanup_error = error
         finally:
             lease.release()
+        if cleanup_error is not None:
+            _add_cleanup_diagnostic(execution_error, cleanup_error)
         raise
 
 

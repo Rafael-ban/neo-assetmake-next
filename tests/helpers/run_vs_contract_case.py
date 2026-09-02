@@ -563,6 +563,345 @@ def _executor_graph_race_case() -> dict[str, object]:
     }
 
 
+class _PoisonModule(types.ModuleType):
+    def __getattr__(self, name: str):
+        raise RuntimeError(f"poison getattr: {name}")
+
+
+def _write_executor_poison_roots(
+    base: Path, *, observer_name: str | None = None
+) -> dict[str, Path]:
+    roots: dict[str, Path] = {}
+    for name in ("A", "B"):
+        root = base / name
+        modules = root / "modules"
+        modules.mkdir(parents=True)
+        (modules / "marker.py").write_text(
+            f"VALUE = {name!r}\n", encoding="utf-8"
+        )
+        lines = ["import marker", "loaded = marker.VALUE"]
+        if name == "A" and observer_name is not None:
+            lines.extend(
+                (
+                    f"import {observer_name} as observer",
+                    "observer.marker = marker",
+                    "observer.install_poison()",
+                    'raise RuntimeError("script failure")',
+                )
+            )
+        (root / "pipeline.vpy").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
+        )
+        (root / "job.json").write_text("{}", encoding="utf-8")
+        roots[name] = root
+    return roots
+
+
+def _executor_poison_close_case() -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    _install_fake_vapoursynth()
+    from assetmaker_vs import executor as helper_module
+    from assetmaker_vs.executor import execute_user_script
+
+    poison_name = "assetmaker_retirement_path_poison"
+    stdlib_json = sys.modules["json"]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        roots = _write_executor_poison_roots(Path(temp_dir).resolve())
+        first = _execute_lifecycle_graph(execute_user_script, roots["A"])
+        first_value = first.namespace["loaded"]
+        first_marker = sys.modules["marker"]
+        poison = _PoisonModule(poison_name)
+        poison.__file__ = None
+        sys.modules[poison_name] = poison
+        close_error = None
+        try:
+            first.close()
+        except BaseException as exc:
+            close_error = {
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+        poison_preserved = sys.modules.get(poison_name) is poison
+        a_marker_cached = sys.modules.get("marker") is first_marker
+        sys.modules.pop(poison_name, None)
+
+        second = _execute_lifecycle_graph(execute_user_script, roots["B"])
+        second_value = second.namespace["loaded"]
+        second.close()
+
+    return {
+        "first_value": first_value,
+        "close_error": close_error,
+        "poison_preserved": poison_preserved,
+        "a_marker_cached": a_marker_cached,
+        "second_value": second_value,
+        "second_retired": "marker" not in sys.modules,
+        "helper_preserved": (
+            sys.modules.get("assetmaker_vs.executor") is helper_module
+        ),
+        "stdlib_preserved": sys.modules.get("json") is stdlib_json,
+    }
+
+
+def _executor_poison_failure_case() -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    _install_fake_vapoursynth()
+    from assetmaker_vs import executor as helper_module
+    from assetmaker_vs.executor import execute_user_script
+
+    poison_name = "assetmaker_retirement_file_poison"
+    observer_name = "assetmaker_retirement_poison_observer"
+    observer = types.ModuleType(observer_name)
+
+    def install_poison() -> None:
+        poison = _PoisonModule(poison_name)
+        observer.poison = poison
+        sys.modules[poison_name] = poison
+
+    observer.install_poison = install_poison
+    sys.modules[observer_name] = observer
+    stdlib_json = sys.modules["json"]
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            roots = _write_executor_poison_roots(
+                Path(temp_dir).resolve(), observer_name=observer_name
+            )
+            execution_error = None
+            try:
+                _execute_lifecycle_graph(execute_user_script, roots["A"])
+            except BaseException as exc:
+                execution_error = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                }
+            poison_preserved = (
+                sys.modules.get(poison_name) is observer.poison
+            )
+            a_marker_cached = sys.modules.get("marker") is observer.marker
+            sys.modules.pop(poison_name, None)
+
+            second = _execute_lifecycle_graph(
+                execute_user_script, roots["B"]
+            )
+            second_value = second.namespace["loaded"]
+            second.close()
+
+        return {
+            "execution_error": execution_error,
+            "poison_preserved": poison_preserved,
+            "a_marker_cached": a_marker_cached,
+            "second_value": second_value,
+            "second_retired": "marker" not in sys.modules,
+            "helper_preserved": (
+                sys.modules.get("assetmaker_vs.executor") is helper_module
+            ),
+            "stdlib_preserved": sys.modules.get("json") is stdlib_json,
+        }
+    finally:
+        sys.modules.pop(poison_name, None)
+        sys.modules.pop(observer_name, None)
+        sys.modules.pop("marker", None)
+
+
+class _UnbindPoisonParent(types.ModuleType):
+    def __init__(
+        self,
+        name: str,
+        *,
+        replacement_name: str,
+        replacement: types.ModuleType,
+    ) -> None:
+        super().__init__(name)
+        self._replacement_name = replacement_name
+        self._replacement = replacement
+
+    def __delattr__(self, name: str) -> None:
+        if name == "bad_piece":
+            sys.modules[self._replacement_name] = self._replacement
+            types.ModuleType.__setattr__(
+                self, "replace_piece", self._replacement
+            )
+            raise RuntimeError("parent unlink failed")
+        super().__delattr__(name)
+
+
+def _install_retirement_fault(root: Path, external: Path):
+    parent_name = "assetmaker_unbind_parent"
+    replacement_name = f"{parent_name}.replace_piece"
+    replacement = types.ModuleType(replacement_name)
+    replacement.__file__ = str(external / "replacement.py")
+    parent = _UnbindPoisonParent(
+        parent_name,
+        replacement_name=replacement_name,
+        replacement=replacement,
+    )
+    parent.__file__ = str(external / "parent.py")
+    sys.modules[parent_name] = parent
+
+    children: dict[str, types.ModuleType] = {}
+    for attribute in ("bad_piece", "replace_piece", "later_piece"):
+        name = f"{parent_name}.{attribute}"
+        child = types.ModuleType(name)
+        child.__file__ = str(root / "modules" / parent_name / f"{attribute}.py")
+        setattr(parent, attribute, child)
+        sys.modules[name] = child
+        children[attribute] = child
+
+    read_parent_name = "assetmaker_read_poison_parent"
+    read_child_name = f"{read_parent_name}.orphan_piece"
+    read_parent = _PoisonModule(read_parent_name)
+    read_parent.__file__ = str(external / "read_parent.py")
+    read_child = types.ModuleType(read_child_name)
+    read_child.__file__ = str(
+        root / "modules" / read_parent_name / "orphan_piece.py"
+    )
+    sys.modules[read_parent_name] = read_parent
+    sys.modules[read_child_name] = read_child
+    return types.SimpleNamespace(
+        parent_name=parent_name,
+        parent=parent,
+        replacement_name=replacement_name,
+        replacement=replacement,
+        children=children,
+        read_parent_name=read_parent_name,
+        read_parent=read_parent,
+        read_child_name=read_child_name,
+        read_child=read_child,
+    )
+
+
+def _retirement_fault_state(fault) -> dict[str, object]:
+    parent = fault.parent
+    return {
+        "parent_preserved": sys.modules.get(fault.parent_name) is parent,
+        "bad_module_removed": (
+            f"{fault.parent_name}.bad_piece" not in sys.modules
+        ),
+        "bad_attr_remains": (
+            getattr(parent, "bad_piece", None) is fault.children["bad_piece"]
+        ),
+        "replacement_module_preserved": (
+            sys.modules.get(fault.replacement_name) is fault.replacement
+        ),
+        "replacement_attr_preserved": (
+            getattr(parent, "replace_piece", None) is fault.replacement
+        ),
+        "later_module_removed": (
+            f"{fault.parent_name}.later_piece" not in sys.modules
+        ),
+        "later_attr_removed": not hasattr(parent, "later_piece"),
+        "read_parent_preserved": (
+            sys.modules.get(fault.read_parent_name) is fault.read_parent
+        ),
+        "read_child_removed": fault.read_child_name not in sys.modules,
+    }
+
+
+def _remove_retirement_fault(fault) -> None:
+    names = (
+        fault.parent_name,
+        f"{fault.parent_name}.bad_piece",
+        fault.replacement_name,
+        f"{fault.parent_name}.later_piece",
+        fault.read_parent_name,
+        fault.read_child_name,
+    )
+    for name in names:
+        sys.modules.pop(name, None)
+
+
+def _executor_retirement_unbind_close_case() -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    _install_fake_vapoursynth()
+    from assetmaker_vs.executor import execute_user_script
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        base = Path(temp_dir).resolve()
+        roots = _write_executor_poison_roots(base)
+        first = _execute_lifecycle_graph(execute_user_script, roots["A"])
+        first_marker = sys.modules["marker"]
+        fault = _install_retirement_fault(roots["A"], base / "external")
+        close_error = None
+        try:
+            first.close()
+        except BaseException as exc:
+            close_error = {
+                "type": type(exc).__name__,
+                "code": getattr(exc, "code", None),
+                "message": str(exc),
+            }
+        state = _retirement_fault_state(fault)
+        a_marker_cached = sys.modules.get("marker") is first_marker
+        _remove_retirement_fault(fault)
+
+        second = _execute_lifecycle_graph(execute_user_script, roots["B"])
+        second_value = second.namespace["loaded"]
+        second.close()
+
+    return {
+        "close_error": close_error,
+        "state": state,
+        "a_marker_cached": a_marker_cached,
+        "second_value": second_value,
+        "second_retired": "marker" not in sys.modules,
+    }
+
+
+def _executor_retirement_unbind_failure_case() -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    _install_fake_vapoursynth()
+    from assetmaker_vs.executor import execute_user_script
+
+    observer_name = "assetmaker_retirement_unbind_observer"
+    observer = types.ModuleType(observer_name)
+    sys.modules[observer_name] = observer
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir).resolve()
+            roots = _write_executor_poison_roots(
+                base, observer_name=observer_name
+            )
+
+            def install_fault() -> None:
+                observer.fault = _install_retirement_fault(
+                    roots["A"], base / "external"
+                )
+
+            observer.install_poison = install_fault
+            execution_error = None
+            try:
+                _execute_lifecycle_graph(execute_user_script, roots["A"])
+            except BaseException as exc:
+                execution_error = {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "notes": list(getattr(exc, "__notes__", ())),
+                }
+            state = _retirement_fault_state(observer.fault)
+            a_marker_cached = sys.modules.get("marker") is observer.marker
+            _remove_retirement_fault(observer.fault)
+
+            second = _execute_lifecycle_graph(
+                execute_user_script, roots["B"]
+            )
+            second_value = second.namespace["loaded"]
+            second.close()
+
+        return {
+            "execution_error": execution_error,
+            "state": state,
+            "a_marker_cached": a_marker_cached,
+            "second_value": second_value,
+            "second_retired": "marker" not in sys.modules,
+        }
+    finally:
+        fault = getattr(observer, "fault", None)
+        if fault is not None:
+            _remove_retirement_fault(fault)
+        sys.modules.pop(observer_name, None)
+        sys.modules.pop("marker", None)
+
+
 def _job_payload(*, frame_count: int = 5) -> dict[str, object]:
     return {
         "api_version": 1,
@@ -1456,6 +1795,14 @@ CASES = {
     "executor_graph_overlap": _executor_graph_overlap_case,
     "executor_graph_race": _executor_graph_race_case,
     "executor_graph_reuse": _executor_graph_reuse_case,
+    "executor_poison_close": _executor_poison_close_case,
+    "executor_poison_failure": _executor_poison_failure_case,
+    "executor_retirement_unbind_close": (
+        _executor_retirement_unbind_close_case
+    ),
+    "executor_retirement_unbind_failure": (
+        _executor_retirement_unbind_failure_case
+    ),
     "range_probe": _range_probe_case,
 }
 
