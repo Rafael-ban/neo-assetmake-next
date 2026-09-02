@@ -37,6 +37,35 @@ def _import_executor():
         raise AssertionError("portable assetmaker_vs.executor 尚未实现") from exc
 
 
+def _fake_vapoursynth(*, fail_clear_call: int | None = None):
+    fake = types.ModuleType("vapoursynth")
+    outputs: dict[int, object] = {}
+    fake.clear_calls = 0
+
+    class FakeClip:
+        def set_output(self, index: int = 0) -> None:
+            outputs[index] = self
+
+    def clear_outputs() -> None:
+        fake.clear_calls += 1
+        if fake.clear_calls == fail_clear_call:
+            raise RuntimeError("clear outputs failed")
+        outputs.clear()
+
+    fake.clear_outputs = clear_outputs
+    fake.get_outputs = lambda: dict(outputs)
+    fake.make_clip = FakeClip
+    return fake
+
+
+def _write_executor_script(root: Path, body: str) -> tuple[Path, Path]:
+    script = root / "pipeline.vpy"
+    job = root / "job.json"
+    script.write_text(body, encoding="utf-8")
+    job.write_text("{}", encoding="utf-8")
+    return script, job
+
+
 def _write_job(path: Path, *, frame_count: int = 3) -> None:
     root = path.parent.resolve()
     payload = {
@@ -447,19 +476,211 @@ class PortableExecutorTests(unittest.TestCase):
             },
         )
 
-    def test_abnormal_close_is_terminal_and_releases_graph_lease(self):
-        result = _run_child("executor_graph_abnormal_close")
+    def test_graph_close_clears_vapoursynth_output_registry(self):
+        executor = _import_executor()
+        fake_vs = _fake_vapoursynth()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            script, job = _write_executor_script(
+                root,
+                "import vapoursynth as vs\n"
+                "clip = vs.make_clip()\n"
+                "clip.set_output(0)\n",
+            )
+            with mock.patch.dict(sys.modules, {"vapoursynth": fake_vs}):
+                graph = executor.execute_user_script(
+                    script_path=script,
+                    job_path=job,
+                    api_version="1",
+                    mode="raw",
+                )
+                self.assertEqual(set(fake_vs.get_outputs()), {0})
 
-        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        self.assertEqual(
-            json.loads(result.stdout),
-            {
-                "first_error": "environment close failed",
-                "second_error": None,
-                "close_calls": 1,
-                "after_error_value": "B",
-            },
-        )
+                graph.close()
+
+                self.assertEqual(fake_vs.get_outputs(), {})
+
+    def test_failed_script_clears_vapoursynth_output_registry(self):
+        executor = _import_executor()
+        fake_vs = _fake_vapoursynth()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            script, job = _write_executor_script(
+                root,
+                "import vapoursynth as vs\n"
+                "clip = vs.make_clip()\n"
+                "clip.set_output(0)\n"
+                'raise RuntimeError("script failed")\n',
+            )
+            with mock.patch.dict(sys.modules, {"vapoursynth": fake_vs}):
+                with self.assertRaisesRegex(RuntimeError, "script failed"):
+                    executor.execute_user_script(
+                        script_path=script,
+                        job_path=job,
+                        api_version="1",
+                        mode="raw",
+                    )
+
+                self.assertEqual(fake_vs.get_outputs(), {})
+
+    def test_clear_outputs_failure_is_wrapped_and_other_cleanup_continues(self):
+        executor = _import_executor()
+        fake_vs = _fake_vapoursynth(fail_clear_call=2)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            script, job = _write_executor_script(
+                root,
+                "import vapoursynth as vs\n"
+                "clip = vs.make_clip()\n"
+                "clip.set_output(0)\n",
+            )
+            with mock.patch.dict(sys.modules, {"vapoursynth": fake_vs}):
+                graph = executor.execute_user_script(
+                    script_path=script,
+                    job_path=job,
+                    api_version="1",
+                    mode="raw",
+                )
+                with mock.patch.object(
+                    executor.importlib, "invalidate_caches"
+                ) as invalidate_caches:
+                    with self.assertRaises(
+                        executor.GraphLifecycleError
+                    ) as raised:
+                        graph.close()
+
+                self.assertEqual(
+                    raised.exception.code, "executor.retirement_failed"
+                )
+                self.assertFalse(graph.environment.active)
+                invalidate_caches.assert_called_once_with()
+
+    def test_environment_close_failure_is_wrapped_and_cleanup_continues(self):
+        executor = _import_executor()
+        fake_vs = _fake_vapoursynth()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            script, job = _write_executor_script(
+                root,
+                "import vapoursynth as vs\n"
+                "clip = vs.make_clip()\n"
+                "clip.set_output(0)\n",
+            )
+            with mock.patch.dict(sys.modules, {"vapoursynth": fake_vs}):
+                graph = executor.execute_user_script(
+                    script_path=script,
+                    job_path=job,
+                    api_version="1",
+                    mode="raw",
+                )
+                original_close = graph.environment.close
+
+                def close_then_fail() -> None:
+                    original_close()
+                    raise RuntimeError("environment close failed")
+
+                graph.environment.close = close_then_fail
+                with mock.patch.object(
+                    executor.importlib, "invalidate_caches"
+                ) as invalidate_caches:
+                    with self.assertRaises(
+                        executor.GraphLifecycleError
+                    ) as raised:
+                        graph.close()
+
+                self.assertEqual(
+                    raised.exception.code, "executor.retirement_failed"
+                )
+                self.assertEqual(fake_vs.get_outputs(), {})
+                invalidate_caches.assert_called_once_with()
+
+                graph.close()
+                next_script = root / "next.vpy"
+                next_script.write_text(
+                    "import vapoursynth as vs\n"
+                    "clip = vs.make_clip()\n"
+                    "clip.set_output(0)\n",
+                    encoding="utf-8",
+                )
+                next_graph = executor.execute_user_script(
+                    script_path=next_script,
+                    job_path=job,
+                    api_version="1",
+                    mode="raw",
+                )
+                next_graph.close()
+
+    def test_cache_failure_is_wrapped_after_other_cleanup_completes(self):
+        executor = _import_executor()
+        fake_vs = _fake_vapoursynth()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            script, job = _write_executor_script(
+                root,
+                "import vapoursynth as vs\n"
+                "clip = vs.make_clip()\n"
+                "clip.set_output(0)\n",
+            )
+            with mock.patch.dict(sys.modules, {"vapoursynth": fake_vs}):
+                graph = executor.execute_user_script(
+                    script_path=script,
+                    job_path=job,
+                    api_version="1",
+                    mode="raw",
+                )
+                with mock.patch.object(
+                    executor.importlib,
+                    "invalidate_caches",
+                    side_effect=RuntimeError("cache invalidation failed"),
+                ):
+                    with self.assertRaises(
+                        executor.GraphLifecycleError
+                    ) as raised:
+                        graph.close()
+
+                self.assertEqual(
+                    raised.exception.code, "executor.retirement_failed"
+                )
+                self.assertEqual(fake_vs.get_outputs(), {})
+                self.assertFalse(graph.environment.active)
+
+    def test_cleanup_failure_does_not_mask_script_failure(self):
+        executor = _import_executor()
+        fake_vs = _fake_vapoursynth(fail_clear_call=2)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            script, job = _write_executor_script(
+                root,
+                "import vapoursynth as vs\n"
+                "clip = vs.make_clip()\n"
+                "clip.set_output(0)\n"
+                'raise RuntimeError("script failed")\n',
+            )
+            original_path = list(sys.path)
+            with mock.patch.dict(sys.modules, {"vapoursynth": fake_vs}):
+                with mock.patch.object(
+                    executor.importlib,
+                    "invalidate_caches",
+                    wraps=executor.importlib.invalidate_caches,
+                ) as invalidate_caches:
+                    with self.assertRaisesRegex(
+                        RuntimeError, "script failed"
+                    ) as raised:
+                        executor.execute_user_script(
+                            script_path=script,
+                            job_path=job,
+                            api_version="1",
+                            mode="raw",
+                        )
+
+                self.assertEqual(sys.path, original_path)
+                self.assertEqual(invalidate_caches.call_count, 2)
+                self.assertTrue(
+                    any(
+                        "executor.retirement_failed" in note
+                        for note in getattr(raised.exception, "__notes__", ())
+                    )
+                )
 
     def test_concurrent_graph_load_has_exactly_one_winner(self):
         result = _run_child("executor_graph_race")

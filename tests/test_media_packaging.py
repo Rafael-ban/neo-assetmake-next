@@ -115,6 +115,74 @@ class MediaPackagingTests(unittest.TestCase):
             ):
                 _collect_vs_contract_include_files(root)
 
+    def test_worker_support_manifest_requires_every_runtime_helper_file(self):
+        from build import _collect_vs_worker_support_files
+
+        entries = _collect_vs_worker_support_files(Path.cwd())
+        destinations = [destination for _, destination in entries]
+
+        helper_root = "resources/vapoursynth/python/assetmaker_vs"
+        self.assertEqual(
+            destinations,
+            [
+                "resources/vapoursynth/assetmaker_runner.vpy",
+                "resources/vapoursynth/default_pipeline.vpy",
+                *[
+                    f"{helper_root}/{filename}"
+                    for filename in (
+                        "__init__.py",
+                        "job_api.py",
+                        "script_header.py",
+                        "executor.py",
+                        "contract.py",
+                        "display.py",
+                    )
+                ],
+            ],
+        )
+        for source, _destination in entries:
+            self.assertTrue(Path(source).is_absolute())
+            self.assertTrue(Path(source).is_file())
+
+    def test_missing_worker_helper_aborts_collection(self):
+        from build import VS_WORKER_SUPPORT_FILES, _collect_vs_worker_support_files
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for relative in VS_WORKER_SUPPORT_FILES[:-1]:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# test", encoding="utf-8")
+
+            with self.assertRaisesRegex(FileNotFoundError, "display.py"):
+                _collect_vs_worker_support_files(root)
+
+    def test_ci_extracts_media_before_tests_and_self_tests_frozen_worker(self):
+        workflow = Path(".github/workflows/build-app.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertLess(
+            workflow.index("- name: Extract media tools"),
+            workflow.index("- name: Run Python tests"),
+        )
+        self.assertIn("vs_worker.exe", workflow)
+        self.assertIn("SyncVSWorkerProcess", workflow)
+        self.assertIn("--self-test", workflow)
+        for artifact in (
+            "ArknightsPassMaker/tools/media/vapoursynth.pyd",
+            "ArknightsPassMaker/tools/media/vapoursynth.dll",
+            "ArknightsPassMaker/tools/media/portable.vs",
+            "ArknightsPassMaker/tools/media/vs-plugins/LSMASHSource.dll",
+            "ArknightsPassMaker/tools/media/vs-plugins/libimwri.dll",
+            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/job_api.py",
+            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/display.py",
+        ):
+            with self.subTest(artifact=artifact):
+                self.assertIn(artifact, workflow)
+        self.assertIn('"中文自测" in message', workflow)
+        self.assertIn("len(message) > 65_536", workflow)
+
     def test_installer_upgrade_preserves_legacy_until_migration(self):
         from core.vs_runtime.migration import migrate_legacy_vsconfig_once
 

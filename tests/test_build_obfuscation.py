@@ -62,6 +62,31 @@ class BuildObfuscationTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_executable_specs_keep_gui_and_add_console_worker(self):
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            source = root / "obfuscated"
+            source.mkdir()
+
+            specs = build._executable_specs(
+                source_root=str(source),
+                project_root=str(root),
+                gui_base="gui",
+            )
+
+        self.assertEqual(len(specs), 2)
+        self.assertEqual(specs[0]["target_name"], "ArknightsPassMaker.exe")
+        self.assertEqual(specs[0]["base"], "gui")
+        self.assertEqual(specs[0]["script"], str(source / "main.py"))
+        self.assertEqual(specs[1], {
+            "script": str(root / "vs_worker.py"),
+            "base": None,
+            "target_name": "vs_worker.exe",
+        })
+
+    def test_gui_stays_out_of_obfuscation_entries(self):
+        self.assertNotIn("gui", build.OBFUSCATABLE_ENTRIES)
+
 
 if __name__ == "__main__":
     unittest.main()

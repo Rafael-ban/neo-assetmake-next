@@ -33,6 +33,16 @@ VS_CONTRACT_FILES = (
     "schemas/vs_runtime.schema.json",
     "schemas/vs_job.schema.json",
 )
+VS_WORKER_SUPPORT_FILES = (
+    "resources/vapoursynth/assetmaker_runner.vpy",
+    "resources/vapoursynth/default_pipeline.vpy",
+    "resources/vapoursynth/python/assetmaker_vs/__init__.py",
+    "resources/vapoursynth/python/assetmaker_vs/job_api.py",
+    "resources/vapoursynth/python/assetmaker_vs/script_header.py",
+    "resources/vapoursynth/python/assetmaker_vs/executor.py",
+    "resources/vapoursynth/python/assetmaker_vs/contract.py",
+    "resources/vapoursynth/python/assetmaker_vs/display.py",
+)
 
 
 def get_version() -> str:
@@ -409,6 +419,42 @@ def _collect_vs_contract_include_files(project_root):
     return include_files
 
 
+def _collect_vs_worker_support_files(project_root):
+    """验证 worker/runner 共用的 portable helper 与内置脚本。"""
+    root = os.path.abspath(os.fspath(project_root))
+    entries = [
+        (os.path.join(root, *relative.split("/")), relative)
+        for relative in VS_WORKER_SUPPORT_FILES
+    ]
+    missing = [source for source, _ in entries if not os.path.isfile(source)]
+    if missing:
+        raise FileNotFoundError(
+            "Required VS worker support files missing: " + ", ".join(missing)
+        )
+    return entries
+
+
+def _executable_specs(source_root, project_root, gui_base):
+    """返回可单测的 GUI/worker cx_Freeze executable 参数。"""
+    source = os.path.abspath(os.fspath(source_root))
+    project = os.path.abspath(os.fspath(project_root))
+    gui = {
+        "script": os.path.join(source, MAIN_SCRIPT),
+        "base": gui_base,
+        "target_name": f"{PROJECT_NAME}.exe",
+    }
+    if os.path.exists(ICON_FILE):
+        gui["icon"] = ICON_FILE
+    return [
+        gui,
+        {
+            "script": os.path.join(project, "vs_worker.py"),
+            "base": None,
+            "target_name": "vs_worker.exe",
+        },
+    ]
+
+
 def run_cxfreeze(skip_flasher=False, source_root=None):
     """执行 cx_Freeze 打包"""
 
@@ -419,6 +465,7 @@ def run_cxfreeze(skip_flasher=False, source_root=None):
         vs_contract_include_files = _collect_vs_contract_include_files(
             project_root
         )
+        vs_worker_support_files = _collect_vs_worker_support_files(project_root)
     except FileNotFoundError as exc:
         print(f"  FATAL: {exc}")
         return False
@@ -602,6 +649,8 @@ def run_cxfreeze(skip_flasher=False, source_root=None):
     include_files.extend(vs_contract_include_files)
     for source_path, contract_path in vs_contract_include_files:
         print(f"  Including VS contract: {source_path} -> {contract_path}")
+    for source_path, support_path in vs_worker_support_files:
+        print(f"  Verified VS worker support: {source_path} -> {support_path}")
     for runtime_name, runtime_path in pyarmor_runtimes:
         include_files.append((runtime_path, runtime_name))
         print(f"  Including PyArmor runtime: {runtime_path}")
@@ -668,12 +717,8 @@ def run_cxfreeze(skip_flasher=False, source_root=None):
             description="Arknights Pass Material Maker",
             options={"build_exe": build_options},
             executables=[
-                Executable(
-                    script=os.path.join(source_root, MAIN_SCRIPT),
-                    base=base,
-                    target_name=f"{PROJECT_NAME}.exe",
-                    icon=ICON_FILE if os.path.exists(ICON_FILE) else None,
-                )
+                Executable(**spec)
+                for spec in _executable_specs(source_root, project_root, base)
             ],
             script_args=["build"],
         )

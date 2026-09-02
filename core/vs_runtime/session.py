@@ -1,0 +1,319 @@
+"""VapourSynth worker 会话的不可变宿主模型。"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+from core.vs_runtime.protocol import ProtocolError
+from core.vs_runtime.script_header import ScriptHeader
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_NODE_FIELDS = {
+    "width",
+    "height",
+    "num_frames",
+    "fps_num",
+    "fps_den",
+    "pixel_format",
+    "matrix",
+    "transfer",
+    "primaries",
+    "range",
+}
+
+
+def _wire_error(message: str, code: str) -> ProtocolError:
+    return ProtocolError(message, code=code)
+
+
+def _strict_object(value: Any, fields: set[str], location: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise _wire_error(
+            f"{location} 字段不完整或包含未知字段",
+            "protocol.invalid_metadata",
+        )
+    return value
+
+
+def _positive_int(value: Any, location: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise _wire_error(
+            f"{location} 必须是严格正整数",
+            "protocol.invalid_metadata",
+        )
+    return value
+
+
+def _nonempty_string(value: Any, location: str) -> str:
+    if type(value) is not str or not value:
+        raise _wire_error(
+            f"{location} 必须是非空字符串",
+            "protocol.invalid_metadata",
+        )
+    return value
+
+
+def _sha256(value: Any, field: str) -> str:
+    if type(value) is not str or _SHA256_RE.fullmatch(value) is None:
+        raise ValueError(f"{field} 必须是小写 SHA-256")
+    return value
+
+
+def _absolute_path(value: Any, field: str) -> str:
+    if type(value) is not str or not value:
+        raise ValueError(f"{field} 必须是非空绝对路径")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"{field} 必须是绝对路径")
+    return str(path.resolve())
+
+
+@dataclass(frozen=True)
+class NodeMetadata:
+    width: int
+    height: int
+    num_frames: int
+    fps_num: int
+    fps_den: int
+    pixel_format: str
+    matrix: str | None
+    transfer: str | None
+    primaries: str | None
+    range: Literal["limited", "full"] | None
+
+    @classmethod
+    def from_wire(
+        cls, value: Any, *, require_colour: bool
+    ) -> "NodeMetadata":
+        data = _strict_object(value, _NODE_FIELDS, "node metadata")
+        values = {
+            field: _positive_int(data[field], f"node.{field}")
+            for field in ("width", "height", "num_frames", "fps_num", "fps_den")
+        }
+        pixel_format = _nonempty_string(data["pixel_format"], "node.pixel_format")
+        colour: dict[str, str | None] = {}
+        for field in ("matrix", "transfer", "primaries"):
+            item = data[field]
+            if item is None and not require_colour:
+                colour[field] = None
+            else:
+                colour[field] = _nonempty_string(item, f"node.{field}")
+        range_ = data["range"]
+        if range_ is None and not require_colour:
+            pass
+        elif range_ not in ("limited", "full"):
+            raise _wire_error(
+                "node.range 必须是 limited/full 或允许位置的 null",
+                "protocol.invalid_metadata",
+            )
+        return cls(
+            **values,
+            pixel_format=pixel_format,
+            matrix=colour["matrix"],
+            transfer=colour["transfer"],
+            primaries=colour["primaries"],
+            range=range_,
+        )
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "width": self.width,
+            "height": self.height,
+            "num_frames": self.num_frames,
+            "fps_num": self.fps_num,
+            "fps_den": self.fps_den,
+            "pixel_format": self.pixel_format,
+            "matrix": self.matrix,
+            "transfer": self.transfer,
+            "primaries": self.primaries,
+            "range": self.range,
+        }
+
+
+@dataclass(frozen=True)
+class SessionMetadata:
+    epoch: int
+    mode: Literal["compatible", "raw"]
+    capabilities: frozenset[str]
+    output0: NodeMetadata
+    editor: NodeMetadata | None
+
+    @classmethod
+    def from_wire(cls, value: Any) -> "SessionMetadata":
+        data = _strict_object(
+            value,
+            {"epoch", "mode", "capabilities", "output0", "editor"},
+            "session metadata",
+        )
+        epoch = _positive_int(data["epoch"], "metadata.epoch")
+        mode = data["mode"]
+        if mode not in ("compatible", "raw"):
+            raise _wire_error(
+                "metadata.mode 必须是 compatible/raw",
+                "protocol.invalid_metadata",
+            )
+        capabilities = data["capabilities"]
+        if (
+            not isinstance(capabilities, list)
+            or any(type(item) is not str or not item for item in capabilities)
+            or len(capabilities) != len(set(capabilities))
+        ):
+            raise _wire_error(
+                "metadata.capabilities 必须是不重复的非空字符串数组",
+                "protocol.invalid_metadata",
+            )
+        editor_wire = data["editor"]
+        editor = (
+            None
+            if editor_wire is None
+            else NodeMetadata.from_wire(editor_wire, require_colour=False)
+        )
+        return cls(
+            epoch=epoch,
+            mode=mode,
+            capabilities=frozenset(capabilities),
+            output0=NodeMetadata.from_wire(
+                data["output0"], require_colour=True
+            ),
+            editor=editor,
+        )
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "epoch": self.epoch,
+            "mode": self.mode,
+            "capabilities": sorted(self.capabilities),
+            "output0": self.output0.to_wire(),
+            "editor": None if self.editor is None else self.editor.to_wire(),
+        }
+
+
+@dataclass(frozen=True)
+class ScriptSelection:
+    script_path: str
+    mode: Literal["compatible", "raw"]
+    bundle_hash: str
+    api_version: int = 1
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "script_path", _absolute_path(self.script_path, "script_path")
+        )
+        if self.mode not in ("compatible", "raw"):
+            raise ValueError("mode 必须是 compatible/raw")
+        if type(self.api_version) is not int or self.api_version != 1:
+            raise ValueError("api_version 必须是严格整数 1")
+        _sha256(self.bundle_hash, "bundle_hash")
+
+    @classmethod
+    def from_header(
+        cls,
+        script_path: str | Path,
+        header: ScriptHeader,
+        bundle_hash: str,
+    ) -> "ScriptSelection":
+        if not isinstance(header, ScriptHeader):
+            raise TypeError("header 必须是 ScriptHeader")
+        return cls(
+            script_path=str(Path(script_path).resolve()),
+            mode=header.mode,
+            bundle_hash=bundle_hash,
+            api_version=header.api_version,
+        )
+
+
+@dataclass(frozen=True)
+class RenderSession:
+    epoch: int
+    track: Literal["loop", "intro"]
+    selection: ScriptSelection
+    job_path: str
+    runtime_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if type(self.epoch) is not int or self.epoch <= 0:
+            raise ValueError("epoch 必须是严格正整数")
+        if self.track not in ("loop", "intro"):
+            raise ValueError("track 必须是 loop/intro")
+        if not isinstance(self.selection, ScriptSelection):
+            raise TypeError("selection 必须是 ScriptSelection")
+        object.__setattr__(
+            self, "job_path", _absolute_path(self.job_path, "job_path")
+        )
+        _sha256(self.runtime_fingerprint, "runtime_fingerprint")
+
+    def to_load_message(self, request_id: int) -> dict[str, Any]:
+        if type(request_id) is not int or request_id <= 0:
+            raise ValueError("request_id 必须是严格正整数")
+        return {
+            "type": "load",
+            "request_id": request_id,
+            "api_version": self.selection.api_version,
+            "track": self.track,
+            "epoch": self.epoch,
+            "script_path": self.selection.script_path,
+            "job_path": self.job_path,
+            "bundle_hash": self.selection.bundle_hash,
+            "runtime_fingerprint": self.runtime_fingerprint,
+            "mode": self.selection.mode,
+        }
+
+
+def resolve_worker_command(app_dir: str | Path) -> list[str]:
+    """返回源码或冻结构建的绝对 worker 命令数组。"""
+    root = Path(app_dir).resolve()
+    if getattr(sys, "frozen", False):
+        return [str((root / "vs_worker.exe").resolve())]
+    return [
+        str(Path(sys.executable).resolve()),
+        "-B",
+        str((root / "vs_worker.py").resolve()),
+    ]
+
+
+def compute_script_bundle_hash(script_path: str | Path) -> str:
+    """计算脚本根内 `.vpy/.py` 的稳定代码 bundle SHA-256。"""
+    script = Path(script_path).resolve(strict=True)
+    root = script.parent
+    files = [
+        path.resolve(strict=True)
+        for path in root.rglob("*")
+        if path.is_file() and path.suffix.casefold() in {".vpy", ".py"}
+    ]
+    relative_files: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for path in files:
+        try:
+            relative = path.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"脚本 bundle 文件逃逸根目录: {path}") from exc
+        collision_key = relative.casefold()
+        if collision_key in seen:
+            raise ValueError(f"脚本 bundle 存在大小写碰撞: {relative}")
+        seen.add(collision_key)
+        relative_files.append((relative, path))
+    relative_files.sort(key=lambda item: item[0].encode("utf-8"))
+    digest = hashlib.sha256()
+    for relative, path in relative_files:
+        data = path.read_bytes()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    return digest.hexdigest()
+
+
+__all__ = [
+    "NodeMetadata",
+    "RenderSession",
+    "ScriptSelection",
+    "SessionMetadata",
+    "compute_script_bundle_hash",
+    "resolve_worker_command",
+]

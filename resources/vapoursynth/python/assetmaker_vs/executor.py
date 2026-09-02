@@ -203,13 +203,29 @@ def _retirement_error(
     )
 
 
+def _graph_retirement_error(
+    result: _ModuleRetirementResult,
+) -> GraphLifecycleError:
+    return GraphLifecycleError(
+        "图退休未完全完成，已继续处理其余退休项",
+        code="executor.retirement_failed",
+        field="graph",
+        expected="all output, environment, module and cache cleanup completed",
+        actual={
+            "failure_count": result.failure_count,
+            "diagnostics": result.diagnostics,
+        },
+        hint="检查 VapourSynth outputs、执行环境与嵌入模块退休行为",
+    )
+
+
 def _stage_retirement_error(
     operation: str, target: str, error: BaseException
 ) -> GraphLifecycleError:
     diagnostic = _bounded_diagnostic(
         f"{operation}: {target}: {_exception_type_name(error)}"
     )
-    return _retirement_error(
+    return _graph_retirement_error(
         _ModuleRetirementResult(
             removed=(),
             failure_count=1,
@@ -345,60 +361,102 @@ def evict_modules_under(script_root: str | os.PathLike[str]) -> tuple[str, ...]:
 
 
 def _close_execution_environment(
-    environment: "ExecutionEnvironment", script_root: Path
+    environment: "ExecutionEnvironment",
+    script_root: Path,
+    clear_outputs: Callable[[], None] | None,
 ) -> tuple[str, ...]:
     retirement: _ModuleRetirementPlan | None = None
-    retirement_failure: BaseException | None = None
-    environment_failure: BaseException | None = None
-    cache_failure: BaseException | None = None
     removed: tuple[str, ...] = ()
+    failure_count = 0
+    diagnostics: list[str] = []
+
+    def record_failure(
+        operation: str, target: str, error: BaseException
+    ) -> None:
+        nonlocal failure_count
+        failure_count += 1
+        if len(diagnostics) >= MAX_RETIREMENT_DIAGNOSTICS:
+            return
+        diagnostics.append(
+            _bounded_diagnostic(
+                f"{operation}: {target}: {_exception_type_name(error)}"
+            )
+        )
+
+    if clear_outputs is not None:
+        try:
+            clear_outputs()
+        except BaseException as error:
+            record_failure("清空 VapourSynth outputs", "output registry", error)
+
     try:
         retirement = _capture_module_retirement(script_root)
     except BaseException as error:
-        retirement_failure = _stage_retirement_error(
-            "捕获退休计划", "script_root", error
-        )
+        record_failure("捕获退休计划", "script_root", error)
 
     try:
         environment.close()
     except BaseException as error:
-        environment_failure = error
+        record_failure("关闭执行环境", "sys.path", error)
 
     if retirement is not None:
         try:
             result = retirement.retire()
         except BaseException as error:
-            retirement_failure = _stage_retirement_error(
-                "执行退休计划", "script_root", error
-            )
+            record_failure("执行退休计划", "script_root", error)
         else:
             removed = result.removed
-            if result.failure_count:
-                retirement_failure = _retirement_error(result)
+            failure_count += result.failure_count
+            available = MAX_RETIREMENT_DIAGNOSTICS - len(diagnostics)
+            if available > 0:
+                diagnostics.extend(result.diagnostics[:available])
 
     try:
         importlib.invalidate_caches()
     except BaseException as error:
-        cache_failure = error
+        record_failure("使 import cache 失效", "importlib", error)
 
-    primary_failure = (
-        environment_failure or retirement_failure or cache_failure
-    )
-    if primary_failure is not None:
-        for secondary_failure in (
-            environment_failure,
-            retirement_failure,
-            cache_failure,
-        ):
-            if (
-                secondary_failure is not None
-                and secondary_failure is not primary_failure
-            ):
-                _add_cleanup_diagnostic(
-                    primary_failure, secondary_failure
-                )
-        raise primary_failure
+    if failure_count:
+        raise _graph_retirement_error(
+            _ModuleRetirementResult(
+                removed=removed,
+                failure_count=failure_count,
+                diagnostics=tuple(diagnostics),
+            )
+        )
     return removed
+
+
+def _retire_graph_resources(
+    *,
+    environment: "ExecutionEnvironment",
+    script_root: Path,
+    clear_outputs: Callable[[], None] | None,
+    lease: _GraphLease,
+) -> None:
+    retirement_failure: BaseException | None = None
+    try:
+        _close_execution_environment(
+            environment,
+            script_root,
+            clear_outputs,
+        )
+    except BaseException as error:
+        retirement_failure = error
+
+    try:
+        lease.release()
+    except BaseException as error:
+        lease_failure = _stage_retirement_error(
+            "释放图租约", "script_root", error
+        )
+        if retirement_failure is None:
+            retirement_failure = lease_failure
+        else:
+            _add_cleanup_diagnostic(retirement_failure, lease_failure)
+
+    if retirement_failure is not None:
+        raise retirement_failure
 
 
 class ExecutionEnvironment:
@@ -506,6 +564,7 @@ class ExecutedGraph:
     outputs: Mapping[int, Any]
     script_root: Path
     environment: ExecutionEnvironment
+    _clear_outputs: Callable[[], None] = field(repr=False)
     _lease: _GraphLease = field(repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
     _close_lock: threading.RLock = field(
@@ -518,10 +577,12 @@ class ExecutedGraph:
             if self._closed:
                 return
             self._closed = True
-            try:
-                _close_execution_environment(self.environment, self.script_root)
-            finally:
-                self._lease.release()
+            _retire_graph_resources(
+                environment=self.environment,
+                script_root=self.script_root,
+                clear_outputs=self._clear_outputs,
+                lease=self._lease,
+            )
 
 
 def execute_user_script(
@@ -541,12 +602,14 @@ def execute_user_script(
     )
     environment = ExecutionEnvironment(search_paths)
     lease = _acquire_graph_lease(script.parent)
+    clear_outputs: Callable[[], None] | None = None
     try:
         import vapoursynth as vs
 
+        clear_outputs = vs.clear_outputs
         evict_modules_under(script.parent)
         importlib.invalidate_caches()
-        vs.clear_outputs()
+        clear_outputs()
         namespace = {
             "__name__": "__vapoursynth__",
             "__file__": str(script),
@@ -564,16 +627,20 @@ def execute_user_script(
             outputs=outputs,
             script_root=script.parent,
             environment=environment,
+            _clear_outputs=clear_outputs,
             _lease=lease,
         )
     except BaseException as execution_error:
         cleanup_error: BaseException | None = None
         try:
-            _close_execution_environment(environment, script.parent)
+            _retire_graph_resources(
+                environment=environment,
+                script_root=script.parent,
+                clear_outputs=clear_outputs,
+                lease=lease,
+            )
         except BaseException as error:
             cleanup_error = error
-        finally:
-            lease.release()
         if cleanup_error is not None:
             _add_cleanup_diagnostic(execution_error, cleanup_error)
         raise

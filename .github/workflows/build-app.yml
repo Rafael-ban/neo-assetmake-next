@@ -123,12 +123,6 @@ jobs:
           fi
           uv run --no-sync python -c "import OpenGL, cv2, PyQt6, numpy, requests; import core.rndis_device_service, core.http_remote_service, gui.workers.rndis_http_workers; print('All packages OK')"
 
-      - name: Run Python tests
-        shell: bash
-        run: |
-          uv run --no-sync python -m compileall main.py config core gui utils _mext build.py tests
-          uv run --no-sync python -m unittest discover -s tests -p "test_*.py"
-
       - name: Cache media tools
         uses: actions/cache@v4
         id: cache-media-tools
@@ -195,6 +189,13 @@ jobs:
           $totalSize = (Get-ChildItem tools/media -Recurse | Measure-Object Length -Sum).Sum / 1MB
           Write-Host "Media tools extracted successfully ($($totalSize.ToString('F2')) MB)"
 
+      # M3 worker tests intentionally do not skip without the portable runtime.
+      - name: Run Python tests
+        shell: bash
+        run: |
+          uv run --no-sync python -m compileall main.py config core gui utils _mext build.py tests resources/vapoursynth/python
+          uv run --no-sync python -m unittest discover -s tests -p "test_*.py"
+
       - name: Install Inno Setup
         shell: pwsh
         run: |
@@ -210,6 +211,60 @@ jobs:
         env:
           # qfluentwidgets 等第三方库触发的 SyntaxWarning
           PYTHONWARNINGS: "ignore::SyntaxWarning"
+
+      - name: Verify frozen VapourSynth worker pipe
+        shell: pwsh
+        run: |
+          $requiredArtifacts = @(
+            "ArknightsPassMaker/vs_worker.exe",
+            "ArknightsPassMaker/config/vs_runtime.json",
+            "ArknightsPassMaker/tools/media/vapoursynth.pyd",
+            "ArknightsPassMaker/tools/media/vapoursynth.dll",
+            "ArknightsPassMaker/tools/media/portable.vs",
+            "ArknightsPassMaker/tools/media/vs-plugins/LSMASHSource.dll",
+            "ArknightsPassMaker/tools/media/vs-plugins/libimwri.dll",
+            "ArknightsPassMaker/resources/vapoursynth/assetmaker_runner.vpy",
+            "ArknightsPassMaker/resources/vapoursynth/default_pipeline.vpy",
+            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/__init__.py",
+            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/job_api.py",
+            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/script_header.py",
+            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/executor.py",
+            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/contract.py",
+            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/display.py"
+          )
+          foreach ($artifact in $requiredArtifacts) {
+            if (-not (Test-Path $artifact)) {
+              Write-Error "Required frozen artifact not found: $artifact"
+              exit 1
+            }
+          }
+          Write-Host "Running vs_worker.exe --self-test through WorkerProcess..."
+          $code = @'
+          from pathlib import Path
+          from core.vs_runtime.worker_process import SyncVSWorkerProcess
+
+          root = Path("ArknightsPassMaker").resolve()
+          worker = (root / "vs_worker.exe").resolve()
+          client = SyncVSWorkerProcess(
+              app_dir=root, command=[str(worker)], self_test=True
+          )
+          try:
+              ready = client.start(timeout_ms=15_000)
+              assert ready["operation"] == "hello"
+              unicode_logs = [
+                  message
+                  for _level, message in client.logs
+                  if "中文自测" in message
+              ]
+              assert any(len(message) > 65_536 for message in unicode_logs)
+              stopped = client.shutdown(timeout_ms=10_000)
+              assert stopped["operation"] == "shutdown"
+              assert client.wait(timeout_ms=10_000) == 0
+          finally:
+              client.close()
+          print("Frozen worker binary PIPE/Unicode/exit-0 self-test OK")
+          '@
+          uv run --no-sync python -c $code
 
       - name: Debug exe outputs
         shell: pwsh
