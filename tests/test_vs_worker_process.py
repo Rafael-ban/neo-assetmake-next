@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -368,7 +369,7 @@ class WorkerProcessTransportTests(unittest.TestCase):
         fake.stderr = ChunkStream()
         done = threading.Event()
 
-        process._stderr_loop(fake, 3, done)
+        process._stderr_loop(fake, 3, done, process._stderr_tail)
 
         self.assertTrue(done.is_set())
         self.assertGreater(len(process._stderr_tail), 1)
@@ -376,6 +377,26 @@ class WorkerProcessTransportTests(unittest.TestCase):
             max(len(item.encode("utf-8")) for item in process._stderr_tail),
             65_600,
         )
+
+    def test_old_stderr_reader_cannot_write_into_current_generation_tail(self):
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        old_tail = deque(maxlen=64)
+        current_tail = deque(["new-generation"], maxlen=64)
+        process._stderr_tail = current_tail
+        fake = mock.Mock()
+        fake.stderr = io.BytesIO(b"old-generation\n")
+        done = threading.Event()
+
+        try:
+            process._stderr_loop(fake, 1, done, old_tail)
+        except TypeError as error:
+            self.fail(f"stderr reader 必须显式接收本代 deque: {error}")
+
+        self.assertTrue(done.is_set())
+        self.assertEqual(tuple(old_tail), ("old-generation",))
+        self.assertEqual(tuple(current_tail), ("new-generation",))
 
     def test_default_app_dir_does_not_depend_on_process_cwd(self):
         from utils.file_utils import get_app_dir
@@ -1165,6 +1186,108 @@ class WorkerServerFrameTests(unittest.TestCase):
             display_clip=None,
         )
 
+    def test_load_uses_bundle_snapshot_frozen_before_retirement_wait(self):
+        from core.vs_runtime.worker_main import WorkerServer
+
+        messages = []
+
+        class Writer:
+            def send(self, message):
+                messages.append(message)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            script = root / "pipeline.vpy"
+            helper = root / "helper.py"
+            job = root / "job.json"
+            script.write_text(
+                _valid_script(compatible=False, extra="# SAFE_SCRIPT\n"),
+                encoding="utf-8",
+            )
+            helper.write_text("VALUE = 'SAFE_HELPER'\n", encoding="utf-8")
+            _write_job(job, epoch=7)
+            session = _session(script, job, epoch=7)
+            server = WorkerServer(writer=Writer(), app_dir=ROOT, self_test=False)
+            original_retire = server._retire_current
+
+            def mutate_source_during_retirement(*args, **kwargs):
+                script.write_text(
+                    _valid_script(
+                        compatible=False,
+                        extra="# CHANGED_SCRIPT\n",
+                    ),
+                    encoding="utf-8",
+                )
+                helper.write_text(
+                    "VALUE = 'CHANGED_HELPER'\n", encoding="utf-8"
+                )
+                changed_job = json.loads(job.read_text(encoding="utf-8"))
+                changed_job["mutation"] = "CHANGED_JOB"
+                job.write_text(
+                    json.dumps(changed_job, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                return original_retire(*args, **kwargs)
+
+            server._retire_current = mutate_source_during_retirement
+            consumed = {}
+            graph = mock.Mock()
+
+            def execute_snapshot(**kwargs):
+                snapshot_script = Path(kwargs["script_path"])
+                snapshot_job = Path(kwargs["job_path"])
+                consumed.update(
+                    script_path=snapshot_script,
+                    script=snapshot_script.read_text(encoding="utf-8"),
+                    helper=(snapshot_script.parent / "helper.py").read_text(
+                        encoding="utf-8"
+                    ),
+                    job=json.loads(snapshot_job.read_text(encoding="utf-8")),
+                )
+                return graph
+
+            clip = SimpleNamespace(
+                width=384,
+                height=640,
+                num_frames=3,
+                fps_num=30_000,
+                fps_den=1_001,
+                format=SimpleNamespace(name="YUV420P8"),
+            )
+            outputs = SimpleNamespace(guarded_clip=clip, editor_clip=None)
+            with (
+                mock.patch.object(
+                    server,
+                    "_ensure_vs",
+                    return_value=SimpleNamespace(core=SimpleNamespace()),
+                ),
+                mock.patch(
+                    "resources.vapoursynth.python.assetmaker_vs.contract.verify_required_callables"
+                ),
+                mock.patch(
+                    "resources.vapoursynth.python.assetmaker_vs.executor.execute_user_script",
+                    side_effect=execute_snapshot,
+                ),
+                mock.patch(
+                    "resources.vapoursynth.python.assetmaker_vs.contract.validate_outputs",
+                    return_value=outputs,
+                ),
+            ):
+                server._handle_load(session.to_load_message(1))
+
+            self.assertNotEqual(consumed["script_path"], script)
+            self.assertIn("SAFE_SCRIPT", consumed["script"])
+            self.assertNotIn("CHANGED_SCRIPT", consumed["script"])
+            self.assertEqual(consumed["helper"], "VALUE = 'SAFE_HELPER'\n")
+            self.assertNotIn("mutation", consumed["job"])
+            snapshot_root = consumed["script_path"].parent.parent
+            self.assertTrue(snapshot_root.is_dir())
+
+            original_retire(99)
+
+            self.assertFalse(snapshot_root.exists())
+            self.assertEqual(messages[-1]["type"], "metadata")
+
     def test_runtime_change_since_worker_start_requires_fresh_process(self):
         from core.vs_runtime.worker_main import WorkerServer
 
@@ -1279,6 +1402,7 @@ class WorkerServerFrameTests(unittest.TestCase):
         server.app_dir = ROOT
         server.runtime = load_vs_runtime()
         server.runtime_fingerprint = "a" * 64
+        snapshot = mock.Mock()
         server._prepare_load = mock.Mock(
             return_value=(
                 3,
@@ -1286,6 +1410,7 @@ class WorkerServerFrameTests(unittest.TestCase):
                 {"requires": []},
                 ROOT / "pipeline.vpy",
                 str(ROOT / "job.json"),
+                snapshot,
             )
         )
         server._retire_current = mock.Mock()
@@ -1318,6 +1443,7 @@ class WorkerServerFrameTests(unittest.TestCase):
         self.assertEqual(type(raised.exception).__name__, "_FatalWorkerExit")
         self.assertEqual(raised.exception.exit_code, 73)
         server._send_error.assert_called_once()
+        snapshot.close.assert_called_once_with()
         verify_required_callables.assert_not_called()
         execute_user_script.assert_not_called()
 
@@ -1478,6 +1604,64 @@ class WorkerServerFrameTests(unittest.TestCase):
         self.assertEqual(sent["epoch"], 7)
         self.assertEqual(sent["slot_name"], "frame-slot")
         self.assertEqual(sent["slot_generation"], 4)
+
+    def test_invalid_surface_terminal_keeps_slot_identity_for_host_release(self):
+        messages = []
+
+        class Writer:
+            def send(self, message):
+                encode_message(message)
+                messages.append(message)
+
+        host = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        fake_process = mock.Mock()
+        fake_process.poll.return_value = None
+        host._process = fake_process
+        host._exit_event.clear()
+        slot = mock.Mock()
+        slot.descriptor = SimpleNamespace(
+            name="host-frame-slot",
+            generation=41,
+            capacity=12,
+            to_wire=lambda: {
+                "name": "host-frame-slot",
+                "generation": 41,
+                "capacity": 12,
+            },
+        )
+        with mock.patch(
+            "core.vs_runtime.worker_process.FrameSlot.create",
+            return_value=slot,
+        ):
+            request_id = host.request_frame(
+                epoch=7,
+                index=0,
+                surface="final",
+                viewport=(2, 2),
+                zoom_factor=1.0,
+                pan=(0.5, 0.5),
+            )
+        _generation, encoded = host._write_queue.get_nowait()
+        request = MessageDecoder().feed(encoded)[0]
+        request["surface"] = "invalid-surface"
+
+        server = self._server(Writer())
+        server._handle_frame(request)
+
+        self.assertEqual(len(messages), 1)
+        response = messages[0]
+        self.assertEqual(response["type"], "request_error")
+        self.assertEqual(response["request_id"], request_id)
+        self.assertEqual(response["epoch"], 7)
+        self.assertEqual(response["slot_name"], "host-frame-slot")
+        self.assertEqual(response["slot_generation"], 41)
+
+        host._handle_message(response, host.generation)
+
+        slot.close.assert_called_once_with()
+        self.assertNotIn(request_id, host._pending)
 
     def test_invalid_unicode_callback_error_still_sends_one_terminal(self):
         from core.vs_runtime.worker_main import ProtocolWriter

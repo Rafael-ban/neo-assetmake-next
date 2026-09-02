@@ -146,6 +146,7 @@ class _LoadedGraph:
     header: dict[str, Any]
     graph: Any
     outputs: Any
+    snapshot: Any
 
 
 @dataclass
@@ -537,8 +538,11 @@ class WorkerServer:
 
     def _prepare_load(
         self, message: dict[str, Any]
-    ) -> tuple[int, dict[str, Any], dict[str, Any], Path, str]:
-        from core.vs_runtime.session import compute_script_bundle_hash
+    ) -> tuple[int, dict[str, Any], dict[str, Any], Path, str, Any]:
+        from core.vs_runtime.session import (
+            ScriptBundleSnapshot,
+            compute_script_bundle_hash,
+        )
 
         request_id = _validate_request_fields(
             message,
@@ -586,40 +590,69 @@ class WorkerServer:
                     f"{field} 必须是小写 SHA-256",
                     code="protocol.invalid_request",
                 )
-        script_path = Path(message["script_path"]).resolve(strict=True)
-        job_path = Path(message["job_path"]).resolve(strict=True)
-        actual_bundle = compute_script_bundle_hash(script_path)
-        if actual_bundle != message["bundle_hash"]:
-            raise ProtocolError(
-                "脚本 bundle 在执行前发生变化",
-                code="worker.bundle_mismatch",
-            )
-        self._assert_runtime_unchanged(message["runtime_fingerprint"])
-        from resources.vapoursynth.python.assetmaker_vs.job_api import load_job
-        from resources.vapoursynth.python.assetmaker_vs.script_header import (
-            parse_script_header,
-            validate_invocation,
+        snapshot = ScriptBundleSnapshot.create(
+            message["script_path"], message["job_path"]
         )
-
-        # helper import 可能跨越文件更新；在读取 job/header 前再次核验，
-        # 后续还会在 VS 与全部执行 helper 就绪后做最终核验。
-        self._assert_runtime_unchanged(message["runtime_fingerprint"])
-
-        job = load_job(job_path)
-        header = parse_script_header(script_path)
-        comparisons = (
-            ("job.api_version", job["api_version"], api_version),
-            ("job.track", job["track"], track),
-            ("job.epoch", job["epoch"], epoch),
-        )
-        for field, actual, expected in comparisons:
-            if type(actual) is not type(expected) or actual != expected:
+        try:
+            actual_bundle = compute_script_bundle_hash(snapshot.script_path)
+            if actual_bundle != message["bundle_hash"]:
                 raise ProtocolError(
-                    f"{field} 与 load message 不一致",
-                    code="worker.identity_mismatch",
+                    "脚本 bundle 在执行前发生变化",
+                    code="worker.bundle_mismatch",
                 )
-        validate_invocation(header, api_version=api_version, mode=mode)
-        return request_id, job, header, script_path, str(job_path)
+            self._assert_runtime_unchanged(message["runtime_fingerprint"])
+            from resources.vapoursynth.python.assetmaker_vs.job_api import (
+                load_job,
+            )
+            from resources.vapoursynth.python.assetmaker_vs.script_header import (
+                parse_script_header,
+                validate_invocation,
+            )
+
+            # helper import 可能跨越文件更新；在读取 job/header 前再次核验，
+            # 后续还会在 VS 与全部执行 helper 就绪后做最终核验。
+            self._assert_runtime_unchanged(message["runtime_fingerprint"])
+
+            job = load_job(snapshot.job_path)
+            header = parse_script_header(snapshot.script_path)
+            comparisons = (
+                ("job.api_version", job["api_version"], api_version),
+                ("job.track", job["track"], track),
+                ("job.epoch", job["epoch"], epoch),
+            )
+            for field, actual, expected in comparisons:
+                if type(actual) is not type(expected) or actual != expected:
+                    raise ProtocolError(
+                        f"{field} 与 load message 不一致",
+                        code="worker.identity_mismatch",
+                    )
+            validate_invocation(header, api_version=api_version, mode=mode)
+            return (
+                request_id,
+                job,
+                header,
+                snapshot.script_path,
+                str(snapshot.job_path),
+                snapshot,
+            )
+        except BaseException:
+            snapshot.close()
+            raise
+
+    @staticmethod
+    def _close_snapshot(snapshot: Any, error: BaseException) -> bool:
+        try:
+            snapshot.close()
+        except BaseException as cleanup_error:
+            try:
+                error.add_note(
+                    "执行快照清理阶段另有异常："
+                    f"[{getattr(cleanup_error, 'code', type(cleanup_error).__name__)}]"
+                )
+            except BaseException:
+                pass
+            return False
+        return True
 
     def _retire_current(
         self, request_id: int, *, response_epoch: int | None = None
@@ -651,24 +684,45 @@ class WorkerServer:
                 self._condition.wait(remaining)
             self._loaded = None
             self._cancelled_epochs.discard(loaded.epoch)
+        failure: BaseException | None = None
         try:
             loaded.graph.close()
         except BaseException as error:
+            failure = error
+        try:
+            loaded.snapshot.close()
+        except BaseException as error:
+            if failure is None:
+                failure = error
+            else:
+                try:
+                    failure.add_note(
+                        "执行快照清理阶段另有异常："
+                        f"[{getattr(error, 'code', type(error).__name__)}]"
+                    )
+                except BaseException:
+                    pass
+        if failure is not None:
             self._send_error(
                 "request_error",
                 request_id,
-                error,
+                failure,
                 epoch=response_epoch or loaded.epoch,
             )
-            raise _FatalWorkerExit(FATAL_RETIREMENT_EXIT) from error
+            raise _FatalWorkerExit(FATAL_RETIREMENT_EXIT) from failure
 
     def _handle_load(self, message: dict[str, Any]) -> None:
         epoch = message.get("epoch") if type(message.get("epoch")) is int else None
         request_id = _strict_positive_int(message.get("request_id"), "request_id")
         try:
-            request_id, job, header, script_path, job_path = self._prepare_load(
-                message
-            )
+            (
+                request_id,
+                job,
+                header,
+                script_path,
+                job_path,
+                snapshot,
+            ) = self._prepare_load(message)
         except BaseException as error:
             self._send_error("request_error", request_id, error, epoch=epoch)
             if (
@@ -677,8 +731,16 @@ class WorkerServer:
             ):
                 raise _FatalWorkerExit(FATAL_RUNTIME_CHANGED_EXIT) from error
             return
-        self._retire_current(request_id, response_epoch=job["epoch"])
-        vs = self._ensure_vs()
+        try:
+            self._retire_current(request_id, response_epoch=job["epoch"])
+        except BaseException as error:
+            self._close_snapshot(snapshot, error)
+            raise
+        try:
+            vs = self._ensure_vs()
+        except BaseException as error:
+            self._close_snapshot(snapshot, error)
+            raise
         from resources.vapoursynth.python.assetmaker_vs.contract import (
             OutputContractError,
             RequirementError,
@@ -695,6 +757,7 @@ class WorkerServer:
             # 的 pyd/DLL/plugin。用户代码执行前必须重新确认三方身份一致。
             self._assert_runtime_unchanged(message["runtime_fingerprint"])
         except ProtocolError as error:
+            self._close_snapshot(snapshot, error)
             self._send_error(
                 "request_error", request_id, error, epoch=job["epoch"]
             )
@@ -703,9 +766,12 @@ class WorkerServer:
         try:
             verify_required_callables(vs.core, header["requires"])
         except RequirementError as error:
+            clean = self._close_snapshot(snapshot, error)
             self._send_error(
                 "requirement_error", request_id, error, epoch=job["epoch"]
             )
+            if not clean:
+                raise _FatalWorkerExit(FATAL_RETIREMENT_EXIT) from error
             return
         try:
             graph = execute_user_script(
@@ -716,10 +782,11 @@ class WorkerServer:
                 python_module_dirs=self.runtime.plugins.python_module_dirs,
             )
         except BaseException as error:
+            clean = self._close_snapshot(snapshot, error)
             self._send_error(
                 "script_error", request_id, error, epoch=job["epoch"]
             )
-            if _has_retirement_failure(error):
+            if not clean or _has_retirement_failure(error):
                 raise _FatalWorkerExit(FATAL_RETIREMENT_EXIT) from error
             return
         try:
@@ -746,6 +813,8 @@ class WorkerServer:
                 except BaseException:
                     pass
                 fatal = _has_retirement_failure(cleanup_error)
+            if not self._close_snapshot(snapshot, response_error):
+                fatal = True
             self._send_error(
                 response_type, request_id, response_error, epoch=job["epoch"]
             )
@@ -758,6 +827,7 @@ class WorkerServer:
             header=header,
             graph=graph,
             outputs=outputs,
+            snapshot=snapshot,
         )
         with self._condition:
             self._loaded = loaded
@@ -786,7 +856,9 @@ class WorkerServer:
             }
         )
 
-    def _frame_request(self, message: dict[str, Any]) -> tuple[int, Any, Any]:
+    def _frame_request_identity(
+        self, message: dict[str, Any]
+    ) -> tuple[int, int, Any]:
         from core.vs_runtime.shared_frame import FrameSlotDescriptor
 
         request_id = _validate_request_fields(
@@ -802,13 +874,23 @@ class WorkerServer:
             },
         )
         epoch = _strict_positive_int(message["epoch"], "epoch")
+        slot = FrameSlotDescriptor.from_wire(message["slot"])
+        return request_id, epoch, slot
+
+    def _frame_request(
+        self,
+        message: dict[str, Any],
+        *,
+        request_id: int,
+        epoch: int,
+        slot: Any,
+    ) -> tuple[int, Any, Any]:
         index = _strict_non_negative_int(message["index"], "index")
         surface = message["surface"]
         if surface not in ("final", "editor"):
             raise ProtocolError(
                 "surface 必须是 final/editor", code="protocol.invalid_request"
             )
-        slot = FrameSlotDescriptor.from_wire(message["slot"])
         display = message["display"]
         if not isinstance(display, dict) or set(display) != {
             "viewport",
@@ -962,7 +1044,15 @@ class WorkerServer:
         slot_descriptor = None
         epoch = message.get("epoch") if type(message.get("epoch")) is int else None
         try:
-            request_id, slot_descriptor, fields = self._frame_request(message)
+            request_id, epoch, slot_descriptor = self._frame_request_identity(
+                message
+            )
+            request_id, slot_descriptor, fields = self._frame_request(
+                message,
+                request_id=request_id,
+                epoch=epoch,
+                slot=slot_descriptor,
+            )
             with self._condition:
                 loaded = self._loaded
                 if fields["epoch"] in self._cancelled_epochs:

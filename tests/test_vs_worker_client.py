@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import unittest
 
@@ -408,6 +409,84 @@ class VSWorkerClientTests(unittest.TestCase):
         self._drain_events()
 
         self.assertEqual(crashes, ["bad wire response"])
+
+    def test_queued_restart_startup_failures_are_single_safe_terminals(self):
+        class FailingRestartTransport(_FakeTransport):
+            def __init__(self, stage):
+                super().__init__()
+                self.stage = stage
+                self.start_count = 0
+
+            def start(self):
+                self.start_count += 1
+                if self.start_count == 2 and self.stage == "spawn":
+                    raise OSError("replacement spawn failed")
+                return super().start()
+
+            def send_request(self, message):
+                if self.generation == 2 and self.stage == "hello":
+                    raise OSError("replacement hello failed")
+                return super().send_request(message)
+
+        for stage in ("spawn", "hello", "timer"):
+            with self.subTest(stage=stage):
+                transport = FailingRestartTransport(stage)
+                timer_calls = 0
+
+                def timer_factory(parent):
+                    nonlocal timer_calls
+                    timer_calls += 1
+                    if stage == "timer" and timer_calls == 3:
+                        raise RuntimeError("replacement timer failed")
+                    return _FakeTimer(parent)
+
+                client = VSWorkerClient(
+                    transport=transport,
+                    worker_config=self.client.worker_config,
+                    timer_factory=timer_factory,
+                )
+                failures = []
+                client.request_failed.connect(
+                    lambda request_id, code, message: failures.append(
+                        (request_id, code, message)
+                    )
+                )
+                uncaught = []
+                original_excepthook = sys.excepthook
+                sys.excepthook = lambda *args: uncaught.append(args)
+                try:
+                    client.start()
+                    client.terminate_and_restart()
+                    transport.emit(
+                        {
+                            "type": "worker_crashed",
+                            "generation": 1,
+                            "message": "old child exited",
+                        }
+                    )
+                    self._drain_events()
+
+                    failed_generation = transport.generation
+                    transport.emit(
+                        {
+                            "type": "worker_crashed",
+                            "generation": failed_generation,
+                            "message": "partial replacement exited",
+                        }
+                    )
+                    self._drain_events()
+                finally:
+                    sys.excepthook = original_excepthook
+                    client.close()
+
+                self.assertEqual(uncaught, [])
+                self.assertEqual(transport.start_count, 2)
+                self.assertEqual(len(failures), 1)
+                self.assertEqual(failures[0][:2], (0, "worker.restart_failed"))
+                self.assertIn(f"replacement {stage} failed", failures[0][2])
+                self.assertEqual(client._timeouts, {})
+                if stage != "spawn":
+                    self.assertGreaterEqual(transport.terminate_count, 2)
 
     def test_large_request_id_is_not_truncated_by_qt_signal(self):
         large = 2**40

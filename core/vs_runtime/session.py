@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import re
+import shutil
+import stat
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -277,8 +280,10 @@ def resolve_worker_command(app_dir: str | Path) -> list[str]:
     ]
 
 
-def compute_script_bundle_hash(script_path: str | Path) -> str:
-    """计算脚本根内 `.vpy/.py` 的稳定代码 bundle SHA-256。"""
+def _read_script_bundle(
+    script_path: str | Path,
+) -> tuple[Path, list[tuple[str, bytes]]]:
+    """一次性读取脚本根内参与 bundle 身份的全部代码。"""
     script = Path(script_path).resolve(strict=True)
     root = script.parent
     files = [
@@ -299,9 +304,14 @@ def compute_script_bundle_hash(script_path: str | Path) -> str:
         seen.add(collision_key)
         relative_files.append((relative, path))
     relative_files.sort(key=lambda item: item[0].encode("utf-8"))
+    return script, [
+        (relative, path.read_bytes()) for relative, path in relative_files
+    ]
+
+
+def _bundle_digest(relative_files: list[tuple[str, bytes]]) -> str:
     digest = hashlib.sha256()
-    for relative, path in relative_files:
-        data = path.read_bytes()
+    for relative, data in relative_files:
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(len(data).to_bytes(8, "big"))
@@ -309,10 +319,74 @@ def compute_script_bundle_hash(script_path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def compute_script_bundle_hash(script_path: str | Path) -> str:
+    """计算脚本根内 `.vpy/.py` 的稳定代码 bundle SHA-256。"""
+    _script, relative_files = _read_script_bundle(script_path)
+    return _bundle_digest(relative_files)
+
+
+@dataclass
+class ScriptBundleSnapshot:
+    """供一次 worker load 独占的代码与 job 磁盘快照。"""
+
+    root_path: Path
+    script_path: Path
+    job_path: Path
+    _closed: bool = False
+
+    @classmethod
+    def create(
+        cls,
+        script_path: str | Path,
+        job_path: str | Path,
+    ) -> "ScriptBundleSnapshot":
+        script, relative_files = _read_script_bundle(script_path)
+        job = Path(job_path).resolve(strict=True)
+        job_bytes = job.read_bytes()
+        root = Path(tempfile.mkdtemp(prefix="assetmaker-vs-snapshot-"))
+        try:
+            bundle_root = root / "bundle"
+            for relative, data in relative_files:
+                target = bundle_root / Path(relative)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            snapshot_job = root / "job.json"
+            snapshot_job.write_bytes(job_bytes)
+            snapshot_script = bundle_root / script.name
+            if not snapshot_script.is_file():
+                raise FileNotFoundError(f"bundle 缺少入口脚本: {script.name}")
+            for path in (*bundle_root.rglob("*"), snapshot_job):
+                if path.is_file():
+                    path.chmod(stat.S_IREAD)
+            return cls(
+                root_path=root,
+                script_path=snapshot_script,
+                job_path=snapshot_job,
+            )
+        except BaseException:
+            cls._remove_tree(root)
+            raise
+
+    @staticmethod
+    def _remove_tree(root: Path) -> None:
+        def make_writable_and_retry(function: Any, path: str, _error: Any) -> None:
+            Path(path).chmod(stat.S_IWRITE)
+            function(path)
+
+        shutil.rmtree(root, onerror=make_writable_and_retry)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._remove_tree(self.root_path)
+        self._closed = True
+
+
 __all__ = [
     "NodeMetadata",
     "RenderSession",
     "ScriptSelection",
+    "ScriptBundleSnapshot",
     "SessionMetadata",
     "compute_script_bundle_hash",
     "resolve_worker_command",

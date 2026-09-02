@@ -177,6 +177,34 @@ class VSWorkerClient(QObject):
         )
         return request_id
 
+    def _report_restart_failure(self, error: BaseException) -> None:
+        """把 queued 自动重启的本地异常收敛为单次稳定 terminal。"""
+        self._restart_requested = False
+        generation = self.transport.generation
+        self._failure_reported_generation = generation
+        try:
+            self._clear_all_timeouts()
+        except BaseException:
+            # 自动重启已失败；timer dispose 也不能再逃逸 Qt slot。
+            pass
+        try:
+            if self.transport.alive:
+                self.transport.terminate()
+        except BaseException:
+            try:
+                self.transport.kill()
+            except BaseException:
+                pass
+        try:
+            detail = str(error)
+        except BaseException:
+            detail = type(error).__name__
+        self.request_failed.emit(
+            0,
+            "worker.restart_failed",
+            f"VapourSynth worker 自动重启失败：{detail}",
+        )
+
     def start(self) -> int:
         if self._closed:
             raise RuntimeError("VSWorkerClient 已关闭")
@@ -356,7 +384,10 @@ class VSWorkerClient(QObject):
             self._clear_all_timeouts()
             if self._restart_requested:
                 self._restart_requested = False
-                self._start_transport()
+                try:
+                    self._start_transport()
+                except BaseException as error:
+                    self._report_restart_failure(error)
                 return
             if (
                 event_type == "worker_crashed"

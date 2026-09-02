@@ -231,6 +231,7 @@ class WorkerProcess:
             write_queue: queue.Queue[tuple[int, bytes] | None] = queue.Queue()
             stdout_done = threading.Event()
             stderr_done = threading.Event()
+            stderr_tail: deque[str] = deque(maxlen=64)
             command = list(self.command)
             if self.self_test:
                 command.append("--self-test")
@@ -271,7 +272,7 @@ class WorkerProcess:
                 ),
                 threading.Thread(
                     target=self._stderr_loop,
-                    args=(process, generation, stderr_done),
+                    args=(process, generation, stderr_done, stderr_tail),
                     name=f"VSWorkerStderr-{generation}",
                     daemon=True,
                 ),
@@ -284,6 +285,7 @@ class WorkerProcess:
                         stderr_done,
                         write_queue,
                         exit_event,
+                        stderr_tail,
                     ),
                     name=f"VSWorkerWaiter-{generation}",
                     daemon=True,
@@ -296,7 +298,7 @@ class WorkerProcess:
             self._exit_code = None
             self._expected_exit = False
             self._transport_failure = ""
-            self._stderr_tail.clear()
+            self._stderr_tail = stderr_tail
             self._write_queue = write_queue
             self._latest_frame_sequence = 0
             self._stdout_done = stdout_done
@@ -419,6 +421,7 @@ class WorkerProcess:
         process: subprocess.Popen[bytes],
         generation: int,
         done: threading.Event,
+        stderr_tail: deque[str],
     ) -> None:
         del generation
         assert process.stderr is not None
@@ -439,13 +442,13 @@ class WorkerProcess:
                         buffer = buffer[MAX_STDERR_LINE_BYTES:]
                     else:
                         break
-                    self._stderr_tail.append(
+                    stderr_tail.append(
                         line.decode("utf-8", errors="replace")
                     )
             if buffer:
-                self._stderr_tail.append(buffer.decode("utf-8", errors="replace"))
+                stderr_tail.append(buffer.decode("utf-8", errors="replace"))
         except OSError as exc:
-            self._stderr_tail.append(f"stderr read failed: {exc}")
+            stderr_tail.append(f"stderr read failed: {exc}")
         finally:
             done.set()
 
@@ -457,6 +460,7 @@ class WorkerProcess:
         stderr_done: threading.Event,
         write_queue: queue.Queue[tuple[int, bytes] | None],
         exit_event: threading.Event,
+        stderr_tail: deque[str],
     ) -> None:
         code = process.wait()
         # 子进程会在退出前 flush 最后一条结构化错误。必须先让 stdout reader
@@ -476,7 +480,7 @@ class WorkerProcess:
                 return
             expected = self._expected_exit
             failure = self._transport_failure
-            stderr_tail = tuple(self._stderr_tail)
+            stderr_lines = tuple(stderr_tail)
             pending = tuple(self._pending.values())
             self._pending.clear()
             self._frame_reservations = 0
@@ -494,8 +498,8 @@ class WorkerProcess:
         detail_parts = [f"worker exit code {code}"]
         if failure:
             detail_parts.append(failure)
-        if stderr_tail:
-            detail_parts.append("\n".join(stderr_tail))
+        if stderr_lines:
+            detail_parts.append("\n".join(stderr_lines))
         with self._state_lock:
             # 旧代的清理、slot 回收与 PIPE 关闭均已完成；从这里起才允许
             # listener 或其他线程启动下一代。exit_event 必须是本代捕获值，
