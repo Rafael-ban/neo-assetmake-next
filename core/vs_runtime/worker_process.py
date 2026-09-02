@@ -79,6 +79,8 @@ _ERROR_FIELDS = {
     "hint",
 }
 MAX_STDERR_LINE_BYTES = 64 * 1024
+STAGING_CLEANUP_ERROR_CODE = "worker.staging_cleanup_failed"
+WORKER_START_ERROR_CODE = "worker.start_failed"
 
 
 class WorkerProcessError(RuntimeError):
@@ -224,6 +226,88 @@ class WorkerProcess:
             except Exception:
                 continue
 
+    @staticmethod
+    def _safe_error_text(error: BaseException) -> str:
+        try:
+            return str(error)
+        except BaseException:
+            return type(error).__name__
+
+    @classmethod
+    def _close_generation_staging(
+        cls, generation_staging: GenerationStagingRoot
+    ) -> str:
+        """尽力关闭精确代际根；文件系统异常只作为稳定诊断返回。"""
+        try:
+            generation_staging.close()
+        except BaseException as error:
+            return cls._safe_error_text(error)
+        return ""
+
+    @classmethod
+    def _reap_failed_start(
+        cls,
+        process: subprocess.Popen[bytes],
+        generation_staging: GenerationStagingRoot,
+        write_queue: queue.Queue[tuple[int, bytes] | None],
+        stdout_done: threading.Event,
+        stderr_done: threading.Event,
+        started_threads: Sequence[threading.Thread],
+    ) -> tuple[int, str]:
+        """不可抛地收束 Popen 后尚未成功启动的 generation。"""
+        try:
+            write_queue.put(None)
+        except BaseException:
+            pass
+        try:
+            process.terminate()
+        except BaseException:
+            pass
+        try:
+            code = process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except BaseException:
+                pass
+            try:
+                code = process.wait(timeout=5)
+            except BaseException:
+                try:
+                    code = process.poll()
+                except BaseException:
+                    code = None
+        except BaseException:
+            try:
+                code = process.poll()
+            except BaseException:
+                code = None
+        stdout_done.set()
+        stderr_done.set()
+        for stream in (process.stdin, process.stdout, process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except BaseException:
+                pass
+        for thread in started_threads:
+            try:
+                if thread.is_alive():
+                    thread.join(timeout=1)
+            except BaseException:
+                pass
+        staging_failure = cls._close_generation_staging(generation_staging)
+        return (code if type(code) is int else -1), staging_failure
+
+    @staticmethod
+    def _failure_detail(message: str, staging_failure: str) -> str:
+        if not staging_failure:
+            return message
+        return (
+            f"{message}; [{STAGING_CLEANUP_ERROR_CODE}] "
+            f"generation staging cleanup failed: {staging_failure}"
+        )
+
     def start(self) -> int:
         with self._state_lock:
             if self._closed:
@@ -239,72 +323,111 @@ class WorkerProcess:
             stderr_done = threading.Event()
             stderr_tail: deque[str] = deque(maxlen=64)
             generation_staging = GenerationStagingRoot.create()
-            command = list(self.command)
-            if self.self_test:
-                command.append("--self-test")
-            child_environment = (
-                dict(os.environ) if self.env is None else dict(self.env)
-            )
-            child_environment.update(generation_staging.to_environment())
-            kwargs: dict[str, Any] = {
-                "cwd": str(self.app_dir),
-                "env": child_environment,
-                "stdin": subprocess.PIPE,
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.PIPE,
-                "shell": False,
-                "bufsize": 0,
-            }
-            if sys_platform_is_windows():
-                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            try:
+                command = list(self.command)
+                if self.self_test:
+                    command.append("--self-test")
+                child_environment = (
+                    dict(os.environ) if self.env is None else dict(self.env)
+                )
+                child_environment.update(generation_staging.to_environment())
+                kwargs: dict[str, Any] = {
+                    "cwd": str(self.app_dir),
+                    "env": child_environment,
+                    "stdin": subprocess.PIPE,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.PIPE,
+                    "shell": False,
+                    "bufsize": 0,
+                }
+                if sys_platform_is_windows():
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            except BaseException as error:
+                staging_failure = self._close_generation_staging(
+                    generation_staging
+                )
+                detail = self._failure_detail(
+                    "worker 启动准备失败: "
+                    f"{self._safe_error_text(error)}",
+                    staging_failure,
+                )
+                raise WorkerProcessError(detail) from error
             try:
                 process = subprocess.Popen(command, **kwargs)
             except (OSError, subprocess.SubprocessError, ValueError) as exc:
-                generation_staging.close()
-                raise WorkerProcessError(f"worker 启动失败: {exc}") from exc
+                staging_failure = self._close_generation_staging(
+                    generation_staging
+                )
+                detail = self._failure_detail(
+                    f"worker 启动失败: {self._safe_error_text(exc)}",
+                    staging_failure,
+                )
+                raise WorkerProcessError(detail) from exc
             if process.stdin is None or process.stdout is None or process.stderr is None:
-                try:
-                    process.kill()
-                    process.wait(timeout=5)
-                except (OSError, subprocess.SubprocessError):
-                    pass
-                generation_staging.close()
-                raise WorkerProcessError("worker binary PIPE 创建失败")
-            threads = [
-                threading.Thread(
-                    target=self._writer_loop,
-                    args=(process, generation, write_queue),
-                    name=f"VSWorkerWriter-{generation}",
-                    daemon=True,
-                ),
-                threading.Thread(
-                    target=self._stdout_loop,
-                    args=(process, generation, stdout_done),
-                    name=f"VSWorkerStdout-{generation}",
-                    daemon=True,
-                ),
-                threading.Thread(
-                    target=self._stderr_loop,
-                    args=(process, generation, stderr_done, stderr_tail),
-                    name=f"VSWorkerStderr-{generation}",
-                    daemon=True,
-                ),
-                threading.Thread(
-                    target=self._waiter_loop,
-                    args=(
-                        process,
-                        generation,
-                        stdout_done,
-                        stderr_done,
-                        write_queue,
-                        exit_event,
-                        stderr_tail,
-                        generation_staging,
+                _code, staging_failure = self._reap_failed_start(
+                    process,
+                    generation_staging,
+                    write_queue,
+                    stdout_done,
+                    stderr_done,
+                    (),
+                )
+                raise WorkerProcessError(
+                    self._failure_detail(
+                        "worker binary PIPE 创建失败", staging_failure
+                    )
+                )
+            try:
+                threads = [
+                    threading.Thread(
+                        target=self._writer_loop,
+                        args=(process, generation, write_queue),
+                        name=f"VSWorkerWriter-{generation}",
+                        daemon=True,
                     ),
-                    name=f"VSWorkerWaiter-{generation}",
-                    daemon=True,
-                ),
-            ]
+                    threading.Thread(
+                        target=self._stdout_loop,
+                        args=(process, generation, stdout_done),
+                        name=f"VSWorkerStdout-{generation}",
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._stderr_loop,
+                        args=(process, generation, stderr_done, stderr_tail),
+                        name=f"VSWorkerStderr-{generation}",
+                        daemon=True,
+                    ),
+                    threading.Thread(
+                        target=self._waiter_loop,
+                        args=(
+                            process,
+                            generation,
+                            stdout_done,
+                            stderr_done,
+                            write_queue,
+                            exit_event,
+                            stderr_tail,
+                            generation_staging,
+                        ),
+                        name=f"VSWorkerWaiter-{generation}",
+                        daemon=True,
+                    ),
+                ]
+            except BaseException as error:
+                _code, staging_failure = self._reap_failed_start(
+                    process,
+                    generation_staging,
+                    write_queue,
+                    stdout_done,
+                    stderr_done,
+                    (),
+                )
+                detail = self._failure_detail(
+                    "worker 协议线程构造失败: "
+                    f"{self._safe_error_text(error)}",
+                    staging_failure,
+                )
+                raise WorkerProcessError(detail) from error
             # Popen 与 PIPE 均成功后才发布新代，避免一次 spawn 失败把
             # generation/exit_event 留在永远无法收尾的半启动状态。
             self._generation = generation
@@ -325,55 +448,54 @@ class WorkerProcess:
                 for thread in self._threads:
                     thread.start()
                     started_threads.append(thread)
-            except RuntimeError as exc:
+            except BaseException as exc:
                 self._expected_exit = True
-                self._transport_failure = f"worker 协议线程启动失败: {exc}"
-                write_queue.put(None)
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
+                self._transport_failure = (
+                    "worker 协议线程启动失败: "
+                    f"{self._safe_error_text(exc)}"
+                )
                 start_error = exc
             else:
                 return generation
 
         # 线程资源耗尽等半启动失败必须在 start() 返回前彻底收束；此时
         # exit_event 仍未置位，其他 start() 会被“上一代仍在收尾”挡住。
-        try:
-            code = process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            try:
-                process.kill()
-            except OSError:
-                pass
-            try:
-                code = process.wait(timeout=5)
-            except (OSError, subprocess.SubprocessError):
-                code = process.poll()
-        except (OSError, subprocess.SubprocessError):
-            code = process.poll()
-        stdout_done.set()
-        stderr_done.set()
-        for stream in (process.stdin, process.stdout, process.stderr):
-            try:
-                if stream is not None:
-                    stream.close()
-            except OSError:
-                pass
-        for thread in started_threads:
-            if thread.is_alive():
-                thread.join(timeout=1)
-        generation_staging.close()
-        if type(code) is not int:
-            code = -1
+        code, staging_failure = self._reap_failed_start(
+            process,
+            generation_staging,
+            write_queue,
+            stdout_done,
+            stderr_done,
+            started_threads,
+        )
+        detail = self._failure_detail(
+            "worker 协议线程启动失败: "
+            f"{self._safe_error_text(start_error)}",
+            staging_failure,
+        )
+        should_emit = False
         with self._state_lock:
             if generation == self._generation:
                 self._exit_code = code
                 self._exit_codes[generation] = code
-                exit_event.set()
-        raise WorkerProcessError(
-            f"worker 协议线程启动失败: {start_error}"
-        ) from start_error
+                self._transport_failure = detail
+                should_emit = not exit_event.is_set()
+            exit_event.set()
+        if should_emit:
+            self._emit(
+                {
+                    "type": "worker_crashed",
+                    "generation": generation,
+                    "exit_code": code,
+                    "code": (
+                        STAGING_CLEANUP_ERROR_CODE
+                        if staging_failure
+                        else WORKER_START_ERROR_CODE
+                    ),
+                    "message": detail,
+                }
+            )
+        raise WorkerProcessError(detail) from start_error
 
     def _writer_loop(
         self,
@@ -493,10 +615,8 @@ class WorkerProcess:
                             stream.close()
                     except OSError:
                         pass
-                try:
-                    generation_staging.close()
-                finally:
-                    exit_event.set()
+                self._close_generation_staging(generation_staging)
+                exit_event.set()
                 return
             expected = self._expected_exit
             failure = self._transport_failure
@@ -515,36 +635,43 @@ class WorkerProcess:
                     stream.close()
             except OSError:
                 pass
-        staging_failure = ""
-        try:
-            generation_staging.close()
-        except BaseException as error:
-            try:
-                staging_failure = str(error)
-            except BaseException:
-                staging_failure = type(error).__name__
+        staging_failure = self._close_generation_staging(generation_staging)
         detail_parts = [f"worker exit code {code}"]
         if failure:
             detail_parts.append(failure)
         if stderr_lines:
             detail_parts.append("\n".join(stderr_lines))
         if staging_failure:
-            detail_parts.append(f"generation staging cleanup failed: {staging_failure}")
+            detail_parts.append(
+                f"[{STAGING_CLEANUP_ERROR_CODE}] "
+                f"generation staging cleanup failed: {staging_failure}"
+            )
+        should_emit = False
         with self._state_lock:
             # 旧代的清理、slot 回收与 PIPE 关闭均已完成；从这里起才允许
             # listener 或其他线程启动下一代。exit_event 必须是本代捕获值，
             # 不能在 listener 重启后再通过 self 误置新代事件。
-            self._exit_code = code
-            self._exit_codes[generation] = code
-            exit_event.set()
-        self._emit(
-            {
-                "type": "worker_exited" if expected and code == 0 else "worker_crashed",
+            if not exit_event.is_set():
+                self._exit_code = code
+                self._exit_codes[generation] = code
+                if staging_failure:
+                    self._transport_failure = detail_parts[-1]
+                should_emit = True
+                exit_event.set()
+        if should_emit:
+            event = {
+                "type": (
+                    "worker_exited"
+                    if expected and code == 0 and not staging_failure
+                    else "worker_crashed"
+                ),
                 "generation": generation,
                 "exit_code": code,
                 "message": "; ".join(detail_parts),
             }
-        )
+            if staging_failure:
+                event["code"] = STAGING_CLEANUP_ERROR_CODE
+            self._emit(event)
 
     def _fail_transport(self, generation: int, message: str) -> None:
         with self._state_lock:
@@ -1112,6 +1239,7 @@ class WorkerProcess:
         with self._state_lock:
             self._closed = True
             process = self._process
+            generation = self._generation
             exit_event = self._exit_event
             generation_staging = self._generation_staging
             if process is not None:
@@ -1129,8 +1257,49 @@ class WorkerProcess:
                     process.kill()
                 except OSError:
                     pass
-            if not exit_event.wait(1) and generation_staging is not None:
-                generation_staging.close()
+            if not exit_event.wait(1):
+                try:
+                    code = process.wait(timeout=1)
+                except BaseException:
+                    try:
+                        code = process.poll()
+                    except BaseException:
+                        code = None
+                if exit_event.is_set():
+                    return
+                staging_failure = (
+                    self._close_generation_staging(generation_staging)
+                    if generation_staging is not None
+                    else ""
+                )
+                if type(code) is not int:
+                    code = -1
+                detail = self._failure_detail(
+                    f"worker exit code {code}", staging_failure
+                )
+                should_emit = False
+                with self._state_lock:
+                    if not exit_event.is_set():
+                        self._exit_code = code
+                        self._exit_codes[generation] = code
+                        if staging_failure:
+                            self._transport_failure = detail
+                        should_emit = True
+                        exit_event.set()
+                if should_emit:
+                    event = {
+                        "type": (
+                            "worker_crashed"
+                            if staging_failure or code != 0
+                            else "worker_exited"
+                        ),
+                        "generation": generation,
+                        "exit_code": code,
+                        "message": detail,
+                    }
+                    if staging_failure:
+                        event["code"] = STAGING_CLEANUP_ERROR_CODE
+                    self._emit(event)
 
 
 def sys_platform_is_windows() -> bool:

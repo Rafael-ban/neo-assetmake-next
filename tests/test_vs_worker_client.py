@@ -410,6 +410,54 @@ class VSWorkerClientTests(unittest.TestCase):
 
         self.assertEqual(crashes, ["bad wire response"])
 
+    def test_cleanup_failure_is_one_stable_signal_and_one_restart(self):
+        failures = []
+        crashes = []
+        self.client.request_failed.connect(
+            lambda request_id, code, message: failures.append(
+                (request_id, code, message)
+            )
+        )
+        self.client.worker_crashed.connect(crashes.append)
+        uncaught = []
+        original_excepthook = sys.excepthook
+        sys.excepthook = lambda *args: uncaught.append(args)
+        try:
+            self.client.start()
+            self.client.terminate_and_restart()
+            old_generation = self.transport.generation
+            event = {
+                "type": "worker_crashed",
+                "generation": old_generation,
+                "exit_code": 0,
+                "code": "worker.staging_cleanup_failed",
+                "message": (
+                    "[worker.staging_cleanup_failed] "
+                    "generation staging cleanup failed"
+                ),
+            }
+            self.transport.emit(event)
+            self._drain_events()
+            self.transport.emit(event)
+            self._drain_events()
+        finally:
+            sys.excepthook = original_excepthook
+
+        self.assertEqual(uncaught, [])
+        self.assertEqual(self.transport.generation, 2)
+        self.assertEqual(
+            failures,
+            [
+                (
+                    0,
+                    "worker.staging_cleanup_failed",
+                    "[worker.staging_cleanup_failed] "
+                    "generation staging cleanup failed",
+                )
+            ],
+        )
+        self.assertEqual(crashes, [])
+
     def test_queued_restart_startup_failures_are_single_safe_terminals(self):
         class FailingRestartTransport(_FakeTransport):
             def __init__(self, stage):

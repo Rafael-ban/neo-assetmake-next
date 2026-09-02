@@ -560,6 +560,146 @@ class WorkerProcessTransportTests(unittest.TestCase):
         )
         self.assertTrue(process.alive)
 
+    def test_staging_identity_failure_before_popen_is_wrapped_and_cleaned(self):
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        created = []
+        real_create = GenerationStagingRoot.create
+
+        def capture_create():
+            staging = real_create()
+            created.append(staging)
+            return staging
+
+        raised = None
+        with (
+            mock.patch.object(
+                GenerationStagingRoot,
+                "create",
+                side_effect=capture_create,
+            ),
+            mock.patch.object(
+                GenerationStagingRoot,
+                "to_environment",
+                autospec=True,
+                side_effect=OSError("ownership marker unreadable"),
+            ),
+            mock.patch(
+                "core.vs_runtime.worker_process.subprocess.Popen"
+            ) as popen,
+        ):
+            try:
+                process.start()
+            except BaseException as error:
+                raised = error
+            finally:
+                for staging in created:
+                    if staging.root_path.exists():
+                        staging.close()
+
+        self.assertIsInstance(raised, WorkerProcessError)
+        self.assertIn("worker 启动准备失败", str(raised))
+        self.assertIn("ownership marker unreadable", str(raised))
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].root_path.exists())
+        popen.assert_not_called()
+        self.assertEqual(process.generation, 0)
+
+    def test_spawn_failure_wraps_generation_cleanup_failure(self):
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        original_close = GenerationStagingRoot.close
+        environment = None
+        raised = None
+        with (
+            mock.patch(
+                "core.vs_runtime.worker_process.subprocess.Popen",
+                side_effect=OSError("spawn unavailable"),
+            ) as popen,
+            mock.patch.object(
+                GenerationStagingRoot,
+                "close",
+                autospec=True,
+                side_effect=PermissionError("generation root is locked"),
+            ),
+        ):
+            try:
+                process.start()
+            except BaseException as error:
+                raised = error
+            finally:
+                environment = popen.call_args.kwargs["env"]
+
+        root = Path(environment[GENERATION_STAGING_ROOT_ENV])
+        try:
+            self.assertIsInstance(raised, WorkerProcessError)
+            self.assertIn("spawn unavailable", str(raised))
+            self.assertIn("worker.staging_cleanup_failed", str(raised))
+            self.assertEqual(process.generation, 0)
+            self.assertIsNone(process._process)
+        finally:
+            if root.exists():
+                original_close(
+                    GenerationStagingRoot.from_environment(environment)
+                )
+
+    def test_missing_pipe_wraps_generation_cleanup_failure_after_reaping(self):
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        child = mock.Mock()
+        child.stdin = None
+        child.stdout = io.BytesIO()
+        child.stderr = io.BytesIO()
+        child.poll.return_value = None
+
+        def stop_child():
+            child.poll.return_value = 1
+
+        child.terminate.side_effect = stop_child
+        child.kill.side_effect = stop_child
+        child.wait.return_value = 1
+        original_close = GenerationStagingRoot.close
+        environment = None
+        raised = None
+        with (
+            mock.patch(
+                "core.vs_runtime.worker_process.subprocess.Popen",
+                return_value=child,
+            ) as popen,
+            mock.patch.object(
+                GenerationStagingRoot,
+                "close",
+                autospec=True,
+                side_effect=PermissionError("generation root is locked"),
+            ),
+        ):
+            try:
+                process.start()
+            except BaseException as error:
+                raised = error
+            finally:
+                environment = popen.call_args.kwargs["env"]
+
+        root = Path(environment[GENERATION_STAGING_ROOT_ENV])
+        try:
+            self.assertIsInstance(raised, WorkerProcessError)
+            self.assertIn("PIPE 创建失败", str(raised))
+            self.assertIn("worker.staging_cleanup_failed", str(raised))
+            self.assertTrue(child.wait.called)
+            self.assertGreaterEqual(
+                child.terminate.call_count + child.kill.call_count, 1
+            )
+            self.assertEqual(process.generation, 0)
+            self.assertIsNone(process._process)
+        finally:
+            if root.exists():
+                original_close(
+                    GenerationStagingRoot.from_environment(environment)
+                )
+
     def test_thread_start_failure_reaps_child_and_allows_fresh_generation(self):
         process = WorkerProcess(
             command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
@@ -610,6 +750,269 @@ class WorkerProcessTransportTests(unittest.TestCase):
             Path(failed_env[GENERATION_STAGING_ROOT_ENV]).exists()
         )
         self.assertTrue(process.alive)
+
+    def test_thread_construction_failure_reaps_unpublished_child_and_root(self):
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        child = mock.Mock()
+        child.stdin = io.BytesIO()
+        child.stdout = io.BytesIO()
+        child.stderr = io.BytesIO()
+        child.pid = 1003
+        child.poll.return_value = None
+
+        def terminate():
+            child.poll.return_value = 1
+
+        child.terminate.side_effect = terminate
+        child.wait.return_value = 1
+        environment = None
+        with (
+            mock.patch(
+                "core.vs_runtime.worker_process.subprocess.Popen",
+                return_value=child,
+            ) as popen,
+            mock.patch(
+                "core.vs_runtime.worker_process.threading.Thread",
+                side_effect=RuntimeError("thread constructor unavailable"),
+            ),
+        ):
+            try:
+                with self.assertRaises(WorkerProcessError) as raised:
+                    process.start()
+            finally:
+                environment = popen.call_args.kwargs["env"]
+                root = Path(environment[GENERATION_STAGING_ROOT_ENV])
+                if root.exists():
+                    GenerationStagingRoot.from_environment(environment).close()
+
+        self.assertIn("worker 协议线程构造失败", str(raised.exception))
+        child.terminate.assert_called_once()
+        self.assertFalse(Path(environment[GENERATION_STAGING_ROOT_ENV]).exists())
+        self.assertEqual(process.generation, 0)
+        self.assertIsNone(process._process)
+        self.assertFalse(process.settling)
+
+    def test_thread_start_cleanup_failure_is_terminal_and_does_not_poison_restart(self):
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        events = []
+        process.add_listener(events.append)
+
+        child = mock.Mock()
+        child.stdin = io.BytesIO()
+        child.stdout = io.BytesIO()
+        child.stderr = io.BytesIO()
+        child.pid = 1004
+        child.poll.return_value = None
+
+        def terminate():
+            child.poll.return_value = 1
+
+        child.terminate.side_effect = terminate
+        child.wait.return_value = 1
+        original_close = GenerationStagingRoot.close
+        close_calls = 0
+
+        def fail_first_close(staging):
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 1:
+                raise PermissionError("generation root is locked")
+            return original_close(staging)
+
+        environment = None
+        with (
+            mock.patch(
+                "core.vs_runtime.worker_process.subprocess.Popen",
+                side_effect=[child, OSError("fresh spawn reached")],
+            ) as popen,
+            mock.patch(
+                "core.vs_runtime.worker_process.threading.Thread.start",
+                side_effect=[None, RuntimeError("thread start unavailable")],
+            ),
+            mock.patch.object(
+                GenerationStagingRoot,
+                "close",
+                autospec=True,
+                side_effect=fail_first_close,
+            ),
+        ):
+            try:
+                with self.assertRaises(WorkerProcessError) as first:
+                    process.start()
+
+                self.assertTrue(process._exit_event.is_set())
+                self.assertFalse(process.settling)
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["type"], "worker_crashed")
+                self.assertEqual(
+                    events[0]["code"], "worker.staging_cleanup_failed"
+                )
+                self.assertIn(
+                    "worker.staging_cleanup_failed", str(first.exception)
+                )
+
+                with self.assertRaisesRegex(
+                    WorkerProcessError, "fresh spawn reached"
+                ):
+                    process.start()
+            finally:
+                environment = popen.call_args_list[0].kwargs["env"]
+                root = Path(environment[GENERATION_STAGING_ROOT_ENV])
+                if root.exists():
+                    original_close(
+                        GenerationStagingRoot.from_environment(environment)
+                    )
+
+        self.assertEqual(process.generation, 1)
+        self.assertEqual(len(events), 1)
+        self.assertFalse(Path(environment[GENERATION_STAGING_ROOT_ENV]).exists())
+
+    def test_thread_start_hostile_error_is_wrapped_and_terminal(self):
+        class HostileStartError(RuntimeError):
+            def __str__(self):
+                raise ValueError("broken thread start error string")
+
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        events = []
+        process.add_listener(events.append)
+
+        child = mock.Mock()
+        child.stdin = io.BytesIO()
+        child.stdout = io.BytesIO()
+        child.stderr = io.BytesIO()
+        child.pid = 1005
+        child.poll.return_value = None
+
+        def terminate():
+            child.poll.return_value = 1
+
+        child.terminate.side_effect = terminate
+        child.wait.return_value = 1
+        environment = None
+        with (
+            mock.patch(
+                "core.vs_runtime.worker_process.subprocess.Popen",
+                return_value=child,
+            ) as popen,
+            mock.patch(
+                "core.vs_runtime.worker_process.threading.Thread.start",
+                side_effect=HostileStartError(),
+            ),
+        ):
+            try:
+                with self.assertRaises(WorkerProcessError) as raised:
+                    process.start()
+            finally:
+                environment = popen.call_args.kwargs["env"]
+                root = Path(environment[GENERATION_STAGING_ROOT_ENV])
+                if root.exists():
+                    GenerationStagingRoot.from_environment(environment).close()
+
+        self.assertIn("HostileStartError", str(raised.exception))
+        child.terminate.assert_called_once()
+        self.assertTrue(process._exit_event.is_set())
+        self.assertFalse(process.settling)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "worker_crashed")
+        self.assertEqual(events[0]["code"], "worker.start_failed")
+        self.assertFalse(Path(environment[GENERATION_STAGING_ROOT_ENV]).exists())
+
+    def test_close_cleanup_failure_is_a_single_non_throwing_terminal(self):
+        class CapturedEvent:
+            def __init__(self):
+                self.value = False
+
+            def is_set(self):
+                return self.value
+
+            def set(self):
+                self.value = True
+
+            def wait(self, _timeout):
+                return self.value
+
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        child = mock.Mock()
+        child.poll.return_value = None
+        child.stdin = io.BytesIO()
+        child.stdout = io.BytesIO()
+        child.stderr = io.BytesIO()
+        exit_event = CapturedEvent()
+        staging = mock.Mock()
+        staging.close.side_effect = PermissionError("generation root is locked")
+        process._generation = 1
+        process._process = child
+        process._exit_event = exit_event
+        process._generation_staging = staging
+        events = []
+        process.add_listener(events.append)
+
+        process.close()
+        process.close()
+
+        self.assertTrue(exit_event.is_set())
+        self.assertFalse(process.settling)
+        self.assertTrue(child.wait.called)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "worker_crashed")
+        self.assertEqual(
+            events[0]["code"], "worker.staging_cleanup_failed"
+        )
+        self.assertIn("generation root is locked", events[0]["message"])
+
+    def test_expected_exit_cleanup_failure_is_a_stable_crash_terminal(self):
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        child = mock.Mock()
+        child.wait.return_value = 0
+        child.poll.return_value = 0
+        child.stdin = io.BytesIO()
+        child.stdout = io.BytesIO()
+        child.stderr = io.BytesIO()
+        stdout_done = threading.Event()
+        stderr_done = threading.Event()
+        stdout_done.set()
+        stderr_done.set()
+        write_queue = queue.Queue()
+        exit_event = threading.Event()
+        staging = mock.Mock()
+        staging.close.side_effect = PermissionError("generation root is locked")
+        process._generation = 1
+        process._process = child
+        process._exit_event = exit_event
+        process._generation_staging = staging
+        process._expected_exit = True
+        events = []
+        process.add_listener(events.append)
+
+        process._waiter_loop(
+            child,
+            1,
+            stdout_done,
+            stderr_done,
+            write_queue,
+            exit_event,
+            deque(),
+            staging,
+        )
+
+        self.assertTrue(exit_event.is_set())
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["type"], "worker_crashed")
+        self.assertEqual(
+            events[0]["code"], "worker.staging_cleanup_failed"
+        )
+        self.assertEqual(events[0]["exit_code"], 0)
+        self.assertIn("generation root is locked", events[0]["message"])
 
     def test_missing_binary_pipe_removes_unpublished_generation_root(self):
         process = WorkerProcess(

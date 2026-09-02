@@ -10,7 +10,10 @@ from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal, pyqtSlot
 
 from config.vs_runtime import WorkerConfig, load_vs_runtime
 from core.vs_runtime.session import RenderSession, SessionMetadata
-from core.vs_runtime.worker_process import WorkerProcess
+from core.vs_runtime.worker_process import (
+    STAGING_CLEANUP_ERROR_CODE,
+    WorkerProcess,
+)
 
 
 @dataclass(frozen=True)
@@ -382,6 +385,19 @@ class VSWorkerClient(QObject):
             return
         if event_type in {"worker_crashed", "worker_exited"}:
             self._clear_all_timeouts()
+            cleanup_failure = (
+                event.get("code") == STAGING_CLEANUP_ERROR_CODE
+            )
+            if (
+                cleanup_failure
+                and self._failure_reported_generation != generation
+            ):
+                self._failure_reported_generation = generation
+                self.request_failed.emit(
+                    0,
+                    STAGING_CLEANUP_ERROR_CODE,
+                    str(event.get("message", STAGING_CLEANUP_ERROR_CODE)),
+                )
             if self._restart_requested:
                 self._restart_requested = False
                 try:
