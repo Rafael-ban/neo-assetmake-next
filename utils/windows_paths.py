@@ -10,7 +10,8 @@ from typing import Any
 _DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:\\")
 _INVALID_COMPONENT_CHARS = frozenset('<>:"|?*')
 _RESERVED_DEVICE_RE = re.compile(
-    r"^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$", re.IGNORECASE
+    r"^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])$",
+    re.IGNORECASE,
 )
 
 

@@ -6,6 +6,7 @@ import os
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -76,6 +77,35 @@ def _migration_with_paused_target_read_process(
 
     runtime_module._read_json = runtime_read
     migration_module._read_object = migration_read
+    try:
+        report = migration_module.migrate_legacy_vsconfig_once(
+            legacy_path, user_path, marker_path
+        )
+    except Exception as exc:
+        results.put(("error", str(exc)))
+    else:
+        results.put(("ok", report.applied))
+
+
+def _synchronized_migration_process(
+    legacy_path,
+    user_path,
+    marker_path,
+    barrier,
+    results,
+):
+    import config.vs_runtime as runtime_module
+    import core.vs_runtime.migration as migration_module
+
+    original_lock = runtime_module._override_lock
+
+    @contextmanager
+    def synchronized_lock(path):
+        barrier.wait(timeout=10)
+        with original_lock(path):
+            yield
+
+    runtime_module._override_lock = synchronized_lock
     try:
         report = migration_module.migrate_legacy_vsconfig_once(
             legacy_path, user_path, marker_path
@@ -305,6 +335,33 @@ class VSRuntimeContractTests(unittest.TestCase):
                         validator.validate(payload)
                 else:
                     validator.validate(payload)
+            with self.subTest(name=name, layer="plugin-model"):
+                with self.assertRaises(VSRuntimeConfigError):
+                    VSRuntimeConfig.from_dict(payload)
+
+    def test_runtime_paths_reject_superscript_com_lpt_devices(self):
+        cases = (
+            ("drive-com1", r"D:\COM¹\pipeline.vpy"),
+            ("drive-com2-extension", r"D:\com².log\pipeline.vpy"),
+            ("drive-lpt3", r"D:\LpT³\pipeline.vpy"),
+            ("unc-lpt1-extension", r"\\server\share\LPT¹.txt\pipeline.vpy"),
+            ("unc-lpt2", r"\\server\share\lpt²\pipeline.vpy"),
+            ("unc-com3-extension", r"\\server\share\CoM³.bin\pipeline.vpy"),
+        )
+        validator = Draft202012Validator(RUNTIME_SCHEMA)
+        for name, invalid_path in cases:
+            payload = VSRuntimeConfig().to_dict()
+            payload["scripts"]["global_script_path"] = invalid_path
+            with self.subTest(name=name, layer="schema"):
+                validator.validate(payload)
+            with self.subTest(name=name, layer="model"):
+                with self.assertRaises(VSRuntimeConfigError):
+                    VSRuntimeConfig.from_dict(payload)
+
+            payload = VSRuntimeConfig().to_dict()
+            payload["plugins"]["native_plugin_dirs"] = [invalid_path]
+            with self.subTest(name=name, layer="plugin-schema"):
+                validator.validate(payload)
             with self.subTest(name=name, layer="plugin-model"):
                 with self.assertRaises(VSRuntimeConfigError):
                     VSRuntimeConfig.from_dict(payload)
@@ -606,6 +663,191 @@ class LegacyVSConfigMigrationTests(unittest.TestCase):
         self.assertEqual(payload["core"]["num_threads"], 4)
         self.assertEqual(payload["core"]["max_cache_size_mb"], 512)
 
+    def test_covered_invalid_legacy_value_does_not_block_missing_field(self):
+        self.legacy_path.write_text(
+            json.dumps(
+                {
+                    "core": {
+                        "num_threads": "bad",
+                        "max_cache_size_mb": 512,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.user_path.parent.mkdir(parents=True)
+        self.user_path.write_text(
+            json.dumps({"core": {"num_threads": 9}}),
+            encoding="utf-8",
+        )
+
+        report = migrate_legacy_vsconfig_once(
+            self.legacy_path, self.user_path, self.marker_path
+        )
+
+        self.assertTrue(report.applied)
+        self.assertEqual(
+            report.migrated_fields, ("core.max_cache_size_mb",)
+        )
+        payload = json.loads(self.user_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["core"]["num_threads"], 9)
+        self.assertEqual(payload["core"]["max_cache_size_mb"], 512)
+
+    def test_same_hash_valid_target_does_not_reinterpret_bad_legacy(self):
+        legacy_payload = {
+            "core": {
+                "num_threads": "bad",
+                "max_cache_size_mb": 512,
+            }
+        }
+        self.legacy_path.write_text(
+            json.dumps(legacy_payload), encoding="utf-8"
+        )
+        source_hash = hashlib.sha256(self.legacy_path.read_bytes()).hexdigest()
+        self.user_path.parent.mkdir(parents=True)
+        self.user_path.write_text(
+            json.dumps(
+                {"core": {"num_threads": 9, "max_cache_size_mb": 512}}
+            ),
+            encoding="utf-8",
+        )
+        self.marker_path.write_text(
+            json.dumps({"source_hash": source_hash}), encoding="utf-8"
+        )
+
+        report = migrate_legacy_vsconfig_once(
+            self.legacy_path, self.user_path, self.marker_path
+        )
+
+        self.assertFalse(report.applied)
+        self.assertEqual(report.migrated_fields, ())
+        self.assertEqual(report.ignored_fields, ())
+        self.assertEqual(report.source_hash, source_hash)
+
+    def test_same_hash_thread_migrations_have_exactly_one_applier(self):
+        import config.vs_runtime as runtime_module
+
+        self.write_legacy()
+        barrier = threading.Barrier(2)
+        original_lock = runtime_module._override_lock
+
+        @contextmanager
+        def synchronized_lock(path):
+            barrier.wait(timeout=10)
+            with original_lock(path):
+                yield
+
+        def migrate():
+            return migrate_legacy_vsconfig_once(
+                self.legacy_path, self.user_path, self.marker_path
+            )
+
+        with mock.patch.object(
+            runtime_module, "_override_lock", new=synchronized_lock
+        ):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                reports = list(pool.map(lambda _index: migrate(), range(2)))
+
+        self.assertEqual([report.applied for report in reports].count(True), 1)
+        marker = json.loads(self.marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(marker["source_hash"], reports[0].source_hash)
+
+    def test_same_hash_process_migrations_have_exactly_one_applier(self):
+        self.write_legacy()
+        context = multiprocessing.get_context("spawn")
+        barrier = context.Barrier(2)
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_synchronized_migration_process,
+                args=(
+                    self.legacy_path,
+                    self.user_path,
+                    self.marker_path,
+                    barrier,
+                    results,
+                ),
+            )
+            for _index in range(2)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=15)
+            self.assertFalse(process.is_alive(), "迁移进程未按时退出")
+            self.assertEqual(process.exitcode, 0)
+
+        outcomes = [results.get(timeout=5) for _process in processes]
+        self.assertEqual([state for state, _value in outcomes], ["ok", "ok"])
+        self.assertEqual(
+            [applied for _state, applied in outcomes].count(True), 1
+        )
+
+    def test_different_hash_marker_cannot_be_overwritten_out_of_order(self):
+        import config.vs_runtime as runtime_module
+        import core.vs_runtime.migration as migration_module
+
+        legacy_a = self.root / "legacy-a.json"
+        legacy_b = self.root / "legacy-b.json"
+        legacy_a.write_text(
+            json.dumps({"core": {"num_threads": 3}}), encoding="utf-8"
+        )
+        legacy_b.write_text(
+            json.dumps({"core": {"num_threads": 7}}), encoding="utf-8"
+        )
+        hash_a = hashlib.sha256(legacy_a.read_bytes()).hexdigest()
+        hash_b = hashlib.sha256(legacy_b.read_bytes()).hexdigest()
+        first_at_marker = threading.Event()
+        release_first = threading.Event()
+        real_marker_write = migration_module.atomic_write_json
+
+        def ordered_marker_write(path, payload, *, indent=2):
+            if Path(path) == self.marker_path and payload == {
+                "source_hash": hash_a
+            }:
+                first_at_marker.set()
+                self.assertTrue(release_first.wait(timeout=10))
+            real_marker_write(path, payload, indent=indent)
+
+        reports = {}
+
+        def migrate(name, source):
+            reports[name] = migrate_legacy_vsconfig_once(
+                source, self.user_path, self.marker_path
+            )
+
+        with mock.patch.object(
+            migration_module,
+            "atomic_write_json",
+            side_effect=ordered_marker_write,
+        ):
+            first = threading.Thread(
+                target=migrate, args=("first", legacy_a)
+            )
+            first.start()
+            self.assertTrue(first_at_marker.wait(timeout=10))
+            shared_lock = runtime_module._thread_lock_for(self.user_path)
+            first_holds_lock = not shared_lock.acquire(blocking=False)
+            if not first_holds_lock:
+                shared_lock.release()
+            second = threading.Thread(
+                target=migrate, args=("second", legacy_b)
+            )
+            second.start()
+            if not first_holds_lock:
+                second.join(timeout=10)
+                self.assertFalse(second.is_alive())
+            release_first.set()
+            first.join(timeout=10)
+            second.join(timeout=10)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(reports["first"].applied)
+        self.assertTrue(reports["second"].applied)
+        marker = json.loads(self.marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(marker, {"source_hash": hash_b})
+
     def test_migration_and_save_thread_race_keeps_latest_patch(self):
         import config.vs_runtime as runtime_module
         import core.vs_runtime.migration as migration_module
@@ -784,6 +1026,34 @@ class LegacyVSConfigMigrationTests(unittest.TestCase):
             payload["plugins"]["native_plugin_dirs"],
             [str(install_root / "tools" / "media" / "vs-plugins")],
         )
+
+    def test_legacy_source_path_errors_are_wrapped(self):
+        invalid_paths = (
+            (".", str(Path.cwd().resolve())),
+            ("bad\0vsconfig.json", "bad"),
+        )
+        for legacy_path, expected_path in invalid_paths:
+            with self.subTest(legacy_path=repr(legacy_path)):
+                with self.assertRaises(VSRuntimeConfigError) as raised:
+                    migrate_legacy_vsconfig_once(
+                        legacy_path, self.user_path, self.marker_path
+                    )
+                self.assertIn(expected_path, str(raised.exception))
+
+    def test_missing_relative_legacy_source_remains_a_noop(self):
+        worktree_temp = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(worktree_temp.cleanup)
+        missing = Path(worktree_temp.name).resolve() / "missing.json"
+        relative_missing = os.path.relpath(missing, Path.cwd())
+
+        report = migrate_legacy_vsconfig_once(
+            relative_missing, self.user_path, self.marker_path
+        )
+
+        self.assertFalse(report.applied)
+        self.assertEqual(report.source_hash, "")
+        self.assertFalse(self.user_path.exists())
+        self.assertFalse(self.marker_path.exists())
 
     def test_global_script_patch_after_migration_keeps_migrated_fields(self):
         self.write_legacy()

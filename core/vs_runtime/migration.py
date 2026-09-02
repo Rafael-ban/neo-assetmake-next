@@ -9,12 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from config.vs_runtime import (
-    VSRuntimeConfigError,
-    default_vs_runtime_path,
-    default_vs_runtime_user_path,
-    merge_missing_vs_runtime_override,
-)
+import config.vs_runtime as runtime_config
+from config.vs_runtime import VSRuntimeConfigError
 from core.file_utils import atomic_write_json, sha256_file
 from utils.windows_paths import canonicalize_windows_absolute_path
 
@@ -99,64 +95,110 @@ def _canonicalize_legacy_plugin_dirs(value: Any, source: Path) -> Any:
     return canonical
 
 
+def _source_path_and_hash(
+    legacy_path: str | os.PathLike[str] | None,
+) -> tuple[Path, str | None]:
+    """解析旧配置源并计算 hash，统一 public 路径错误边界。"""
+    source_input: Any = legacy_path
+    source: Path | None = None
+    try:
+        source = (
+            Path(source_input)
+            if source_input is not None
+            else runtime_config.default_vs_runtime_path().with_name(
+                "vsconfig.json"
+            )
+        ).resolve()
+        if not source.exists():
+            return source, None
+        return source, sha256_file(source)
+    except (OSError, TypeError, ValueError) as exc:
+        context = source if source is not None else source_input
+        if context is None:
+            context = "legacy vsconfig"
+        try:
+            label = str(context)
+        except (TypeError, ValueError):
+            label = repr(context)
+        raise VSRuntimeConfigError(f"{label}: {exc}") from exc
+
+
+def _raise_target_error(target: Path, exc: VSRuntimeConfigError) -> None:
+    """为已持锁 target 操作补充稳定的绝对路径上下文。"""
+    resolved = str(target.resolve())
+    if resolved in str(exc):
+        raise exc
+    raise VSRuntimeConfigError(f"{resolved}: {exc}") from exc
+
+
 def migrate_legacy_vsconfig_once(
     legacy_path: str | os.PathLike[str] | None = None,
     user_path: str | os.PathLike[str] | None = None,
     marker_path: str | os.PathLike[str] | None = None,
 ) -> MigrationReport:
     """按旧文件 hash 幂等迁移运行字段，并报告被忽略的滤镜字段。"""
-    source = (
-        Path(legacy_path)
-        if legacy_path is not None
-        else default_vs_runtime_path().with_name("vsconfig.json")
-    ).resolve()
+    source, source_hash = _source_path_and_hash(legacy_path)
+    if source_hash is None:
+        return MigrationReport(False, (), (), "")
+
     target = (
         Path(user_path)
         if user_path is not None
-        else default_vs_runtime_user_path()
+        else runtime_config.default_vs_runtime_user_path()
     )
     marker = (
         Path(marker_path)
         if marker_path is not None
         else target.parent / "vsconfig.migration.json"
     )
-    if not source.exists():
-        return MigrationReport(False, (), (), "")
 
-    source_hash = sha256_file(source)
-    legacy = _read_object(source, "legacy vsconfig")
-    migrated: dict[str, Any] = {}
-    migrated_fields: list[str] = []
-    for old_field, new_field in LEGACY_FIELD_MAP.items():
-        present, value = _get_nested(legacy, old_field)
-        if present:
+    with runtime_config._override_lock(target):
+        try:
+            existing, target_exists = (
+                runtime_config._read_vs_runtime_override_locked(target)
+            )
+        except VSRuntimeConfigError as exc:
+            _raise_target_error(target, exc)
+
+        same_source_hash = False
+        if marker.exists():
+            marker_payload = _read_object(marker, "migration marker")
+            same_source_hash = (
+                marker_payload.get("source_hash") == source_hash
+            )
+        if same_source_hash and target_exists:
+            return MigrationReport(False, (), (), source_hash)
+
+        legacy = _read_object(source, "legacy vsconfig")
+        migrated: dict[str, Any] = {}
+        migrated_fields: list[str] = []
+        for old_field, new_field in LEGACY_FIELD_MAP.items():
+            already_present, _value = _get_nested(existing, new_field)
+            if already_present:
+                continue
+            present, value = _get_nested(legacy, old_field)
+            if not present:
+                continue
             if old_field == "extra_plugin_dirs":
                 try:
                     value = _canonicalize_legacy_plugin_dirs(value, source)
                 except ValueError as exc:
-                    raise VSRuntimeConfigError(
-                        f"{source}: {exc}"
-                    ) from exc
+                    raise VSRuntimeConfigError(f"{source}: {exc}") from exc
             _set_nested(migrated, new_field, value)
             migrated_fields.append(old_field)
-    ignored_fields = tuple(
-        field for field in IGNORED_FILTER_FIELDS if field in legacy
-    )
-    report_fields = tuple(migrated_fields)
 
-    same_source_hash = False
-    if marker.exists():
-        marker_payload = _read_object(marker, "migration marker")
-        same_source_hash = marker_payload.get("source_hash") == source_hash
-
-    applied = merge_missing_vs_runtime_override(
-        target,
-        migrated,
-        skip_valid_existing=same_source_hash,
-    )
-    if not applied:
-        return MigrationReport(
-            False, report_fields, ignored_fields, source_hash
+        ignored_fields = tuple(
+            field for field in IGNORED_FILTER_FIELDS if field in legacy
         )
-    atomic_write_json(marker, {"source_hash": source_hash}, indent=2)
-    return MigrationReport(True, report_fields, ignored_fields, source_hash)
+        payload = runtime_config._deep_merge(existing, migrated)
+        try:
+            runtime_config._write_vs_runtime_override_locked(target, payload)
+        except VSRuntimeConfigError as exc:
+            _raise_target_error(target, exc)
+        atomic_write_json(marker, {"source_hash": source_hash}, indent=2)
+        return MigrationReport(
+            True,
+            tuple(migrated_fields),
+            ignored_fields,
+            source_hash,
+        )

@@ -404,20 +404,60 @@ def _update_vs_runtime_override(
     """在共享锁内读取、合并、校验并写入一次用户覆盖。"""
     with _override_lock(target):
         try:
-            exists = target.exists()
-            existing = (
-                _validate_partial(_read_json(target)) if exists else {}
-            )
-            payload = merge(existing, exists)
-            if payload is None:
-                return False
-            _validate_partial(payload)
-            atomic_write_json(target, payload, indent=2)
-            return True
+            return _update_vs_runtime_override_locked(target, merge)
         except VSRuntimeConfigError as exc:
             if str(target.resolve()) in str(exc):
                 raise
             raise VSRuntimeConfigError(f"{target.resolve()}: {exc}") from exc
+
+
+def _read_vs_runtime_override_locked(
+    target: Path,
+) -> tuple[dict[str, Any], bool]:
+    """读取并验证用户覆盖；调用者必须已经持有 target 更新锁。"""
+    exists = target.exists()
+    existing = _validate_partial(_read_json(target)) if exists else {}
+    return existing, exists
+
+
+def _write_vs_runtime_override_locked(
+    target: Path, payload: dict[str, Any]
+) -> None:
+    """验证并替换用户覆盖；调用者必须已经持有 target 更新锁。"""
+    _validate_partial(payload)
+    atomic_write_json(target, payload, indent=2)
+
+
+def _update_vs_runtime_override_locked(
+    target: Path,
+    merge: Callable[
+        [dict[str, Any], bool], dict[str, Any] | None
+    ],
+) -> bool:
+    """执行一次已持锁的 read-merge-validate-write 更新。"""
+    existing, exists = _read_vs_runtime_override_locked(target)
+    payload = merge(existing, exists)
+    if payload is None:
+        return False
+    _write_vs_runtime_override_locked(target, payload)
+    return True
+
+
+def _select_missing_override_fields(
+    defaults: dict[str, Any], existing: dict[str, Any]
+) -> dict[str, Any]:
+    """复制 defaults 中在 existing 里真正缺失的叶字段。"""
+    missing: dict[str, Any] = {}
+    for key, value in defaults.items():
+        if key not in existing:
+            missing[key] = deepcopy(value)
+            continue
+        current = existing[key]
+        if isinstance(value, dict) and isinstance(current, dict):
+            nested = _select_missing_override_fields(value, current)
+            if nested:
+                missing[key] = nested
+    return missing
 
 
 def save_vs_runtime_override(
@@ -441,14 +481,17 @@ def merge_missing_vs_runtime_override(
 ) -> bool:
     """在共享更新锁内只填充当前缺失的覆盖字段。"""
     target = Path(path)
-    missing_defaults = _canonicalize_override_paths(
+    candidate_defaults = deepcopy(
         _require_object(defaults, "override defaults")
     )
-    _validate_partial(missing_defaults)
 
     def merge(existing: dict[str, Any], exists: bool):
         if skip_valid_existing and exists:
             return None
-        return _deep_merge(missing_defaults, existing)
+        missing_defaults = _select_missing_override_fields(
+            candidate_defaults, existing
+        )
+        canonical = _canonicalize_override_paths(missing_defaults)
+        return _deep_merge(existing, canonical)
 
     return _update_vs_runtime_override(target, merge)

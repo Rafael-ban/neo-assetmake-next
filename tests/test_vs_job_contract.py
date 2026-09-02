@@ -336,6 +336,25 @@ class RenderJobContractTests(unittest.TestCase):
                 with self.assertRaises(RenderJobError):
                     RenderJob.from_dict(payload)
 
+    def test_job_paths_reject_superscript_com_lpt_devices(self):
+        invalid_paths = (
+            r"D:\COM¹\file.vpy",
+            r"D:\com².log\file.vpy",
+            r"D:\LpT³\file.vpy",
+            r"\\server\share\LPT¹.txt\file.vpy",
+            r"\\server\share\lpt²\file.vpy",
+            r"\\server\share\CoM³.bin\file.vpy",
+        )
+        validator = Draft202012Validator(JOB_SCHEMA)
+        for invalid_path in invalid_paths:
+            payload = make_job().to_dict()
+            payload["source"]["path"] = invalid_path
+            with self.subTest(path=invalid_path, layer="schema"):
+                validator.validate(payload)
+            with self.subTest(path=invalid_path, layer="model"):
+                with self.assertRaises(RenderJobError):
+                    RenderJob.from_dict(payload)
+
     def test_float_api_version_and_rotation_tokens_are_rejected(self):
         invalid_payloads = []
         api_payload = make_job().to_dict()
