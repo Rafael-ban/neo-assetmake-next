@@ -37,7 +37,7 @@ def _import_executor():
         raise AssertionError("portable assetmaker_vs.executor 尚未实现") from exc
 
 
-def _write_job(path: Path) -> None:
+def _write_job(path: Path, *, frame_count: int = 3) -> None:
     root = path.parent.resolve()
     payload = {
         "api_version": 1,
@@ -51,7 +51,7 @@ def _write_job(path: Path) -> None:
         },
         "timeline": {
             "start_frame": 0,
-            "end_frame": 3,
+            "end_frame": frame_count,
             "fps": {"numerator": 30000, "denominator": 1001},
         },
         "transform": {
@@ -127,6 +127,75 @@ def _run_vspipe(
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     return subprocess.run(args, **kwargs)
+
+
+def _run_vspipe_y4m(
+    *, script: Path, job: Path, mode: str
+) -> subprocess.CompletedProcess[bytes]:
+    args = [
+        TOOLCHAIN.vspipe_path,
+        "-c",
+        "y4m",
+        "--arg",
+        f"assetmaker_job={job}",
+        "--arg",
+        f"assetmaker_script={script}",
+        "--arg",
+        "assetmaker_api=1",
+        "--arg",
+        f"assetmaker_mode={mode}",
+        str(RUNNER),
+        "-",
+    ]
+    kwargs: dict[str, object] = {
+        "cwd": ROOT,
+        "capture_output": True,
+        "timeout": 30,
+        "check": False,
+        "env": build_media_subprocess_env(TOOLCHAIN.vspipe_path),
+    }
+    if sys.platform == "win32":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return subprocess.run(args, **kwargs)
+
+
+def _write_invalid_prop_script(
+    path: Path,
+    *,
+    prop: str,
+    value_expression: str,
+    remove_color_range: bool = False,
+) -> None:
+    remove_line = (
+        '    del changed.props["_ColorRange"]\n'
+        if remove_color_range
+        else ""
+    )
+    path.write_text(
+        "# assetmaker-api: 1\n"
+        "# assetmaker-mode: raw\n"
+        "# assetmaker-capabilities: source\n"
+        "# assetmaker-requires:\n"
+        "# assetmaker-editor-output: 0\n\n"
+        "import vapoursynth as vs\n\n"
+        "base = vs.core.std.BlankClip(\n"
+        "    width=384, height=640, length=3,\n"
+        "    fpsnum=30000, fpsden=1001, format=vs.YUV420P8,\n"
+        "    color=[16, 128, 128],\n"
+        ")\n"
+        "base = vs.core.std.SetFrameProps(\n"
+        "    base, _Matrix=6, _Transfer=6, _Primaries=6, _ColorRange=1\n"
+        ")\n\n"
+        "def invalid(n, f):\n"
+        "    changed = f.copy()\n"
+        + remove_line
+        + f"    changed.props[{prop!r}] = {value_expression}\n"
+        "    return changed\n\n"
+        "vs.core.std.ModifyFrame(\n"
+        "    clip=base, clips=base, selector=invalid\n"
+        ").set_output(0)\n",
+        encoding="utf-8",
+    )
 
 
 class PortableExecutorTests(unittest.TestCase):
@@ -237,6 +306,26 @@ class PortableExecutorTests(unittest.TestCase):
             self.assertIs(sys.modules[external_name], external)
             self.assertIn("assetmaker_vs.executor", sys.modules)
 
+    def test_evict_modules_under_removes_namespace_package_path(self):
+        executor = _import_executor()
+        package_name = f"assetmaker_namespace_{uuid.uuid4().hex}"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            modules = root / "modules"
+            package = modules / package_name
+            package.mkdir(parents=True)
+            (package / "child.py").write_text("VALUE = 1\n", encoding="utf-8")
+            sys.path.insert(0, str(modules))
+            self.addCleanup(sys.path.remove, str(modules))
+            namespace = importlib.import_module(package_name)
+            self.addCleanup(sys.modules.pop, package_name, None)
+            self.assertIsNone(namespace.__file__)
+
+            removed = executor.evict_modules_under(root)
+
+        self.assertIn(package_name, removed)
+        self.assertNotIn(package_name, sys.modules)
+
     def test_deferred_frame_callback_keeps_import_path_and_stdout_isolated(self):
         result = _run_child("executor_deferred")
 
@@ -252,6 +341,24 @@ class PortableExecutorTests(unittest.TestCase):
         )
         self.assertTrue(payload["active_during_render"])
         self.assertFalse(payload["active_after_close"])
+
+    def test_real_cross_root_same_name_module_reloads_after_graph_retirement(self):
+        result = _run_child("executor_cross_root")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["first_value"], "from-a")
+        self.assertEqual(payload["second_value"], "from-b")
+        self.assertEqual(
+            Path(payload["active_module_path"]).parent.parent.name, "A"
+        )
+        self.assertEqual(
+            Path(payload["second_module_path"]).parent.parent.name, "B"
+        )
+        self.assertTrue(payload["retired_after_close"])
+        self.assertTrue(payload["retired_second_after_close"])
+        self.assertTrue(payload["helper_preserved"])
+        self.assertTrue(payload["stdlib_preserved"])
 
     def test_stdout_sink_is_thread_safe_and_chunks_below_protocol_limit(self):
         executor = _import_executor()
@@ -382,8 +489,19 @@ print(json.dumps({"ok": True}))
         self.assertEqual(json.loads(result.stdout), {"ok": True})
 
 
-@unittest.skipUnless(TOOLCHAIN.vspipe_path, "bundled VSPipe unavailable")
 class TrustedRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        expected = ROOT / "tools" / "media" / "VSPipe.exe"
+        available = bool(TOOLCHAIN.vspipe_path) and Path(
+            TOOLCHAIN.vspipe_path
+        ).is_file()
+        self.assertTrue(
+            available,
+            "绑定真实 VSPipe 验收不可跳过："
+            f"VSPipe missing；discover_root={ROOT}；"
+            f"expected={expected}；{TOOLCHAIN.describe()}",
+        )
+
     def test_chinese_script_root_imports_modules_and_keeps_stdout_off_y4m(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             project = Path(temp_dir).resolve() / "素材" / "黍"
@@ -408,6 +526,40 @@ class TrustedRunnerTests(unittest.TestCase):
         self.assertNotIn("hello from script", result.stdout)
         self.assertIn("hello from script", result.stderr)
         self.assertIn("lazy module imported", result.stderr)
+
+    def test_real_y4m_stdout_contains_only_stream_and_python_logs_use_stderr(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = Path(temp_dir).resolve() / "素材" / "黍"
+            modules = project / "modules"
+            modules.mkdir(parents=True)
+            script = project / "pipeline.vpy"
+            shutil.copyfile(FIXTURES / "prints_and_imports.vpy", script)
+            (modules / "marker.py").write_text(
+                'VALUE = "marker-from-script-root"\n', encoding="utf-8"
+            )
+            (modules / "lazy_marker.py").write_text(
+                'print("lazy module imported")\nVALUE = "lazy-marker"\n',
+                encoding="utf-8",
+            )
+            job = project / "job.json"
+            _write_job(job)
+
+            result = _run_vspipe_y4m(script=script, job=job, mode="raw")
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            result.stderr.decode("utf-8", errors="replace"),
+        )
+        self.assertTrue(result.stdout.startswith(b"YUV4MPEG2"))
+        for text in (
+            b"hello from script",
+            b"lazy module imported",
+            b"hello from callback",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn(text, result.stdout)
+                self.assertIn(text, result.stderr)
 
     def test_header_mode_mismatch_fails_before_user_script(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -436,6 +588,76 @@ class TrustedRunnerTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("contract.pixel_format", result.stderr)
+
+    def test_convertible_noninteger_props_fail_through_fixed_runner(self):
+        cases = (
+            ("_Matrix", "6.5", False, "matrix"),
+            ("_Transfer", "6.0", False, "transfer"),
+            ("_Primaries", "b'6'", False, "primaries"),
+            ("_Range", "0.0", True, "range"),
+            ("_ColorRange", "1.0", False, "range"),
+            ("_Matrix", "b'not-an-int'", False, "matrix"),
+        )
+        for prop, value_expression, remove_color_range, field in cases:
+            with self.subTest(prop=prop, value=value_expression):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    project = Path(temp_dir).resolve() / "素材" / "黍"
+                    project.mkdir(parents=True)
+                    script = project / "invalid-prop.vpy"
+                    _write_invalid_prop_script(
+                        script,
+                        prop=prop,
+                        value_expression=value_expression,
+                        remove_color_range=remove_color_range,
+                    )
+                    job = project / "job.json"
+                    _write_job(job)
+
+                    result = _run_vspipe(
+                        script=script, job=job, mode="raw"
+                    )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("ASSETMAKER_VS_ERROR", result.stderr)
+                self.assertIn(f'"field":"{field}"', result.stderr)
+
+    def test_real_y4m_sequential_consumption_stops_on_second_frame_drift(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = Path(temp_dir).resolve() / "素材" / "黍"
+            project.mkdir(parents=True)
+            script = project / "late-drift.vpy"
+            shutil.copyfile(FIXTURES / "late_drift.vpy", script)
+            job = project / "job.json"
+            _write_job(job, frame_count=5)
+
+            result = _run_vspipe_y4m(script=script, job=job, mode="raw")
+
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ASSETMAKER_VS_ERROR", stderr)
+        self.assertIn('"field":"matrix"', stderr)
+
+
+class RunnerBindingPolicyTests(unittest.TestCase):
+    def test_bound_runner_suite_cannot_be_hidden_by_missing_tool_skip(self):
+        self.assertNotIn(
+            "__unittest_skip__",
+            TrustedRunnerTests.__dict__,
+            "绑定真实 VSPipe 验收不得通过类级 skip 被包装成绿色",
+        )
+
+    def test_missing_vspipe_is_an_explicit_failure_with_diagnostics(self):
+        case = TrustedRunnerTests(
+            "test_header_mode_mismatch_fails_before_user_script"
+        )
+        with mock.patch(
+            f"{__name__}.TOOLCHAIN", MediaToolchain()
+        ), self.assertRaises(AssertionError) as raised:
+            case.setUp()
+
+        message = str(raised.exception)
+        self.assertIn("VSPipe", message)
+        self.assertIn("missing", message)
 
 
 if __name__ == "__main__":

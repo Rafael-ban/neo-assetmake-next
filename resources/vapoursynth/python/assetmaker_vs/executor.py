@@ -8,7 +8,7 @@ import json
 import os
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
@@ -57,6 +57,41 @@ def _is_under(path: Path, root: Path) -> bool:
         return False
 
 
+def _module_paths(module: Any) -> tuple[Path, ...]:
+    """返回模块可识别的物理来源，包含无 ``__file__`` 的 namespace 包。"""
+    candidates: list[Any] = [getattr(module, "__file__", None)]
+    package_paths = getattr(module, "__path__", ())
+    if isinstance(package_paths, (str, bytes, os.PathLike)):
+        candidates.append(package_paths)
+    else:
+        try:
+            candidates.extend(package_paths)
+        except Exception:
+            # 失去父包的 _NamespacePath 可能在重算时抛 KeyError；单个坏模块
+            # 不应中止整个退休扫描，其 __file__ 仍会在上方独立处理。
+            pass
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            value = os.fsdecode(candidate)
+        except (TypeError, ValueError):
+            continue
+        if not value or value in {"built-in", "frozen"} or value.startswith("<"):
+            continue
+        try:
+            path = Path(value).resolve()
+            key = _path_key(path)
+        except (OSError, TypeError, ValueError):
+            continue
+        if key not in seen:
+            seen.add(key)
+            paths.append(path)
+    return tuple(paths)
+
+
 def evict_modules_under(script_root: str | os.PathLike[str]) -> tuple[str, ...]:
     """只驱逐由当前脚本根加载的模块，永不驱逐 helper 自身。"""
     root = Path(script_root).resolve()
@@ -65,16 +100,12 @@ def evict_modules_under(script_root: str | os.PathLike[str]) -> tuple[str, ...]:
     for name, module in tuple(sys.modules.items()):
         if name == "assetmaker_vs" or name.startswith("assetmaker_vs."):
             continue
-        module_file = getattr(module, "__file__", None)
-        if not module_file:
+        module_paths = _module_paths(module)
+        if not module_paths:
             continue
-        try:
-            path = Path(module_file).resolve()
-        except (OSError, TypeError, ValueError):
+        if any(_is_under(path, helper_package) for path in module_paths):
             continue
-        if _is_under(path, helper_package):
-            continue
-        if _is_under(path, root):
+        if any(_is_under(path, root) for path in module_paths):
             sys.modules.pop(name, None)
             removed.append(name)
     return tuple(removed)
@@ -185,9 +216,20 @@ class ExecutedGraph:
     outputs: Mapping[int, Any]
     script_root: Path
     environment: ExecutionEnvironment
+    _closed: bool = field(default=False, init=False, repr=False)
+    _close_lock: threading.RLock = field(
+        default_factory=threading.RLock, init=False, repr=False
+    )
 
     def close(self) -> None:
-        self.environment.close()
+        """在调用者确认全部 inflight 已终态后退休图及其脚本模块。"""
+        with self._close_lock:
+            if self._closed:
+                return
+            self.environment.close()
+            evict_modules_under(self.script_root)
+            importlib.invalidate_caches()
+            self._closed = True
 
 
 def execute_user_script(
@@ -232,6 +274,8 @@ def execute_user_script(
         )
     except BaseException:
         environment.close()
+        evict_modules_under(script.parent)
+        importlib.invalidate_caches()
         raise
 
 

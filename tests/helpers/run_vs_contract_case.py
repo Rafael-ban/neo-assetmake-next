@@ -77,6 +77,83 @@ def _executor_deferred_case() -> dict[str, object]:
     }
 
 
+def _executor_cross_root_case() -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    vs = _load_vs()
+    from assetmaker_vs import executor as helper_module
+    from assetmaker_vs.executor import execute_user_script
+
+    stdlib_json = sys.modules["json"]
+    script_source = """import vapoursynth as vs
+from marker import VALUE
+
+marker_value = VALUE
+base = vs.core.std.BlankClip(
+    width=16,
+    height=16,
+    length=1,
+    format=vs.GRAY8,
+)
+
+def deferred(n, f):
+    import marker
+    assert marker.VALUE == marker_value
+    return f
+
+vs.core.std.ModifyFrame(
+    clip=base,
+    clips=base,
+    selector=deferred,
+).set_output(0)
+"""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        roots = [Path(temp_dir).resolve() / name for name in ("A", "B")]
+        for root, value in zip(roots, ("from-a", "from-b"), strict=True):
+            modules = root / "modules"
+            modules.mkdir(parents=True)
+            (modules / "marker.py").write_text(
+                f"VALUE = {value!r}\n", encoding="utf-8"
+            )
+            (root / "pipeline.vpy").write_text(
+                script_source, encoding="utf-8"
+            )
+            (root / "job.json").write_text("{}", encoding="utf-8")
+
+        first = execute_user_script(
+            script_path=roots[0] / "pipeline.vpy",
+            job_path=roots[0] / "job.json",
+            api_version="1",
+            mode="raw",
+        )
+        first_value = first.namespace["marker_value"]
+        first_frame = vs.get_output(0).clip.get_frame(0)
+        first_frame.close()
+        active_module_path = str(Path(sys.modules["marker"].__file__).resolve())
+        first.close()
+        retired_after_close = "marker" not in sys.modules
+
+        second = execute_user_script(
+            script_path=roots[1] / "pipeline.vpy",
+            job_path=roots[1] / "job.json",
+            api_version="1",
+            mode="raw",
+        )
+        second_value = second.namespace["marker_value"]
+        second_module_path = str(Path(sys.modules["marker"].__file__).resolve())
+        second.close()
+
+    return {
+        "first_value": first_value,
+        "second_value": second_value,
+        "active_module_path": active_module_path,
+        "second_module_path": second_module_path,
+        "retired_after_close": retired_after_close,
+        "retired_second_after_close": "marker" not in sys.modules,
+        "helper_preserved": sys.modules.get("assetmaker_vs.executor") is helper_module,
+        "stdlib_preserved": sys.modules.get("json") is stdlib_json,
+    }
+
+
 def _job_payload(*, frame_count: int = 5) -> dict[str, object]:
     return {
         "api_version": 1,
@@ -196,6 +273,105 @@ def _contract_late_drift_case() -> dict[str, object]:
             return {"error": contract_error.to_dict()}
         raise
     raise AssertionError("逐帧 guard 未拒绝第 2 帧的 matrix 漂移")
+
+
+def _invalid_prop_clip(
+    vs,
+    *,
+    prop: str,
+    value: object,
+    late: bool = False,
+    remove_color_range: bool = False,
+):
+    base = _tagged_clip(vs)
+
+    def invalid(n, f):
+        if late and n != 1:
+            return f
+        changed = f.copy()
+        if remove_color_range:
+            del changed.props["_ColorRange"]
+        changed.props[prop] = value
+        return changed
+
+    return vs.core.std.ModifyFrame(clip=base, clips=base, selector=invalid)
+
+
+def _contract_strict_types_case() -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    vs = _load_vs()
+    from assetmaker_vs.contract import (
+        OutputContractError,
+        decode_output_contract_error,
+        validate_outputs,
+    )
+
+    cases = (
+        ("_Matrix", 6.5, False),
+        ("_Transfer", 6.0, False),
+        ("_Primaries", b"6", False),
+        ("_Range", 0.0, True),
+        ("_ColorRange", 1.0, False),
+    )
+    results: dict[str, object] = {}
+    for prop, value, remove_color_range in cases:
+        clip = _invalid_prop_clip(
+            vs,
+            prop=prop,
+            value=value,
+            remove_color_range=remove_color_range,
+        )
+        vs.clear_outputs()
+        clip.set_output(0)
+        try:
+            validate_outputs(vs, _job_payload(), _raw_header())
+        except OutputContractError as exc:
+            decoded = decode_output_contract_error(exc)
+            results[prop] = {
+                "error": (decoded or exc).to_dict(),
+            }
+        else:
+            results[prop] = {"accepted": True}
+    return {"results": results}
+
+
+def _contract_bytes_case(*, late: bool) -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    vs = _load_vs()
+    from assetmaker_vs.contract import (
+        decode_output_contract_error,
+        validate_outputs,
+    )
+
+    clip = _invalid_prop_clip(
+        vs,
+        prop="_Matrix",
+        value=b"not-an-int",
+        late=late,
+    )
+    vs.clear_outputs()
+    clip.set_output(0)
+    try:
+        validated = validate_outputs(vs, _job_payload(), _raw_header())
+        if late:
+            validated.guarded_clip.get_frame(1)
+    except BaseException as exc:
+        decoded = decode_output_contract_error(exc)
+        if decoded is None:
+            return {
+                "exception": type(exc).__name__,
+                "message": str(exc),
+            }
+        return {"error": decoded.to_dict()}
+    return {"accepted": True}
+
+
+def _contract_bytes_sentinel_case() -> dict[str, object]:
+    return _contract_bytes_case(late=False)
+
+
+def _contract_bytes_late_case() -> dict[str, object]:
+    return _contract_bytes_case(late=True)
 
 
 def _range_probe_case() -> dict[str, object]:
@@ -848,7 +1024,10 @@ def _default_p7_case() -> dict[str, object]:
 
 
 CASES = {
+    "contract_bytes_late": _contract_bytes_late_case,
+    "contract_bytes_sentinel": _contract_bytes_sentinel_case,
     "contract_late_drift": _contract_late_drift_case,
+    "contract_strict_types": _contract_strict_types_case,
     "contract_valid": _contract_valid_case,
     "display_center": _display_center_case,
     "display_geometry": _display_geometry_case,
@@ -856,6 +1035,7 @@ CASES = {
     "default_p7": _default_p7_case,
     "default_video": _default_video_case,
     "executor_deferred": _executor_deferred_case,
+    "executor_cross_root": _executor_cross_root_case,
     "range_probe": _range_probe_case,
 }
 

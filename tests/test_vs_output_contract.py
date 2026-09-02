@@ -9,6 +9,7 @@ import unittest
 from collections import namedtuple
 from fractions import Fraction
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,7 +35,7 @@ class FakeFormat:
 
 
 class FakeFrame:
-    def __init__(self, node: "FakeVideoNode", props: dict[str, int]):
+    def __init__(self, node: "FakeVideoNode", props: dict[str, Any]):
         self.width = node.width
         self.height = node.height
         self.format = node.format
@@ -54,7 +55,7 @@ class FakeVideoNode:
         fps: tuple[int, int] = (30000, 1001),
         format_id: int = 100,
         format_name: str = "YUV420P8",
-        props_by_frame: list[dict[str, int]] | None = None,
+        props_by_frame: list[dict[str, Any]] | None = None,
     ):
         self.width = width
         self.height = height
@@ -375,6 +376,88 @@ class OutputContractPureTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.field, "matrix")
 
+    def test_frame_props_require_exact_int_type(self):
+        contract = _contract_module()
+        base = {
+            "_Matrix": 6,
+            "_Transfer": 6,
+            "_Primaries": 6,
+            "_ColorRange": 1,
+        }
+        cases = (
+            ("_Matrix", "matrix", 6, False),
+            ("_Transfer", "transfer", 6, False),
+            ("_Primaries", "primaries", 6, False),
+            ("_Range", "range", 0, True),
+            ("_ColorRange", "range", 1, False),
+        )
+        for prop, field, valid_code, remove_color_range in cases:
+            invalid_values = (
+                bool(valid_code),
+                float(valid_code),
+                str(valid_code),
+                str(valid_code).encode("ascii"),
+            )
+            for actual in invalid_values:
+                props = dict(base)
+                if remove_color_range:
+                    props.pop("_ColorRange")
+                props[prop] = actual
+                with self.subTest(prop=prop, actual=actual):
+                    with self.assertRaises(
+                        contract.OutputContractError
+                    ) as raised:
+                        _validated(
+                            FakeVideoNode(props_by_frame=[props] * 5)
+                        )
+                    self.assertEqual(raised.exception.field, field)
+                    if isinstance(actual, bytes):
+                        self.assertEqual(
+                            raised.exception.actual,
+                            {
+                                "type": "bytes",
+                                "length": len(actual),
+                                "hex": actual.hex(),
+                                "truncated": False,
+                            },
+                        )
+                    else:
+                        self.assertEqual(raised.exception.actual, actual)
+
+    def test_arbitrary_frame_prop_actual_is_bounded_json_and_decodable(self):
+        contract = _contract_module()
+
+        class HugeActual:
+            def __repr__(self) -> str:
+                return "hostile-" + "黍" * 100_000
+
+        for actual in (b"x" * 1_000_000, HugeActual()):
+            props = {
+                "_Matrix": actual,
+                "_Transfer": 6,
+                "_Primaries": 6,
+                "_ColorRange": 1,
+            }
+            with self.subTest(actual_type=type(actual).__name__):
+                with self.assertRaises(
+                    contract.OutputContractError
+                ) as raised:
+                    _validated(FakeVideoNode(props_by_frame=[props] * 5))
+                serialized = json.dumps(
+                    raised.exception.to_dict(), ensure_ascii=True
+                )
+                self.assertLess(len(serialized), 4096)
+                decoded = contract.decode_output_contract_error(
+                    str(raised.exception)
+                )
+                self.assertIsNotNone(decoded)
+                self.assertEqual(decoded.to_dict(), raised.exception.to_dict())
+                self.assertIsInstance(raised.exception.actual, dict)
+                self.assertEqual(
+                    raised.exception.actual["type"], type(actual).__name__
+                )
+                self.assertTrue(raised.exception.actual["truncated"])
+
     def test_guard_rejects_non_sentinel_second_frame(self):
         contract = _contract_module()
         good = {
@@ -439,6 +522,46 @@ class OutputContractRealSubprocessTests(unittest.TestCase):
         self.assertEqual(payload["limited"].get("_ColorRange"), 1)
         self.assertEqual(payload["full"].get("_ColorRange"), 0)
         self.assertNotIn("_Range", payload["limited"])
+
+    def test_real_r73_rejects_convertible_noninteger_frame_props(self):
+        result = _run_child("contract_strict_types")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        payload = json.loads(result.stdout)
+        expected_fields = {
+            "_Matrix": "matrix",
+            "_Transfer": "transfer",
+            "_Primaries": "primaries",
+            "_Range": "range",
+            "_ColorRange": "range",
+        }
+        for prop, field in expected_fields.items():
+            with self.subTest(prop=prop):
+                self.assertIn("error", payload["results"][prop])
+                self.assertEqual(
+                    payload["results"][prop]["error"]["field"], field
+                )
+
+    def test_real_bytes_actual_survives_sentinel_guard_and_decode(self):
+        for case in ("contract_bytes_sentinel", "contract_bytes_late"):
+            with self.subTest(case=case):
+                result = _run_child(case)
+
+                self.assertEqual(
+                    result.returncode, 0, result.stderr or result.stdout
+                )
+                payload = json.loads(result.stdout)
+                self.assertIn("error", payload)
+                self.assertEqual(payload["error"]["field"], "matrix")
+                self.assertEqual(
+                    payload["error"]["actual"],
+                    {
+                        "type": "bytes",
+                        "length": 10,
+                        "hex": "6e6f742d616e2d696e74",
+                        "truncated": False,
+                    },
+                )
 
 
 if __name__ == "__main__":

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Iterable
 
@@ -16,12 +18,175 @@ X264_MATRIX = {1: "bt709", 6: "smpte170m"}
 X264_TRANSFER = {1: "bt709", 6: "smpte170m"}
 X264_PRIMARIES = {1: "bt709", 6: "smpte170m"}
 _CODE_LABELS = {1: "709", 6: "170m"}
+_MAX_ERROR_BYTES = 64
+_MAX_ERROR_ITEMS = 16
+_MAX_ERROR_NODES = 64
+_MAX_ERROR_STRING_CHARS = 256
+
+
+def _bounded_text(value: str) -> tuple[str, bool]:
+    if len(value) <= _MAX_ERROR_STRING_CHARS:
+        return value, False
+    return value[:_MAX_ERROR_STRING_CHARS], True
+
+
+def _type_name(value: Any) -> str:
+    name, _ = _bounded_text(type(value).__name__)
+    return name
+
+
+def _json_key(value: Any) -> str:
+    if type(value) is str:
+        text = value
+    else:
+        try:
+            text = repr(value)
+        except BaseException as exc:
+            text = f"<repr failed: {type(exc).__name__}>"
+    text, truncated = _bounded_text(text)
+    return text + ("…" if truncated else "")
+
+
+def _json_safe(
+    value: Any,
+    *,
+    _remaining: list[int] | None = None,
+    _seen: set[int] | None = None,
+) -> Any:
+    """把错误载荷收敛为有界 JSON 值，不调用用户对象的无界编码器。"""
+    remaining = [_MAX_ERROR_NODES] if _remaining is None else _remaining
+    seen = set() if _seen is None else _seen
+    remaining[0] -= 1
+    value_type = _type_name(value)
+    if remaining[0] < 0:
+        return {"type": value_type, "truncated": True}
+    if value is None or type(value) is bool:
+        return value
+    if type(value) is int:
+        bits = value.bit_length()
+        if bits <= 256:
+            return value
+        magnitude = abs(value)
+        prefix = magnitude >> max(0, bits - 64)
+        return {
+            "type": "int",
+            "bits": bits,
+            "hex_prefix": hex(prefix),
+            "negative": value < 0,
+            "truncated": True,
+        }
+    if type(value) is float:
+        if math.isfinite(value):
+            return value
+        return {
+            "type": "float",
+            "value": repr(value),
+            "truncated": False,
+        }
+    if type(value) is str:
+        text, truncated = _bounded_text(value)
+        if not truncated:
+            return text
+        return {
+            "type": "str",
+            "length": len(value),
+            "text": text,
+            "truncated": True,
+        }
+    if type(value) in (bytes, bytearray):
+        prefix = bytes(value[:_MAX_ERROR_BYTES])
+        return {
+            "type": value_type,
+            "length": len(value),
+            "hex": prefix.hex(),
+            "truncated": len(value) > len(prefix),
+        }
+
+    object_id = id(value)
+    if object_id in seen:
+        return {"type": value_type, "cycle": True, "truncated": True}
+    if type(value) in (list, tuple):
+        seen.add(object_id)
+        try:
+            values = [
+                _json_safe(item, _remaining=remaining, _seen=seen)
+                for item in value[:_MAX_ERROR_ITEMS]
+            ]
+            if len(value) > _MAX_ERROR_ITEMS:
+                values.append(
+                    {
+                        "type": value_type,
+                        "remaining": len(value) - _MAX_ERROR_ITEMS,
+                        "truncated": True,
+                    }
+                )
+            return values
+        finally:
+            seen.remove(object_id)
+    if isinstance(value, Mapping):
+        seen.add(object_id)
+        try:
+            result: dict[str, Any] = {}
+            try:
+                iterator = iter(value.items())
+                for index in range(_MAX_ERROR_ITEMS + 1):
+                    try:
+                        key, item = next(iterator)
+                    except StopIteration:
+                        break
+                    if index == _MAX_ERROR_ITEMS:
+                        result["__assetmaker_truncated__"] = True
+                        break
+                    result[_json_key(key)] = _json_safe(
+                        item, _remaining=remaining, _seen=seen
+                    )
+                return result
+            except BaseException as exc:
+                return {
+                    "type": value_type,
+                    "mapping_error": type(exc).__name__,
+                    "truncated": True,
+                }
+        finally:
+            seen.remove(object_id)
+
+    try:
+        representation = repr(value)
+    except BaseException as exc:
+        representation = f"<repr failed: {type(exc).__name__}>"
+    representation, truncated = _bounded_text(representation)
+    return {
+        "type": value_type,
+        "repr": representation,
+        "truncated": truncated,
+    }
 
 
 class OutputContractError(AssetmakerVSError):
     """脚本注册的输出不满足编码或编辑画布契约。"""
 
     MARKER = "ASSETMAKER_VS_ERROR:"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        field: str | None = None,
+        path: str | None = None,
+        expected: Any = None,
+        actual: Any = None,
+        hint: str | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            code=code,
+            field=field,
+            path=path,
+            expected=_json_safe(expected),
+            actual=_json_safe(actual),
+            hint=hint,
+        )
 
     def _format_message(self) -> str:
         payload = self.to_dict()
@@ -188,23 +353,17 @@ def _check_node_static(vs: Any, clip: Any, job: dict[str, Any]) -> None:
 def _range_value(props: Any) -> str:
     values: list[str] = []
     if "_Range" in props:
-        try:
-            code = int(props["_Range"])
-        except (TypeError, ValueError) as exc:
-            raise _error(
-                "range", ["limited", "full"], props["_Range"]
-            ) from exc
+        code = props["_Range"]
+        if type(code) is not int:
+            raise _error("range", ["limited", "full"], code)
         try:
             values.append({0: "limited", 1: "full"}[code])
         except KeyError as exc:
             raise _error("range", ["limited", "full"], code) from exc
     if "_ColorRange" in props:
-        try:
-            code = int(props["_ColorRange"])
-        except (TypeError, ValueError) as exc:
-            raise _error(
-                "range", ["limited", "full"], props["_ColorRange"]
-            ) from exc
+        code = props["_ColorRange"]
+        if type(code) is not int:
+            raise _error("range", ["limited", "full"], code)
         try:
             values.append({1: "limited", 0: "full"}[code])
         except KeyError as exc:
@@ -228,10 +387,9 @@ def _code_value(
         raise _error(field, sorted(known), expected_name)
     if prop not in props:
         raise _error(field, expected_name, None)
-    try:
-        code = int(props[prop])
-    except (TypeError, ValueError) as exc:
-        raise _error(field, expected_name, props[prop]) from exc
+    code = props[prop]
+    if type(code) is not int:
+        raise _error(field, expected_name, code)
     actual_name = _CODE_LABELS.get(code, code)
     if code != known[expected_name]:
         raise _error(field, expected_name, actual_name)
