@@ -34,9 +34,9 @@ CASES = {
         start_frame=0, end_frame=30, fps=30.0, resolution="360x640",
         is_image=True, rotation=90,
     ),
-    "image_480x854": VideoExportParams(
+    "image_720x1080": VideoExportParams(
         video_path=r"C:\media\logo.png", cropbox=(0, 0, 0, 0),
-        start_frame=0, end_frame=30, fps=30.0, resolution="480x854", is_image=True,
+        start_frame=0, end_frame=30, fps=30.0, resolution="720x1080", is_image=True,
     ),
     "video_720x1080": VideoExportParams(
         video_path=r"C:\media\hd.mp4", cropbox=(0, 0, 0, 0),

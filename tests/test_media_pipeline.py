@@ -191,7 +191,7 @@ class VapourSynthScriptTests(unittest.TestCase):
             start_frame=0,
             end_frame=30,
             fps=30.0,
-            resolution="480x854",
+            resolution="720x1080",
             is_image=True,
         )
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -203,8 +203,8 @@ class VapourSynthScriptTests(unittest.TestCase):
         self.assertIn("core.std.Loop", script)
         self.assertIn("times=30", script)
         self.assertNotIn("length=30", script)
-        self.assertIn("width=480", script)
-        self.assertIn("height=854", script)
+        self.assertIn("width=720", script)
+        self.assertIn("height=1080", script)
         # RGB->YUV conversion matrix must match the smpte170m VUI tags (sub-HD
         # targets decode as BT.601 by convention; the old '709' produced a
         # visible colour shift on export).
