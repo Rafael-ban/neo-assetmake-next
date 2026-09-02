@@ -570,11 +570,18 @@ def run_cxfreeze(skip_flasher=False, source_root=None):
         ),  # 运行时通过 class_icons/ 相对路径访问
     ]
 
-    # VS 配置单一事实源:随包分发默认 config/vsconfig.json,装好后用户可就地
-    # 编辑(加插件到 required_plugins 等);缺失时代码回落 dataclass 默认值。
-    if os.path.exists(os.path.join("config", "vsconfig.json")):
-        include_files.append(("config/vsconfig.json", "config/vsconfig.json"))
-        print("  Including VS config: config/vsconfig.json")
+    # M1 同时分发严格的运行配置/作业 schema 和旧 vsconfig。旧文件暂留用于
+    # 一次性迁移；全局脚本等用户选择只写 APPDATA 下的 user override。
+    vs_contract_files = (
+        "config/vs_runtime.json",
+        "config/vsconfig.json",
+        "schemas/vs_runtime.schema.json",
+        "schemas/vs_job.schema.json",
+    )
+    for contract_path in vs_contract_files:
+        if os.path.exists(contract_path):
+            include_files.append((contract_path, contract_path))
+            print(f"  Including VS contract: {contract_path}")
     for runtime_name, runtime_path in pyarmor_runtimes:
         include_files.append((runtime_path, runtime_name))
         print(f"  Including PyArmor runtime: {runtime_path}")

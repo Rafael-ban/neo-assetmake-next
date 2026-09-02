@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rhodesepass.local/schemas/vs_runtime.schema.json",
+  "title": "VSRuntimeConfig",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "worker", "core", "plugins", "scripts"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "startup_timeout_ms",
+        "frame_timeout_ms",
+        "shutdown_timeout_ms"
+      ],
+      "properties": {
+        "startup_timeout_ms": {"type": "integer", "minimum": 0},
+        "frame_timeout_ms": {"type": "integer", "minimum": 0},
+        "shutdown_timeout_ms": {"type": "integer", "minimum": 0}
+      }
+    },
+    "core": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["num_threads", "max_cache_size_mb"],
+      "properties": {
+        "num_threads": {"type": "integer", "minimum": 0},
+        "max_cache_size_mb": {"type": "integer", "minimum": 0}
+      }
+    },
+    "plugins": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["native_plugin_dirs", "python_module_dirs"],
+      "properties": {
+        "native_plugin_dirs": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "python_module_dirs": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "scripts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["global_script_path"],
+      "properties": {
+        "global_script_path": {"type": "string"}
+      }
+    }
+  }
+}

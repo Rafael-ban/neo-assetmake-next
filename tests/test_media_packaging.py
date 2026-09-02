@@ -25,10 +25,15 @@ class MediaPackagingTests(unittest.TestCase):
             with self.subTest(expected_token=expected_token):
                 self.assertIn(expected_token, self.build_source)
 
-    def test_build_script_packages_vsconfig(self):
-        # The VS config single source of truth must ship so the installed app
-        # can read + override it (load_vsconfig falls back to defaults if absent).
+    def test_build_script_packages_runtime_and_legacy_vs_configs(self):
+        # M1 ships the strict runtime config while retaining legacy vsconfig
+        # until its one-time migration has completed in installed builds.
+        self.assertIn("config/vs_runtime.json", self.build_source)
         self.assertIn("config/vsconfig.json", self.build_source)
+
+    def test_build_script_packages_runtime_contract_schemas(self):
+        self.assertIn("schemas/vs_runtime.schema.json", self.build_source)
+        self.assertIn("schemas/vs_job.schema.json", self.build_source)
 
     def test_runtime_source_does_not_reference_removed_ffmpeg_stack(self):
         disallowed_tokens = (

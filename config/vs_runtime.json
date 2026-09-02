@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "worker": {
+    "startup_timeout_ms": 15000,
+    "frame_timeout_ms": 10000,
+    "shutdown_timeout_ms": 3000
+  },
+  "core": {
+    "num_threads": 0,
+    "max_cache_size_mb": 0
+  },
+  "plugins": {
+    "native_plugin_dirs": [],
+    "python_module_dirs": []
+  },
+  "scripts": {
+    "global_script_path": ""
+  }
+}
