@@ -35,6 +35,7 @@ from core.vs_runtime.session import (
     GENERATION_STAGING_ROOT_ENV,
     GenerationStagingRoot,
     RenderSession,
+    ScriptBundleSnapshot,
     ScriptSelection,
     compute_script_bundle_hash,
 )
@@ -559,6 +560,301 @@ class WorkerProcessTransportTests(unittest.TestCase):
             Path(failed_env[GENERATION_STAGING_ROOT_ENV]).exists()
         )
         self.assertTrue(process.alive)
+
+    def test_marker_write_failure_is_wrapped_before_popen_and_root_is_cleaned(self):
+        class MarkerWriteError(OSError):
+            pass
+
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        events = []
+        process.add_listener(events.append)
+        roots = []
+        real_mkdtemp = tempfile.mkdtemp
+
+        def capture_mkdtemp(*args, **kwargs):
+            root = real_mkdtemp(*args, **kwargs)
+            roots.append(Path(root).resolve())
+            return root
+
+        with (
+            mock.patch(
+                "core.vs_runtime.session.tempfile.mkdtemp",
+                side_effect=capture_mkdtemp,
+            ),
+            mock.patch(
+                "core.vs_runtime.session.Path.write_text",
+                autospec=True,
+                side_effect=MarkerWriteError("marker write denied"),
+            ),
+            mock.patch(
+                "core.vs_runtime.worker_process.subprocess.Popen"
+            ) as popen,
+        ):
+            with self.assertRaises(WorkerProcessError) as raised:
+                process.start()
+
+        self.assertEqual(len(roots), 1)
+        self.assertFalse(roots[0].exists())
+        self.assertIn("worker.staging_identity_failed", str(raised.exception))
+        self.assertIn("marker write denied", str(raised.exception))
+        self.assertEqual(process.generation, 0)
+        self.assertIsNone(process._process)
+        self.assertIsNone(process._generation_staging)
+        self.assertEqual(events, [])
+        popen.assert_not_called()
+
+    def test_marker_and_cleanup_failure_retains_owner_with_safe_diagnostic(self):
+        class HostileMarkerError(OSError):
+            def __str__(self):
+                raise ValueError("broken marker error string")
+
+        class HostileCleanupError(PermissionError):
+            def __str__(self):
+                raise ValueError("broken cleanup error string")
+
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        events = []
+        process.add_listener(events.append)
+        roots = []
+        real_mkdtemp = tempfile.mkdtemp
+        real_remove = ScriptBundleSnapshot._remove_tree
+
+        def capture_mkdtemp(*args, **kwargs):
+            root = real_mkdtemp(*args, **kwargs)
+            roots.append(Path(root).resolve())
+            return root
+
+        try:
+            with (
+                mock.patch(
+                    "core.vs_runtime.session.tempfile.mkdtemp",
+                    side_effect=capture_mkdtemp,
+                ),
+                mock.patch(
+                    "core.vs_runtime.session.Path.write_text",
+                    autospec=True,
+                    side_effect=HostileMarkerError(),
+                ),
+                mock.patch.object(
+                    ScriptBundleSnapshot,
+                    "_remove_tree",
+                    side_effect=HostileCleanupError(),
+                ),
+                mock.patch(
+                    "core.vs_runtime.worker_process.subprocess.Popen"
+                ) as popen,
+            ):
+                with self.assertRaises(WorkerProcessError) as raised:
+                    process.start()
+
+            message = str(raised.exception)
+            self.assertIn("worker.staging_identity_failed", message)
+            self.assertIn("HostileMarkerError", message)
+            self.assertIn("worker.staging_cleanup_failed", message)
+            self.assertIn("HostileCleanupError", message)
+            self.assertEqual(len(roots), 1)
+            self.assertTrue(roots[0].is_dir())
+            self.assertIsNotNone(process._generation_staging)
+            self.assertEqual(
+                process._generation_staging.root_path.resolve(), roots[0]
+            )
+            self.assertEqual(process.generation, 0)
+            self.assertIsNone(process._process)
+            self.assertEqual(events, [])
+            popen.assert_not_called()
+        finally:
+            for root in roots:
+                if root.exists():
+                    real_remove(root)
+
+    def test_next_start_cleans_retained_owner_before_allocating_fresh_root(self):
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        roots = []
+        real_mkdtemp = tempfile.mkdtemp
+        real_write_text = Path.write_text
+        real_remove = ScriptBundleSnapshot._remove_tree
+        write_calls = 0
+        remove_calls = 0
+
+        def capture_mkdtemp(*args, **kwargs):
+            if roots:
+                self.assertFalse(
+                    roots[0].exists(),
+                    "必须先清理 retained owner，才能创建新 generation root",
+                )
+            root = real_mkdtemp(*args, **kwargs)
+            roots.append(Path(root).resolve())
+            return root
+
+        def fail_first_marker(path, data, *args, **kwargs):
+            nonlocal write_calls
+            write_calls += 1
+            if write_calls == 1:
+                raise OSError("first marker failed")
+            return real_write_text(path, data, *args, **kwargs)
+
+        def fail_first_remove(root):
+            nonlocal remove_calls
+            remove_calls += 1
+            if remove_calls == 1:
+                raise PermissionError("first cleanup failed")
+            return real_remove(root)
+
+        try:
+            with (
+                mock.patch(
+                    "core.vs_runtime.session.tempfile.mkdtemp",
+                    side_effect=capture_mkdtemp,
+                ),
+                mock.patch(
+                    "core.vs_runtime.session.Path.write_text",
+                    autospec=True,
+                    side_effect=fail_first_marker,
+                ),
+                mock.patch.object(
+                    ScriptBundleSnapshot,
+                    "_remove_tree",
+                    side_effect=fail_first_remove,
+                ),
+                mock.patch(
+                    "core.vs_runtime.worker_process.subprocess.Popen",
+                    side_effect=OSError("fresh spawn reached"),
+                ) as popen,
+            ):
+                with self.assertRaises(WorkerProcessError) as first:
+                    process.start()
+                with self.assertRaisesRegex(
+                    WorkerProcessError, "fresh spawn reached"
+                ):
+                    process.start()
+
+            self.assertIn("worker.staging_cleanup_failed", str(first.exception))
+            self.assertEqual(len(roots), 2)
+            self.assertFalse(roots[0].exists())
+            self.assertFalse(roots[1].exists())
+            self.assertIsNone(process._generation_staging)
+            self.assertEqual(process.generation, 0)
+            self.assertEqual(popen.call_count, 1)
+        finally:
+            for root in roots:
+                if root.exists():
+                    real_remove(root)
+
+    def test_next_start_keeps_retained_owner_when_cleanup_still_fails(self):
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        roots = []
+        real_mkdtemp = tempfile.mkdtemp
+        real_remove = ScriptBundleSnapshot._remove_tree
+
+        def capture_mkdtemp(*args, **kwargs):
+            root = real_mkdtemp(*args, **kwargs)
+            roots.append(Path(root).resolve())
+            return root
+
+        try:
+            with (
+                mock.patch(
+                    "core.vs_runtime.session.tempfile.mkdtemp",
+                    side_effect=capture_mkdtemp,
+                ),
+                mock.patch(
+                    "core.vs_runtime.session.Path.write_text",
+                    autospec=True,
+                    side_effect=OSError("marker failed"),
+                ),
+                mock.patch.object(
+                    ScriptBundleSnapshot,
+                    "_remove_tree",
+                    side_effect=PermissionError("cleanup still denied"),
+                ),
+                mock.patch(
+                    "core.vs_runtime.worker_process.subprocess.Popen"
+                ) as popen,
+            ):
+                with self.assertRaises(WorkerProcessError):
+                    process.start()
+                retained = process._generation_staging
+                with self.assertRaises(WorkerProcessError) as second:
+                    process.start()
+
+            self.assertIn(
+                "worker.staging_cleanup_failed", str(second.exception)
+            )
+            self.assertEqual(len(roots), 1)
+            self.assertIs(process._generation_staging, retained)
+            self.assertTrue(roots[0].is_dir())
+            self.assertEqual(process.generation, 0)
+            popen.assert_not_called()
+        finally:
+            for root in roots:
+                if root.exists():
+                    real_remove(root)
+
+    def test_close_retries_retained_owner_without_async_terminal(self):
+        process = WorkerProcess(
+            command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
+        )
+        events = []
+        process.add_listener(events.append)
+        roots = []
+        real_mkdtemp = tempfile.mkdtemp
+        real_remove = ScriptBundleSnapshot._remove_tree
+        remove_calls = 0
+
+        def capture_mkdtemp(*args, **kwargs):
+            root = real_mkdtemp(*args, **kwargs)
+            roots.append(Path(root).resolve())
+            return root
+
+        def fail_first_remove(root):
+            nonlocal remove_calls
+            remove_calls += 1
+            if remove_calls == 1:
+                raise PermissionError("initial cleanup denied")
+            return real_remove(root)
+
+        try:
+            with (
+                mock.patch(
+                    "core.vs_runtime.session.tempfile.mkdtemp",
+                    side_effect=capture_mkdtemp,
+                ),
+                mock.patch(
+                    "core.vs_runtime.session.Path.write_text",
+                    autospec=True,
+                    side_effect=OSError("marker failed"),
+                ),
+                mock.patch.object(
+                    ScriptBundleSnapshot,
+                    "_remove_tree",
+                    side_effect=fail_first_remove,
+                ),
+                mock.patch(
+                    "core.vs_runtime.worker_process.subprocess.Popen"
+                ) as popen,
+            ):
+                with self.assertRaises(WorkerProcessError):
+                    process.start()
+                self.assertTrue(roots[0].is_dir())
+                process.close()
+
+            self.assertFalse(roots[0].exists())
+            self.assertIsNone(process._generation_staging)
+            self.assertEqual(process.generation, 0)
+            self.assertEqual(events, [])
+            popen.assert_not_called()
+        finally:
+            for root in roots:
+                if root.exists():
+                    real_remove(root)
 
     def test_staging_identity_failure_before_popen_is_wrapped_and_cleaned(self):
         process = WorkerProcess(
@@ -1731,6 +2027,7 @@ class WorkerServerFrameTests(unittest.TestCase):
             _write_job(job, epoch=7)
             session = _session(script, job, epoch=7)
             generation_staging = GenerationStagingRoot.create()
+            generation_staging.initialize_marker()
             self.addCleanup(generation_staging.close)
             server = WorkerServer(
                 writer=Writer(),
@@ -1830,6 +2127,7 @@ class WorkerServerFrameTests(unittest.TestCase):
             _write_job(job, epoch=7)
             session = _session(script, job, epoch=7)
             generation_staging = GenerationStagingRoot.create()
+            generation_staging.initialize_marker()
             self.addCleanup(generation_staging.close)
             server = WorkerServer(
                 writer=mock.Mock(),
@@ -1896,6 +2194,7 @@ class WorkerServerFrameTests(unittest.TestCase):
         server.runtime = load_vs_runtime()
         server.runtime_fingerprint = "a" * 64
         server.generation_staging = GenerationStagingRoot.create()
+        server.generation_staging.initialize_marker()
         self.addCleanup(server.generation_staging.close)
         with tempfile.TemporaryDirectory() as temp_dir:
             script = Path(temp_dir) / "pipeline.vpy"
@@ -1953,6 +2252,7 @@ class WorkerServerFrameTests(unittest.TestCase):
         server.runtime = load_vs_runtime()
         server.runtime_fingerprint = "a" * 64
         server.generation_staging = GenerationStagingRoot.create()
+        server.generation_staging.initialize_marker()
         self.addCleanup(server.generation_staging.close)
         with tempfile.TemporaryDirectory() as temp_dir:
             script = Path(temp_dir) / "pipeline.vpy"

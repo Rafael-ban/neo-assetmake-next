@@ -336,8 +336,20 @@ class GenerationStagingRoot:
     """由 host 持有、跨越一个 worker generation 的 staging 根。"""
 
     root_path: Path
-    owner_token: str
+    owner_token: str = ""
     _closed: bool = False
+    _marker_initialized: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _owns_unmarked_root: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _lock: threading.Lock = field(
         default_factory=threading.Lock,
         init=False,
@@ -347,16 +359,32 @@ class GenerationStagingRoot:
 
     @classmethod
     def create(cls) -> "GenerationStagingRoot":
-        root = Path(tempfile.mkdtemp(prefix=_GENERATION_STAGING_PREFIX)).resolve()
-        token = secrets.token_hex(32)
-        try:
+        """只分配目录并返回精确 owner；marker 由调用者随后初始化。"""
+        staging = cls(
+            root_path=Path(
+                tempfile.mkdtemp(prefix=_GENERATION_STAGING_PREFIX)
+            )
+        )
+        staging._owns_unmarked_root = True
+        return staging
+
+    def initialize_marker(self) -> None:
+        """在 owner 已交给 host 后建立跨进程 ownership marker。"""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("worker generation staging 已关闭")
+            if self._marker_initialized:
+                return
+            root = self.root_path.resolve(strict=True)
+            if not root.name.startswith(_GENERATION_STAGING_PREFIX):
+                raise RuntimeError("worker generation staging 根名称非法")
+            token = secrets.token_hex(32)
             (root / _GENERATION_STAGING_MARKER).write_text(
                 token, encoding="ascii"
             )
-            return cls(root_path=root, owner_token=token)
-        except BaseException:
-            ScriptBundleSnapshot._remove_tree(root)
-            raise
+            self.root_path = root
+            self.owner_token = token
+            self._marker_initialized = True
 
     @classmethod
     def from_environment(
@@ -370,6 +398,7 @@ class GenerationStagingRoot:
             root_path=Path(root_value).resolve(strict=True),
             owner_token=token,
         )
+        staging._marker_initialized = True
         staging._verify_owner()
         return staging
 
@@ -381,6 +410,8 @@ class GenerationStagingRoot:
         }
 
     def _verify_owner(self) -> None:
+        if not self._marker_initialized:
+            raise RuntimeError("worker generation staging ownership marker 未初始化")
         root = self.root_path.resolve(strict=True)
         if not root.name.startswith(_GENERATION_STAGING_PREFIX):
             raise RuntimeError("worker generation staging 根名称非法")
@@ -408,7 +439,17 @@ class GenerationStagingRoot:
             if not self.root_path.exists():
                 self._closed = True
                 return
-            self._verify_owner()
+            if self._marker_initialized:
+                self._verify_owner()
+            else:
+                if not self._owns_unmarked_root:
+                    raise RuntimeError(
+                        "worker generation staging 未初始化 owner 不可清理"
+                    )
+                root = self.root_path.resolve(strict=True)
+                if not root.name.startswith(_GENERATION_STAGING_PREFIX):
+                    raise RuntimeError("worker generation staging 根名称非法")
+                self.root_path = root
             ScriptBundleSnapshot._remove_tree(self.root_path)
             self._closed = True
 

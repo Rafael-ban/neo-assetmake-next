@@ -80,6 +80,7 @@ _ERROR_FIELDS = {
 }
 MAX_STDERR_LINE_BYTES = 64 * 1024
 STAGING_CLEANUP_ERROR_CODE = "worker.staging_cleanup_failed"
+STAGING_IDENTITY_ERROR_CODE = "worker.staging_identity_failed"
 WORKER_START_ERROR_CODE = "worker.start_failed"
 
 
@@ -244,9 +245,19 @@ class WorkerProcess:
             return cls._safe_error_text(error)
         return ""
 
-    @classmethod
+    def _release_generation_staging(
+        self, generation_staging: GenerationStagingRoot
+    ) -> str:
+        """尽力释放精确 owner；成功后才清除 transport 持有的引用。"""
+        failure = self._close_generation_staging(generation_staging)
+        if not failure:
+            with self._state_lock:
+                if self._generation_staging is generation_staging:
+                    self._generation_staging = None
+        return failure
+
     def _reap_failed_start(
-        cls,
+        self,
         process: subprocess.Popen[bytes],
         generation_staging: GenerationStagingRoot,
         write_queue: queue.Queue[tuple[int, bytes] | None],
@@ -296,7 +307,9 @@ class WorkerProcess:
                     thread.join(timeout=1)
             except BaseException:
                 pass
-        staging_failure = cls._close_generation_staging(generation_staging)
+        staging_failure = self._release_generation_staging(
+            generation_staging
+        )
         return (code if type(code) is int else -1), staging_failure
 
     @staticmethod
@@ -316,13 +329,45 @@ class WorkerProcess:
                 return self._generation
             if self._process is not None and not self._exit_event.is_set():
                 raise WorkerProcessError("上一代 worker 仍在收尾")
+            retained_staging = self._generation_staging
+            if retained_staging is not None:
+                retained_failure = self._release_generation_staging(
+                    retained_staging
+                )
+                if retained_failure:
+                    raise WorkerProcessError(
+                        f"[{STAGING_CLEANUP_ERROR_CODE}] retained generation "
+                        "staging cleanup failed: "
+                        f"{retained_failure}"
+                    )
             generation = self._generation + 1
             exit_event = threading.Event()
             write_queue: queue.Queue[tuple[int, bytes] | None] = queue.Queue()
             stdout_done = threading.Event()
             stderr_done = threading.Event()
             stderr_tail: deque[str] = deque(maxlen=64)
-            generation_staging = GenerationStagingRoot.create()
+            try:
+                generation_staging = GenerationStagingRoot.create()
+            except BaseException as error:
+                raise WorkerProcessError(
+                    f"[{STAGING_IDENTITY_ERROR_CODE}] worker generation "
+                    "staging allocation failed: "
+                    f"{self._safe_error_text(error)}"
+                ) from error
+            self._generation_staging = generation_staging
+            try:
+                generation_staging.initialize_marker()
+            except BaseException as error:
+                staging_failure = self._release_generation_staging(
+                    generation_staging
+                )
+                detail = self._failure_detail(
+                    f"[{STAGING_IDENTITY_ERROR_CODE}] worker generation "
+                    "staging marker initialization failed: "
+                    f"{self._safe_error_text(error)}",
+                    staging_failure,
+                )
+                raise WorkerProcessError(detail) from error
             try:
                 command = list(self.command)
                 if self.self_test:
@@ -343,7 +388,7 @@ class WorkerProcess:
                 if sys_platform_is_windows():
                     kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             except BaseException as error:
-                staging_failure = self._close_generation_staging(
+                staging_failure = self._release_generation_staging(
                     generation_staging
                 )
                 detail = self._failure_detail(
@@ -355,7 +400,7 @@ class WorkerProcess:
             try:
                 process = subprocess.Popen(command, **kwargs)
             except (OSError, subprocess.SubprocessError, ValueError) as exc:
-                staging_failure = self._close_generation_staging(
+                staging_failure = self._release_generation_staging(
                     generation_staging
                 )
                 detail = self._failure_detail(
@@ -615,7 +660,7 @@ class WorkerProcess:
                             stream.close()
                     except OSError:
                         pass
-                self._close_generation_staging(generation_staging)
+                self._release_generation_staging(generation_staging)
                 exit_event.set()
                 return
             expected = self._expected_exit
@@ -635,7 +680,9 @@ class WorkerProcess:
                     stream.close()
             except OSError:
                 pass
-        staging_failure = self._close_generation_staging(generation_staging)
+        staging_failure = self._release_generation_staging(
+            generation_staging
+        )
         detail_parts = [f"worker exit code {code}"]
         if failure:
             detail_parts.append(failure)
@@ -1245,6 +1292,8 @@ class WorkerProcess:
             if process is not None:
                 self._expected_exit = True
         if process is None:
+            if generation_staging is not None:
+                self._release_generation_staging(generation_staging)
             return
         if process.poll() is None:
             try:
@@ -1268,7 +1317,7 @@ class WorkerProcess:
                 if exit_event.is_set():
                     return
                 staging_failure = (
-                    self._close_generation_staging(generation_staging)
+                    self._release_generation_staging(generation_staging)
                     if generation_staging is not None
                     else ""
                 )
