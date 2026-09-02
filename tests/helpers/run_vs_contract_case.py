@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import gc
+import importlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import types
 from pathlib import Path
 
 
@@ -151,6 +154,412 @@ vs.core.std.ModifyFrame(
         "retired_second_after_close": "marker" not in sys.modules,
         "helper_preserved": sys.modules.get("assetmaker_vs.executor") is helper_module,
         "stdlib_preserved": sys.modules.get("json") is stdlib_json,
+    }
+
+
+def _executor_mixed_namespace_case(
+    *,
+    runtime_only: bool,
+    fail_first: bool = False,
+) -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    _load_vs()
+    from assetmaker_vs import executor as helper_module
+    from assetmaker_vs.executor import execute_user_script
+
+    stdlib_json = sys.modules["json"]
+    observer_name = "assetmaker_mixed_namespace_observer"
+    observer = types.ModuleType(observer_name)
+    sys.modules[observer_name] = observer
+    module_names = (
+        "shared_ns.local_piece",
+        "shared_ns.external_piece",
+        "shared_ns",
+        "ordinary_external",
+    )
+    script_template = f"""from shared_ns import local_piece
+import shared_ns
+import shared_ns.external_piece as external_piece
+import ordinary_external
+import {observer_name} as observer
+
+loaded = local_piece.VALUE
+observer.parent = shared_ns
+observer.external = external_piece
+observer.local = local_piece
+observer.ordinary = ordinary_external
+{{failure}}
+"""
+    path_added = False
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir).resolve()
+            third_party = base / "third_party"
+            external_package = third_party / "shared_ns"
+            external_package.mkdir(parents=True)
+            (external_package / "external_piece.py").write_text(
+                'VALUE = "external"\n', encoding="utf-8"
+            )
+            (third_party / "ordinary_external.py").write_text(
+                'VALUE = "ordinary"\n', encoding="utf-8"
+            )
+            roots = [base / name for name in ("A", "B")]
+            for root, value in zip(roots, ("A", "B"), strict=True):
+                package = root / "modules" / "shared_ns"
+                package.mkdir(parents=True)
+                (package / "local_piece.py").write_text(
+                    f"VALUE = {value!r}\n", encoding="utf-8"
+                )
+                failure = (
+                    'raise RuntimeError("first script failed")'
+                    if fail_first and value == "A"
+                    else ""
+                )
+                (root / "pipeline.vpy").write_text(
+                    script_template.format(failure=failure), encoding="utf-8"
+                )
+                (root / "job.json").write_text("{}", encoding="utf-8")
+
+            python_module_dirs = (third_party,) if runtime_only else ()
+            if not runtime_only:
+                sys.path.insert(0, str(third_party))
+                path_added = True
+                importlib.import_module("shared_ns.external_piece")
+                importlib.import_module("ordinary_external")
+
+            first_error = None
+            first = None
+            try:
+                first = execute_user_script(
+                    script_path=roots[0] / "pipeline.vpy",
+                    job_path=roots[0] / "job.json",
+                    api_version="1",
+                    mode="raw",
+                    python_module_dirs=python_module_dirs,
+                )
+            except RuntimeError as exc:
+                first_error = str(exc)
+                if not fail_first:
+                    raise
+
+            parent = observer.parent
+            external = observer.external
+            ordinary = observer.ordinary
+            first_value = observer.local.VALUE
+            if first is not None:
+                first.close()
+
+            after_first = {
+                "parent_same": sys.modules.get("shared_ns") is parent,
+                "external_same": (
+                    sys.modules.get("shared_ns.external_piece") is external
+                ),
+                "external_attr_same": (
+                    getattr(parent, "external_piece", None) is external
+                ),
+                "ordinary_same": (
+                    sys.modules.get("ordinary_external") is ordinary
+                ),
+                "local_cached": "shared_ns.local_piece" in sys.modules,
+                "stale_local_attr": getattr(parent, "local_piece", None)
+                is observer.local,
+            }
+
+            second = execute_user_script(
+                script_path=roots[1] / "pipeline.vpy",
+                job_path=roots[1] / "job.json",
+                api_version="1",
+                mode="raw",
+                python_module_dirs=python_module_dirs,
+            )
+            second_value = second.namespace["loaded"]
+            second_parent = observer.parent
+            second_external = observer.external
+            second_ordinary = observer.ordinary
+            second_local_file = str(
+                Path(observer.local.__file__).resolve()
+            )
+            second.close()
+
+            return {
+                "runtime_only": runtime_only,
+                "first_error": first_error,
+                "first_value": first_value,
+                "after_first": after_first,
+                "second_value": second_value,
+                "second_local_file": second_local_file,
+                "second_parent_same": second_parent is parent,
+                "second_external_same": second_external is external,
+                "second_external_attr_same": (
+                    getattr(second_parent, "external_piece", None)
+                    is external
+                ),
+                "second_ordinary_same": second_ordinary is ordinary,
+                "after_second_local_cached": (
+                    "shared_ns.local_piece" in sys.modules
+                ),
+                "after_second_stale_local_attr": (
+                    getattr(second_parent, "local_piece", None)
+                    is observer.local
+                ),
+                "helper_preserved": (
+                    sys.modules.get("assetmaker_vs.executor") is helper_module
+                ),
+                "stdlib_preserved": sys.modules.get("json") is stdlib_json,
+            }
+    finally:
+        if path_added:
+            sys.path.remove(str(third_party))
+        sys.modules.pop(observer_name, None)
+        for name in module_names:
+            sys.modules.pop(name, None)
+
+
+def _executor_mixed_namespace_sys_path_case() -> dict[str, object]:
+    return _executor_mixed_namespace_case(runtime_only=False)
+
+
+def _executor_mixed_namespace_runtime_dirs_case() -> dict[str, object]:
+    return _executor_mixed_namespace_case(runtime_only=True)
+
+
+def _executor_mixed_namespace_failure_case() -> dict[str, object]:
+    return _executor_mixed_namespace_case(runtime_only=True, fail_first=True)
+
+
+def _install_fake_vapoursynth() -> types.ModuleType:
+    """安装只覆盖 executor 生命周期所需表面的进程内假实现。"""
+    fake = types.ModuleType("vapoursynth")
+    outputs: dict[int, object] = {}
+    lock = threading.Lock()
+    fake.clear_calls = 0
+
+    def clear_outputs() -> None:
+        with lock:
+            fake.clear_calls += 1
+            outputs.clear()
+
+    def get_outputs() -> dict[int, object]:
+        with lock:
+            return dict(outputs)
+
+    fake.clear_outputs = clear_outputs
+    fake.get_outputs = get_outputs
+    sys.modules["vapoursynth"] = fake
+    return fake
+
+
+def _write_executor_lifecycle_roots(base: Path) -> dict[str, Path]:
+    roots: dict[str, Path] = {}
+    for name in ("A", "B", "C"):
+        root = base / name
+        root.mkdir(parents=True)
+        (root / "pipeline.vpy").write_text(
+            f"GRAPH_ID = {name!r}\n", encoding="utf-8"
+        )
+        (root / "failed.vpy").write_text(
+            'raise RuntimeError("script failed")\n', encoding="utf-8"
+        )
+        (root / "job.json").write_text("{}", encoding="utf-8")
+        roots[name] = root
+    return roots
+
+
+def _execute_lifecycle_graph(
+    execute_user_script, root: Path, script: str = "pipeline.vpy"
+):
+    return execute_user_script(
+        script_path=root / script,
+        job_path=root / "job.json",
+        api_version="1",
+        mode="raw",
+    )
+
+
+def _executor_graph_overlap_case() -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    fake_vs = _install_fake_vapoursynth()
+    from assetmaker_vs.executor import execute_user_script
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        roots = _write_executor_lifecycle_roots(Path(temp_dir).resolve())
+        first = _execute_lifecycle_graph(execute_user_script, roots["A"])
+        active_path = list(sys.path)
+        overlapping = None
+        overlap_error: BaseException | None = None
+        try:
+            overlapping = _execute_lifecycle_graph(
+                execute_user_script, roots["B"]
+            )
+        except BaseException as exc:
+            overlap_error = exc
+        finally:
+            clear_calls_while_rejected = fake_vs.clear_calls
+            active_path_unchanged = sys.path == active_path
+            if overlapping is not None:
+                overlapping.close()
+            first.close()
+
+        after_close = _execute_lifecycle_graph(
+            execute_user_script, roots["B"]
+        )
+        after_close_value = after_close.namespace["GRAPH_ID"]
+        after_close.close()
+
+    return {
+        "accepted_while_active": overlapping is not None,
+        "error_type": (
+            None if overlap_error is None else type(overlap_error).__name__
+        ),
+        "error_code": getattr(overlap_error, "code", None),
+        "error_message": (
+            None if overlap_error is None else str(overlap_error)
+        ),
+        "clear_calls_while_rejected": clear_calls_while_rejected,
+        "active_path_unchanged": active_path_unchanged,
+        "after_close_value": after_close_value,
+    }
+
+
+def _executor_graph_reuse_case() -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    _install_fake_vapoursynth()
+    from assetmaker_vs.executor import execute_user_script
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        roots = _write_executor_lifecycle_roots(Path(temp_dir).resolve())
+        first = _execute_lifecycle_graph(execute_user_script, roots["A"])
+        first.close()
+        first.close()
+        after_double_close = _execute_lifecycle_graph(
+            execute_user_script, roots["B"]
+        )
+        after_double_close_value = after_double_close.namespace["GRAPH_ID"]
+        after_double_close.close()
+
+        failure_error = None
+        try:
+            _execute_lifecycle_graph(
+                execute_user_script, roots["A"], "failed.vpy"
+            )
+        except RuntimeError as exc:
+            failure_error = str(exc)
+        after_failure = _execute_lifecycle_graph(
+            execute_user_script, roots["C"]
+        )
+        after_failure_value = after_failure.namespace["GRAPH_ID"]
+        after_failure.close()
+
+    return {
+        "after_double_close_value": after_double_close_value,
+        "failure_error": failure_error,
+        "after_failure_value": after_failure_value,
+    }
+
+
+def _executor_graph_abnormal_close_case() -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    _install_fake_vapoursynth()
+    from assetmaker_vs.executor import execute_user_script
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        roots = _write_executor_lifecycle_roots(Path(temp_dir).resolve())
+        first = _execute_lifecycle_graph(execute_user_script, roots["A"])
+        original_close = first.environment.close
+        close_calls = 0
+
+        def abnormal_close() -> None:
+            nonlocal close_calls
+            close_calls += 1
+            original_close()
+            raise RuntimeError("environment close failed")
+
+        first.environment.close = abnormal_close
+        first_error = None
+        second_error = None
+        try:
+            first.close()
+        except RuntimeError as exc:
+            first_error = str(exc)
+        try:
+            first.close()
+        except RuntimeError as exc:
+            second_error = str(exc)
+
+        after_error = _execute_lifecycle_graph(
+            execute_user_script, roots["B"]
+        )
+        after_error_value = after_error.namespace["GRAPH_ID"]
+        after_error.close()
+
+    return {
+        "first_error": first_error,
+        "second_error": second_error,
+        "close_calls": close_calls,
+        "after_error_value": after_error_value,
+    }
+
+
+def _executor_graph_race_case() -> dict[str, object]:
+    sys.path.insert(0, str(HELPER_ROOT))
+    fake_vs = _install_fake_vapoursynth()
+    from assetmaker_vs.executor import execute_user_script
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        roots = _write_executor_lifecycle_roots(Path(temp_dir).resolve())
+        start = threading.Barrier(2)
+        result_lock = threading.Lock()
+        outcomes: list[dict[str, object]] = []
+        graphs: list[object] = []
+
+        def load(name: str) -> None:
+            start.wait(timeout=5)
+            try:
+                graph = _execute_lifecycle_graph(
+                    execute_user_script, roots[name]
+                )
+            except BaseException as exc:
+                outcome = {
+                    "kind": "error",
+                    "type": type(exc).__name__,
+                    "code": getattr(exc, "code", None),
+                }
+                with result_lock:
+                    outcomes.append(outcome)
+            else:
+                with result_lock:
+                    outcomes.append(
+                        {
+                            "kind": "graph",
+                            "value": graph.namespace["GRAPH_ID"],
+                        }
+                    )
+                    graphs.append(graph)
+
+        threads = [
+            threading.Thread(target=load, args=(name,))
+            for name in ("A", "B")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        alive = [thread.is_alive() for thread in threads]
+        clear_calls_during_race = fake_vs.clear_calls
+        for graph in reversed(graphs):
+            graph.close()
+
+        after_race = _execute_lifecycle_graph(
+            execute_user_script, roots["C"]
+        )
+        after_race_value = after_race.namespace["GRAPH_ID"]
+        after_race.close()
+
+    return {
+        "alive": alive,
+        "outcomes": outcomes,
+        "clear_calls_during_race": clear_calls_during_race,
+        "after_race_value": after_race_value,
     }
 
 
@@ -1036,6 +1445,17 @@ CASES = {
     "default_video": _default_video_case,
     "executor_deferred": _executor_deferred_case,
     "executor_cross_root": _executor_cross_root_case,
+    "executor_mixed_namespace_failure": _executor_mixed_namespace_failure_case,
+    "executor_mixed_namespace_runtime_dirs": (
+        _executor_mixed_namespace_runtime_dirs_case
+    ),
+    "executor_mixed_namespace_sys_path": (
+        _executor_mixed_namespace_sys_path_case
+    ),
+    "executor_graph_abnormal_close": _executor_graph_abnormal_close_case,
+    "executor_graph_overlap": _executor_graph_overlap_case,
+    "executor_graph_race": _executor_graph_race_case,
+    "executor_graph_reuse": _executor_graph_reuse_case,
     "range_probe": _range_probe_case,
 }
 

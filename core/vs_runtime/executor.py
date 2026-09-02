@@ -3,6 +3,7 @@
 from resources.vapoursynth.python.assetmaker_vs.executor import (
     ExecutedGraph,
     ExecutionEnvironment,
+    GraphLifecycleError,
     MAX_LOG_BODY_BYTES,
     PythonLogWriter,
     build_module_search_paths,
@@ -17,6 +18,7 @@ from resources.vapoursynth.python.assetmaker_vs.executor import (
 __all__ = [
     "ExecutedGraph",
     "ExecutionEnvironment",
+    "GraphLifecycleError",
     "MAX_LOG_BODY_BYTES",
     "PythonLogWriter",
     "build_module_search_paths",

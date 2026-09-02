@@ -199,6 +199,43 @@ def _write_invalid_prop_script(
 
 
 class PortableExecutorTests(unittest.TestCase):
+    def _assert_mixed_namespace_payload(
+        self, payload: dict[str, object], *, failed_first: bool
+    ) -> None:
+        self.assertEqual(payload["first_value"], "A")
+        self.assertEqual(
+            payload["first_error"],
+            "first script failed" if failed_first else None,
+        )
+        self.assertEqual(
+            payload["after_first"],
+            {
+                "parent_same": True,
+                "external_same": True,
+                "external_attr_same": True,
+                "ordinary_same": True,
+                "local_cached": False,
+                "stale_local_attr": False,
+            },
+        )
+        self.assertEqual(payload["second_value"], "B")
+        self.assertEqual(
+            Path(payload["second_local_file"]).parent.parent.parent.name,
+            "B",
+        )
+        for field in (
+            "second_parent_same",
+            "second_external_same",
+            "second_external_attr_same",
+            "second_ordinary_same",
+            "helper_preserved",
+            "stdlib_preserved",
+        ):
+            with self.subTest(field=field):
+                self.assertTrue(payload[field])
+        self.assertFalse(payload["after_second_local_cached"])
+        self.assertFalse(payload["after_second_stale_local_attr"])
+
     def test_helper_is_never_evicted_even_under_the_script_root(self):
         executor = _import_executor()
         name = "resources.vapoursynth.python.assetmaker_vs.synthetic_test"
@@ -359,6 +396,101 @@ class PortableExecutorTests(unittest.TestCase):
         self.assertTrue(payload["retired_second_after_close"])
         self.assertTrue(payload["helper_preserved"])
         self.assertTrue(payload["stdlib_preserved"])
+
+    def test_mixed_namespace_with_preexisting_third_party_reloads_local_child(self):
+        result = _run_child("executor_mixed_namespace_sys_path")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self._assert_mixed_namespace_payload(
+            json.loads(result.stdout), failed_first=False
+        )
+
+    def test_mixed_namespace_from_runtime_dirs_preserves_external_identity(self):
+        result = _run_child("executor_mixed_namespace_runtime_dirs")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self._assert_mixed_namespace_payload(
+            json.loads(result.stdout), failed_first=False
+        )
+
+    def test_failed_script_retires_half_loaded_mixed_namespace(self):
+        result = _run_child("executor_mixed_namespace_failure")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self._assert_mixed_namespace_payload(
+            json.loads(result.stdout), failed_first=True
+        )
+
+    def test_second_graph_is_rejected_until_active_graph_closes(self):
+        result = _run_child("executor_graph_overlap")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["accepted_while_active"])
+        self.assertEqual(payload["error_type"], "GraphLifecycleError")
+        self.assertEqual(payload["error_code"], "executor.graph_active")
+        self.assertIn("executor.graph_active", payload["error_message"])
+        self.assertEqual(payload["clear_calls_while_rejected"], 1)
+        self.assertTrue(payload["active_path_unchanged"])
+        self.assertEqual(payload["after_close_value"], "B")
+
+    def test_graph_lease_is_reusable_after_close_and_script_failure(self):
+        result = _run_child("executor_graph_reuse")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "after_double_close_value": "B",
+                "failure_error": "script failed",
+                "after_failure_value": "C",
+            },
+        )
+
+    def test_abnormal_close_is_terminal_and_releases_graph_lease(self):
+        result = _run_child("executor_graph_abnormal_close")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "first_error": "environment close failed",
+                "second_error": None,
+                "close_calls": 1,
+                "after_error_value": "B",
+            },
+        )
+
+    def test_concurrent_graph_load_has_exactly_one_winner(self):
+        result = _run_child("executor_graph_race")
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["alive"], [False, False])
+        self.assertEqual(payload["clear_calls_during_race"], 1)
+        self.assertEqual(payload["after_race_value"], "C")
+        graphs = [
+            outcome
+            for outcome in payload["outcomes"]
+            if outcome["kind"] == "graph"
+        ]
+        errors = [
+            outcome
+            for outcome in payload["outcomes"]
+            if outcome["kind"] == "error"
+        ]
+        self.assertEqual(len(graphs), 1)
+        self.assertIn(graphs[0]["value"], {"A", "B"})
+        self.assertEqual(
+            errors,
+            [
+                {
+                    "kind": "error",
+                    "type": "GraphLifecycleError",
+                    "code": "executor.graph_active",
+                }
+            ],
+        )
 
     def test_stdout_sink_is_thread_safe_and_chunks_below_protocol_limit(self):
         executor = _import_executor()

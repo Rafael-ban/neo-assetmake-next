@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Mapping
 from collections import namedtuple
 from fractions import Fraction
 from pathlib import Path
@@ -457,6 +458,130 @@ class OutputContractPureTests(unittest.TestCase):
                     raised.exception.actual["type"], type(actual).__name__
                 )
                 self.assertTrue(raised.exception.actual["truncated"])
+
+    def test_hostile_error_values_have_bounded_stable_markers(self):
+        contract = _contract_module()
+
+        class BadMapping(Mapping):
+            def __getitem__(self, key):
+                raise KeyError(key)
+
+            def __iter__(self):
+                return iter(())
+
+            def __len__(self):
+                return 1
+
+            def items(self):
+                raise RuntimeError("items failed")
+
+        class BadRepr:
+            def __repr__(self) -> str:
+                raise RuntimeError("repr failed")
+
+        cyclic_list: list[object] = []
+        cyclic_list.append(cyclic_list)
+        cyclic_dict: dict[str, object] = {}
+        cyclic_dict["self"] = cyclic_dict
+        huge_positive = 1 << 1_000_000
+        huge_negative = -huge_positive
+        cases = (
+            (
+                "cyclic_list",
+                cyclic_list,
+                [
+                    {
+                        "type": "list",
+                        "cycle": True,
+                        "truncated": True,
+                    }
+                ],
+            ),
+            (
+                "cyclic_dict",
+                cyclic_dict,
+                {
+                    "self": {
+                        "type": "dict",
+                        "cycle": True,
+                        "truncated": True,
+                    }
+                },
+            ),
+            (
+                "bad_mapping",
+                BadMapping(),
+                {
+                    "type": "BadMapping",
+                    "mapping_error": "RuntimeError",
+                    "truncated": True,
+                },
+            ),
+            (
+                "bad_repr",
+                BadRepr(),
+                {
+                    "type": "BadRepr",
+                    "repr": "<repr failed: RuntimeError>",
+                    "truncated": False,
+                },
+            ),
+            (
+                "nan",
+                float("nan"),
+                {"type": "float", "value": "nan", "truncated": False},
+            ),
+            (
+                "positive_infinity",
+                float("inf"),
+                {"type": "float", "value": "inf", "truncated": False},
+            ),
+            (
+                "negative_infinity",
+                float("-inf"),
+                {"type": "float", "value": "-inf", "truncated": False},
+            ),
+            (
+                "huge_positive_int",
+                huge_positive,
+                {
+                    "type": "int",
+                    "bits": 1_000_001,
+                    "hex_prefix": "0x8000000000000000",
+                    "negative": False,
+                    "truncated": True,
+                },
+            ),
+            (
+                "huge_negative_int",
+                huge_negative,
+                {
+                    "type": "int",
+                    "bits": 1_000_001,
+                    "hex_prefix": "0x8000000000000000",
+                    "negative": True,
+                    "truncated": True,
+                },
+            ),
+        )
+
+        for name, actual, expected_actual in cases:
+            with self.subTest(name=name):
+                error = contract.OutputContractError(
+                    "恶意值回归",
+                    code="output.hostile",
+                    field="matrix",
+                    expected=6,
+                    actual=actual,
+                )
+                payload = error.to_dict()
+                self.assertEqual(payload["actual"], expected_actual)
+                json.dumps(payload, ensure_ascii=True, allow_nan=False)
+                marker = str(error)
+                self.assertLess(len(marker.encode("utf-8")), 4096)
+                decoded = contract.decode_output_contract_error(marker)
+                self.assertIsNotNone(decoded)
+                self.assertEqual(decoded.to_dict(), payload)
 
     def test_guard_rejects_non_sentinel_second_frame(self):
         contract = _contract_module()
