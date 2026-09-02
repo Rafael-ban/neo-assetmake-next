@@ -1,62 +1,57 @@
-"""不可变渲染作业 ABI 及其 JSON 边界。"""
+"""不可变 RenderJob 模型；wire 解析与校验由便携 helper 唯一实现。"""
 
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NoReturn
 
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import SchemaError, ValidationError
-
-from config.constants import RESOLUTION_SPECS
 from core.file_utils import atomic_write_json
-from utils.file_utils import get_app_dir
-from utils.windows_paths import require_canonical_windows_absolute_path
+from resources.vapoursynth.python.assetmaker_vs import job_api as _wire
 
 
 class RenderJobError(ValueError):
-    """渲染作业读取、结构或阶段语义错误。"""
+    """应用侧 RenderJob 错误，保留共享 ABI 的机器字段。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "job.adapter",
+        field: str | None = None,
+        path: str | None = None,
+        expected: Any = None,
+        actual: Any = None,
+        hint: str | None = None,
+    ) -> None:
+        self.code = code
+        self.field = field
+        self.path = path
+        self.expected = expected
+        self.actual = actual
+        self.hint = hint
+        super().__init__(str(message))
 
 
-_MOVEFILE_WRITE_THROUGH = 0x00000008
-_WINDOWS_ALREADY_EXISTS = frozenset({80, 183})
+def _raise_adapter(exc: _wire.JobAPIError) -> NoReturn:
+    raise RenderJobError(
+        str(exc),
+        code=exc.code,
+        field=exc.field,
+        path=exc.path,
+        expected=exc.expected,
+        actual=exc.actual,
+        hint=exc.hint,
+    ) from exc
 
 
-def _object(value: Any, location: str) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise RenderJobError(f"{location} 必须是对象")
-    return value
-
-
-def _keys(data: dict[str, Any], required: set[str], location: str) -> None:
-    unknown = sorted(set(data) - required)
-    missing = sorted(required - set(data))
-    if unknown:
-        raise RenderJobError(
-            f"{location} 包含未知字段: {', '.join(unknown)}"
-        )
-    if missing:
-        raise RenderJobError(
-            f"{location} 缺少必需字段: {', '.join(missing)}"
-        )
-
-
-def _integer(value: Any, location: str, *, minimum: int = 0) -> int:
-    if type(value) is not int or value < minimum:
-        raise RenderJobError(f"{location} 必须是 >= {minimum} 的整数")
-    return value
-
-
-def _normalized_absolute_path(value: Any, location: str) -> str:
+def _validate_section(section: str, payload: Any) -> None:
     try:
-        return require_canonical_windows_absolute_path(value, location)
-    except ValueError as exc:
-        raise RenderJobError(str(exc)) from exc
+        _wire.validate_job_section(section, payload)
+    except _wire.JobAPIError as exc:
+        _raise_adapter(exc)
 
 
 @dataclass(frozen=True)
@@ -65,8 +60,7 @@ class RationalFPS:
     denominator: int
 
     def validate(self) -> None:
-        _integer(self.numerator, "timeline.fps.numerator", minimum=1)
-        _integer(self.denominator, "timeline.fps.denominator", minimum=1)
+        _validate_section("fps", self.to_dict())
 
     def to_dict(self) -> dict[str, int]:
         return {
@@ -76,11 +70,11 @@ class RationalFPS:
 
     @classmethod
     def from_dict(cls, value: Any) -> "RationalFPS":
-        data = _object(value, "timeline.fps")
-        _keys(data, {"numerator", "denominator"}, "timeline.fps")
-        fps = cls(data["numerator"], data["denominator"])
-        fps.validate()
-        return fps
+        try:
+            data = _wire.validate_job_section("fps", value)
+        except _wire.JobAPIError as exc:
+            _raise_adapter(exc)
+        return cls(data["numerator"], data["denominator"])
 
 
 @dataclass(frozen=True)
@@ -90,24 +84,7 @@ class SourceSpec:
     virtual_frame_count: int | None
 
     def validate(self) -> None:
-        _normalized_absolute_path(self.path, "source.path")
-        if self.kind not in ("video", "image"):
-            raise RenderJobError(f"未知 source.kind: {self.kind!r}")
-        if self.kind == "video":
-            if self.virtual_frame_count is not None:
-                raise RenderJobError(
-                    "video 的 source.virtual_frame_count 必须为 null"
-                )
-        elif self.virtual_frame_count is None:
-            raise RenderJobError(
-                "image 的 source.virtual_frame_count 必须为正整数"
-            )
-        else:
-            _integer(
-                self.virtual_frame_count,
-                "source.virtual_frame_count",
-                minimum=1,
-            )
+        _validate_section("source", self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -118,11 +95,11 @@ class SourceSpec:
 
     @classmethod
     def from_dict(cls, value: Any) -> "SourceSpec":
-        data = _object(value, "source")
-        _keys(data, {"path", "kind", "virtual_frame_count"}, "source")
-        source = cls(data["path"], data["kind"], data["virtual_frame_count"])
-        source.validate()
-        return source
+        try:
+            data = _wire.validate_job_section("source", value)
+        except _wire.JobAPIError as exc:
+            _raise_adapter(exc)
+        return cls(data["path"], data["kind"], data["virtual_frame_count"])
 
 
 @dataclass(frozen=True)
@@ -132,17 +109,15 @@ class TimelineSpec:
     fps: RationalFPS | None
 
     def validate(self) -> None:
-        _integer(self.start_frame, "timeline.start_frame")
-        if self.end_frame is not None:
-            _integer(self.end_frame, "timeline.end_frame", minimum=1)
-            if self.end_frame <= self.start_frame:
-                raise RenderJobError(
-                    "resolved timeline.end_frame 必须大于 start_frame"
-                )
-        if self.fps is not None:
-            if not isinstance(self.fps, RationalFPS):
-                raise RenderJobError("timeline.fps 类型无效")
-            self.fps.validate()
+        if self.fps is not None and not isinstance(self.fps, RationalFPS):
+            raise RenderJobError(
+                "timeline.fps 类型无效",
+                code="job.type",
+                field="timeline.fps",
+                expected="RationalFPS or None",
+                actual=type(self.fps).__name__,
+            )
+        _validate_section("timeline", self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -153,12 +128,12 @@ class TimelineSpec:
 
     @classmethod
     def from_dict(cls, value: Any) -> "TimelineSpec":
-        data = _object(value, "timeline")
-        _keys(data, {"start_frame", "end_frame", "fps"}, "timeline")
+        try:
+            data = _wire.validate_job_section("timeline", value)
+        except _wire.JobAPIError as exc:
+            _raise_adapter(exc)
         fps = None if data["fps"] is None else RationalFPS.from_dict(data["fps"])
-        timeline = cls(data["start_frame"], data["end_frame"], fps)
-        timeline.validate()
-        return timeline
+        return cls(data["start_frame"], data["end_frame"], fps)
 
 
 @dataclass(frozen=True)
@@ -170,20 +145,7 @@ class CropSpec:
     height: int
 
     def validate(self) -> None:
-        if self.coordinate_space != "post_rotation_source_pixels":
-            raise RenderJobError(
-                f"未知 crop.coordinate_space: {self.coordinate_space!r}"
-            )
-        _integer(self.x, "transform.crop.x")
-        _integer(self.y, "transform.crop.y")
-        _integer(self.width, "transform.crop.width")
-        _integer(self.height, "transform.crop.height")
-        full_frame = self.width == 0 and self.height == 0
-        explicit_crop = self.width > 0 and self.height > 0
-        if not (full_frame or explicit_crop):
-            raise RenderJobError(
-                "crop width/height 必须同时为 0，或同时为正整数"
-            )
+        _validate_section("crop", self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -196,18 +158,17 @@ class CropSpec:
 
     @classmethod
     def from_dict(cls, value: Any) -> "CropSpec":
-        data = _object(value, "transform.crop")
-        required = {"coordinate_space", "x", "y", "width", "height"}
-        _keys(data, required, "transform.crop")
-        crop = cls(
+        try:
+            data = _wire.validate_job_section("crop", value)
+        except _wire.JobAPIError as exc:
+            _raise_adapter(exc)
+        return cls(
             data["coordinate_space"],
             data["x"],
             data["y"],
             data["width"],
             data["height"],
         )
-        crop.validate()
-        return crop
 
 
 @dataclass(frozen=True)
@@ -216,27 +177,26 @@ class TransformSpec:
     crop: CropSpec
 
     def validate(self) -> None:
-        if type(self.rotation) is not int or self.rotation not in (
-            0,
-            90,
-            180,
-            270,
-        ):
-            raise RenderJobError(f"未知 transform.rotation: {self.rotation!r}")
         if not isinstance(self.crop, CropSpec):
-            raise RenderJobError("transform.crop 类型无效")
-        self.crop.validate()
+            raise RenderJobError(
+                "transform.crop 类型无效",
+                code="job.type",
+                field="transform.crop",
+                expected="CropSpec",
+                actual=type(self.crop).__name__,
+            )
+        _validate_section("transform", self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
         return {"rotation": self.rotation, "crop": self.crop.to_dict()}
 
     @classmethod
     def from_dict(cls, value: Any) -> "TransformSpec":
-        data = _object(value, "transform")
-        _keys(data, {"rotation", "crop"}, "transform")
-        transform = cls(data["rotation"], CropSpec.from_dict(data["crop"]))
-        transform.validate()
-        return transform
+        try:
+            data = _wire.validate_job_section("transform", value)
+        except _wire.JobAPIError as exc:
+            _raise_adapter(exc)
+        return cls(data["rotation"], CropSpec.from_dict(data["crop"]))
 
 
 @dataclass(frozen=True)
@@ -244,18 +204,18 @@ class PathSpec:
     cache_dir: str
 
     def validate(self) -> None:
-        _normalized_absolute_path(self.cache_dir, "paths.cache_dir")
+        _validate_section("paths", self.to_dict())
 
     def to_dict(self) -> dict[str, str]:
         return {"cache_dir": self.cache_dir}
 
     @classmethod
     def from_dict(cls, value: Any) -> "PathSpec":
-        data = _object(value, "paths")
-        _keys(data, {"cache_dir"}, "paths")
-        paths = cls(data["cache_dir"])
-        paths.validate()
-        return paths
+        try:
+            data = _wire.validate_job_section("paths", value)
+        except _wire.JobAPIError as exc:
+            _raise_adapter(exc)
+        return cls(data["cache_dir"])
 
 
 @dataclass(frozen=True)
@@ -274,57 +234,29 @@ class OutputSpec:
 
     @classmethod
     def from_profile(cls, profile: str) -> "OutputSpec":
-        if profile not in ("360x640", "720x1080"):
-            raise RenderJobError(f"未知 output.profile: {profile!r}")
-        spec = RESOLUTION_SPECS.get(profile)
-        if spec is None:
-            raise RenderJobError(f"RESOLUTION_SPECS 缺少 profile: {profile!r}")
+        try:
+            return cls._from_normalized(_wire.output_for_profile(profile))
+        except _wire.JobAPIError as exc:
+            _raise_adapter(exc)
+
+    @classmethod
+    def _from_normalized(cls, data: dict[str, Any]) -> "OutputSpec":
         return cls(
-            profile=profile,
-            display_width=int(spec["width"]),
-            display_height=int(spec["height"]),
-            coded_width=int(spec["padded_width"]),
-            coded_height=int(spec["padded_height"]),
-            final_rotate_180=bool(spec["rotate_180"]),
+            profile=data["profile"],
+            display_width=data["display_width"],
+            display_height=data["display_height"],
+            coded_width=data["coded_width"],
+            coded_height=data["coded_height"],
+            pixel_format=data["pixel_format"],
+            matrix=data["matrix"],
+            transfer=data["transfer"],
+            primaries=data["primaries"],
+            range=data["range"],
+            final_rotate_180=data["final_rotate_180"],
         )
 
     def validate(self) -> None:
-        expected = self.from_profile(self.profile)
-        for field_name in (
-            "display_width",
-            "display_height",
-            "coded_width",
-            "coded_height",
-        ):
-            _integer(getattr(self, field_name), f"output.{field_name}", minimum=1)
-        if not isinstance(self.final_rotate_180, bool):
-            raise RenderJobError("output.final_rotate_180 必须是布尔值")
-        geometry = (
-            self.display_width,
-            self.display_height,
-            self.coded_width,
-            self.coded_height,
-            self.final_rotate_180,
-        )
-        expected_geometry = (
-            expected.display_width,
-            expected.display_height,
-            expected.coded_width,
-            expected.coded_height,
-            expected.final_rotate_180,
-        )
-        if geometry != expected_geometry:
-            raise RenderJobError(
-                f"output 几何参数与 profile {self.profile!r} 不一致"
-            )
-        if self.pixel_format != "YUV420P8":
-            raise RenderJobError(f"未知 output.pixel_format: {self.pixel_format!r}")
-        for field_name in ("matrix", "transfer", "primaries"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str) or not value:
-                raise RenderJobError(f"output.{field_name} 必须是非空字符串")
-        if self.range not in ("limited", "full"):
-            raise RenderJobError(f"未知 output.range: {self.range!r}")
+        _validate_section("output", self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -343,36 +275,11 @@ class OutputSpec:
 
     @classmethod
     def from_dict(cls, value: Any) -> "OutputSpec":
-        data = _object(value, "output")
-        required = {
-            "profile",
-            "display_width",
-            "display_height",
-            "coded_width",
-            "coded_height",
-            "pixel_format",
-            "matrix",
-            "transfer",
-            "primaries",
-            "range",
-            "final_rotate_180",
-        }
-        _keys(data, required, "output")
-        output = cls(
-            profile=data["profile"],
-            display_width=data["display_width"],
-            display_height=data["display_height"],
-            coded_width=data["coded_width"],
-            coded_height=data["coded_height"],
-            pixel_format=data["pixel_format"],
-            matrix=data["matrix"],
-            transfer=data["transfer"],
-            primaries=data["primaries"],
-            range=data["range"],
-            final_rotate_180=data["final_rotate_180"],
-        )
-        output.validate()
-        return output
+        try:
+            data = _wire.validate_job_section("output", value)
+        except _wire.JobAPIError as exc:
+            _raise_adapter(exc)
+        return cls._from_normalized(data)
 
 
 @dataclass(frozen=True)
@@ -387,14 +294,8 @@ class RenderJob:
     output: OutputSpec
     paths: PathSpec
 
-    def validate(self, *, for_export: bool = False) -> None:
-        if type(self.api_version) is not int or self.api_version != 1:
-            raise RenderJobError(f"未知 api_version: {self.api_version!r}")
-        _integer(self.epoch, "epoch")
-        if self.track not in ("loop", "intro"):
-            raise RenderJobError(f"未知 track: {self.track!r}")
-        _normalized_absolute_path(self.project_root, "project_root")
-        for value, expected_type, location in (
+    def _check_component_types(self) -> None:
+        for value, expected_type, field in (
             (self.source, SourceSpec, "source"),
             (self.timeline, TimelineSpec, "timeline"),
             (self.transform, TransformSpec, "transform"),
@@ -402,24 +303,38 @@ class RenderJob:
             (self.paths, PathSpec, "paths"),
         ):
             if not isinstance(value, expected_type):
-                raise RenderJobError(f"{location} 类型无效")
-            value.validate()
-        if self.source.kind == "image":
-            end_frame = self.timeline.end_frame
-            virtual_count = self.source.virtual_frame_count
-            if end_frame is None or self.timeline.fps is None:
-                raise RenderJobError("image timeline 的 end_frame/fps 必须已解析")
-            if virtual_count is None or not (
-                0 <= self.timeline.start_frame < end_frame <= virtual_count
-            ):
                 raise RenderJobError(
-                    "image timeline 必须满足 0 <= start < end <= "
-                    "virtual_frame_count"
+                    f"{field} 类型无效",
+                    code="job.type",
+                    field=field,
+                    expected=expected_type.__name__,
+                    actual=type(value).__name__,
                 )
-        if for_export and (
-            self.timeline.end_frame is None or self.timeline.fps is None
+        if self.timeline.fps is not None and not isinstance(
+            self.timeline.fps, RationalFPS
         ):
-            raise RenderJobError("导出作业必须解析 timeline.end_frame 和 fps")
+            raise RenderJobError(
+                "timeline.fps 类型无效",
+                code="job.type",
+                field="timeline.fps",
+                expected="RationalFPS or None",
+                actual=type(self.timeline.fps).__name__,
+            )
+        if not isinstance(self.transform.crop, CropSpec):
+            raise RenderJobError(
+                "transform.crop 类型无效",
+                code="job.type",
+                field="transform.crop",
+                expected="CropSpec",
+                actual=type(self.transform.crop).__name__,
+            )
+
+    def validate(self, *, for_export: bool = False) -> None:
+        self._check_component_types()
+        try:
+            _wire.validate_job_payload(self.to_dict(), for_export=for_export)
+        except _wire.JobAPIError as exc:
+            _raise_adapter(exc)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -435,21 +350,8 @@ class RenderJob:
         }
 
     @classmethod
-    def from_dict(cls, value: Any) -> "RenderJob":
-        data = _object(value, "job")
-        required = {
-            "api_version",
-            "epoch",
-            "track",
-            "project_root",
-            "source",
-            "timeline",
-            "transform",
-            "output",
-            "paths",
-        }
-        _keys(data, required, "job")
-        job = cls(
+    def _from_normalized(cls, data: dict[str, Any]) -> "RenderJob":
+        return cls(
             api_version=data["api_version"],
             epoch=data["epoch"],
             track=data["track"],
@@ -460,41 +362,29 @@ class RenderJob:
             output=OutputSpec.from_dict(data["output"]),
             paths=PathSpec.from_dict(data["paths"]),
         )
-        job.validate()
-        return job
 
-
-def _schema_path() -> Path:
-    return Path(get_app_dir()) / "schemas" / "vs_job.schema.json"
-
-
-@lru_cache(maxsize=1)
-def _job_validator() -> Draft202012Validator:
-    path = _schema_path()
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        Draft202012Validator.check_schema(payload)
-    except (OSError, UnicodeError, json.JSONDecodeError, SchemaError) as exc:
-        raise RenderJobError(f"{path.resolve()}: 无法加载 job schema: {exc}") from exc
-    return Draft202012Validator(payload)
+    @classmethod
+    def from_dict(cls, value: Any) -> "RenderJob":
+        try:
+            data = _wire.validate_job_payload(value)
+        except _wire.JobAPIError as exc:
+            _raise_adapter(exc)
+        return cls._from_normalized(data)
 
 
 def load_render_job(
     path: str | os.PathLike[str], *, for_export: bool = False
 ) -> RenderJob:
-    """从唯一 JSON 边界加载并完整验证 RenderJob。"""
-    source_path = Path(path)
+    """从唯一 JSON 边界加载，再冻结为应用侧模型。"""
     try:
-        payload = json.loads(source_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise RenderJobError(f"{source_path.resolve()}: {exc}") from exc
-    try:
-        _job_validator().validate(payload)
-        job = RenderJob.from_dict(payload)
-        job.validate(for_export=for_export)
-        return job
-    except (ValidationError, RenderJobError) as exc:
-        raise RenderJobError(f"{source_path.resolve()}: {exc}") from exc
+        data = _wire.load_job(path, for_export=for_export)
+    except _wire.JobAPIError as exc:
+        _raise_adapter(exc)
+    return RenderJob._from_normalized(data)
+
+
+_MOVEFILE_WRITE_THROUGH = 0x00000008
+_WINDOWS_ALREADY_EXISTS = frozenset({80, 183})
 
 
 def _move_file_ex_windows(source: Path, target: Path) -> None:
@@ -522,8 +412,6 @@ def _publish_complete_file(source: Path, target: Path) -> None:
     if os.name == "nt":
         _move_file_ex_windows(source, target)
         return
-
-    # 非 Windows 仅供开发/测试；发布产品固定走上面的 MoveFileExW。
     os.link(source, target)
     source.unlink()
 
@@ -565,3 +453,18 @@ def write_render_job(job: RenderJob) -> Path:
             except OSError:
                 pass
     return target
+
+
+__all__ = [
+    "CropSpec",
+    "OutputSpec",
+    "PathSpec",
+    "RationalFPS",
+    "RenderJob",
+    "RenderJobError",
+    "SourceSpec",
+    "TimelineSpec",
+    "TransformSpec",
+    "load_render_job",
+    "write_render_job",
+]

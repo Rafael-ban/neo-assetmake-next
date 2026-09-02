@@ -199,6 +199,21 @@ class RenderJobContractTests(unittest.TestCase):
                 with self.assertRaises(RenderJobError):
                     invalid.validate()
 
+    def test_python_model_wraps_invalid_nested_dataclass_types(self):
+        job = make_job()
+        invalid_jobs = (
+            replace(job, timeline=replace(job.timeline, fps={})),
+            replace(job, transform=replace(job.transform, crop={})),
+        )
+
+        for invalid in invalid_jobs:
+            with self.subTest(job=invalid):
+                with self.assertRaises(RenderJobError):
+                    invalid.validate()
+
+        with self.assertRaises(RenderJobError):
+            OutputSpec.from_profile([])
+
     def test_video_and_image_virtual_frame_rules_are_enforced(self):
         with self.assertRaises(RenderJobError):
             make_job(virtual_frame_count=120).validate()

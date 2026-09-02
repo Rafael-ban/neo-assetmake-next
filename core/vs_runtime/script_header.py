@@ -1,41 +1,38 @@
-"""自定义 ``.vpy`` 脚本开头的安全声明解析器。"""
+"""自定义 ``.vpy`` 脚本声明的应用侧不可变适配层。"""
 
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, NoReturn
+
+from resources.vapoursynth.python.assetmaker_vs import script_header as _wire
 
 
-HEADER_LIMIT_BYTES = 8 * 1024
-_KNOWN_FIELDS = {
-    "api",
-    "mode",
-    "capabilities",
-    "requires",
-    "editor-output",
-}
-_KNOWN_CAPABILITIES = {
-    "source",
-    "trim",
-    "crop",
-    "rotation",
-    "resolution",
-    "image_loop",
-}
-_EDITOR_OPERATIONS = {"trim", "crop", "rotation"}
-_REQUIREMENT_RE = re.compile(
-    r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$"
-)
-_DECLARATION_RE = re.compile(
-    r"^#\s*assetmaker-([^:]+)\s*:\s*(.*?)\s*$"
-)
+HEADER_LIMIT_BYTES = _wire.HEADER_LIMIT_BYTES
 
 
 class ScriptHeaderError(ValueError):
-    """脚本声明缺失或不满足兼容协议。"""
+    """脚本声明错误；机器字段与便携 helper 保持完全一致。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        field: str | None = None,
+        path: str | None = None,
+        expected: Any = None,
+        actual: Any = None,
+        hint: str | None = None,
+    ) -> None:
+        self.code = code
+        self.field = field
+        self.path = path
+        self.expected = expected
+        self.actual = actual
+        self.hint = hint
+        super().__init__(str(message))
 
 
 @dataclass(frozen=True)
@@ -47,118 +44,48 @@ class ScriptHeader:
     editor_output: Literal[0, 1]
 
 
-def _comma_list(value: str, field: str, *, allow_empty: bool) -> tuple[str, ...]:
-    if not value.strip():
-        if allow_empty:
-            return ()
-        raise ScriptHeaderError(f"assetmaker-{field} 不能为空")
-    items = tuple(item.strip() for item in value.split(","))
-    if any(not item for item in items):
-        raise ScriptHeaderError(f"assetmaker-{field} 包含空条目")
-    if len(set(items)) != len(items):
-        raise ScriptHeaderError(f"assetmaker-{field} 包含重复条目")
-    return items
+def _raise_adapter(exc: _wire.ScriptHeaderError) -> NoReturn:
+    raise ScriptHeaderError(
+        str(exc),
+        code=exc.code,
+        field=exc.field,
+        path=exc.path,
+        expected=exc.expected,
+        actual=exc.actual,
+        hint=exc.hint,
+    ) from exc
 
 
-def _decode_header_window(data: bytes) -> str:
-    window = data[:HEADER_LIMIT_BYTES]
-    if len(data) > HEADER_LIMIT_BYTES and not window.endswith(b"\n"):
-        last_complete_line = window.rfind(b"\n")
-        window = window[: last_complete_line + 1] if last_complete_line >= 0 else b""
-    try:
-        return window.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise ScriptHeaderError(f"脚本 header 不是合法 UTF-8: {exc}") from exc
+def _adapt(payload: dict[str, Any]) -> ScriptHeader:
+    return ScriptHeader(
+        api_version=payload["api_version"],
+        mode=payload["mode"],
+        capabilities=tuple(payload["capabilities"]),
+        requires=tuple(payload["requires"]),
+        editor_output=payload["editor_output"],
+    )
 
 
 def parse_script_header_text(text: str) -> ScriptHeader:
-    """解析文本最前方连续注释/空行中的 assetmaker 声明。"""
-    prefix = _decode_header_window(text.encode("utf-8"))
-    declarations: dict[str, str] = {}
-    for line in prefix.splitlines():
-        stripped = line.lstrip()
-        if not stripped:
-            continue
-        if not stripped.startswith("#"):
-            break
-        match = _DECLARATION_RE.match(stripped)
-        if match is None:
-            continue
-        field, value = match.groups()
-        field = field.strip()
-        if field not in _KNOWN_FIELDS:
-            raise ScriptHeaderError(f"未知 assetmaker header: {field!r}")
-        if field in declarations:
-            raise ScriptHeaderError(f"重复 assetmaker header: {field!r}")
-        declarations[field] = value
-
-    missing = sorted(_KNOWN_FIELDS - set(declarations))
-    if missing:
-        raise ScriptHeaderError(f"缺少 assetmaker header: {', '.join(missing)}")
-
-    if declarations["api"] != "1":
-        raise ScriptHeaderError(
-            f"不支持 assetmaker-api: {declarations['api']!r}"
-        )
-    mode = declarations["mode"]
-    if mode not in ("compatible", "raw"):
-        raise ScriptHeaderError(
-            f"未知 assetmaker-mode: {mode!r}"
-        )
-    if declarations["editor-output"] not in ("0", "1"):
-        raise ScriptHeaderError(
-            "assetmaker-editor-output 必须为 0 或 1"
-        )
-
-    capabilities = _comma_list(
-        declarations["capabilities"], "capabilities", allow_empty=False
-    )
-    unknown_capabilities = sorted(set(capabilities) - _KNOWN_CAPABILITIES)
-    if unknown_capabilities:
-        raise ScriptHeaderError(
-            f"未知 capability: {', '.join(unknown_capabilities)}"
-        )
-
-    requirements = _comma_list(
-        declarations["requires"], "requires", allow_empty=True
-    )
-    invalid_requirements = [
-        item for item in requirements if _REQUIREMENT_RE.fullmatch(item) is None
-    ]
-    if invalid_requirements:
-        raise ScriptHeaderError(
-            f"非法 requirement: {', '.join(invalid_requirements)}"
-        )
-
-    editor_output = int(declarations["editor-output"])
-    if (
-        mode == "compatible"
-        and _EDITOR_OPERATIONS.intersection(capabilities)
-        and editor_output != 1
-    ):
-        raise ScriptHeaderError(
-            "compatible 脚本声明 trim/crop/rotation 时必须设置 "
-            "assetmaker-editor-output: 1"
-        )
-    if mode == "raw" and editor_output != 0:
-        raise ScriptHeaderError(
-            "raw 脚本不读取编辑器输出，assetmaker-editor-output 必须为 0"
-        )
-    return ScriptHeader(
-        api_version=1,
-        mode=mode,
-        capabilities=capabilities,
-        requires=requirements,
-        editor_output=editor_output,
-    )
+    """通过共享 wire 解析器解析文本，再冻结为应用侧模型。"""
+    try:
+        return _adapt(_wire.parse_script_header_text(text))
+    except _wire.ScriptHeaderError as exc:
+        _raise_adapter(exc)
 
 
 def parse_script_header(path: str | os.PathLike[str]) -> ScriptHeader:
-    """仅读取脚本前 8 KiB 并解析声明，错误包含绝对路径。"""
-    script_path = Path(path)
+    """通过共享 wire 解析器解析文件，再冻结为应用侧模型。"""
     try:
-        with script_path.open("rb") as handle:
-            text = _decode_header_window(handle.read(HEADER_LIMIT_BYTES + 1))
-        return parse_script_header_text(text)
-    except (OSError, ScriptHeaderError) as exc:
-        raise ScriptHeaderError(f"{script_path.resolve()}: {exc}") from exc
+        return _adapt(_wire.parse_script_header(path))
+    except _wire.ScriptHeaderError as exc:
+        _raise_adapter(exc)
+
+
+__all__ = [
+    "HEADER_LIMIT_BYTES",
+    "ScriptHeader",
+    "ScriptHeaderError",
+    "parse_script_header",
+    "parse_script_header_text",
+]
