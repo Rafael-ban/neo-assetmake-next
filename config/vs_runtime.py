@@ -14,7 +14,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 
 from core.file_utils import atomic_write_json
 from utils.file_utils import get_app_dir
@@ -395,6 +395,31 @@ def load_vs_runtime(
     return VSRuntimeConfig.from_dict(base)
 
 
+def _update_vs_runtime_override(
+    target: Path,
+    merge: Callable[
+        [dict[str, Any], bool], dict[str, Any] | None
+    ],
+) -> bool:
+    """在共享锁内读取、合并、校验并写入一次用户覆盖。"""
+    with _override_lock(target):
+        try:
+            exists = target.exists()
+            existing = (
+                _validate_partial(_read_json(target)) if exists else {}
+            )
+            payload = merge(existing, exists)
+            if payload is None:
+                return False
+            _validate_partial(payload)
+            atomic_write_json(target, payload, indent=2)
+            return True
+        except VSRuntimeConfigError as exc:
+            if str(target.resolve()) in str(exc):
+                raise
+            raise VSRuntimeConfigError(f"{target.resolve()}: {exc}") from exc
+
+
 def save_vs_runtime_override(
     path: str | os.PathLike[str], override: Any
 ) -> None:
@@ -402,15 +427,28 @@ def save_vs_runtime_override(
     target = Path(path)
     patch = _canonicalize_override_paths(_require_object(override, "override"))
     _validate_partial(patch)
-    with _override_lock(target):
-        try:
-            existing = (
-                _validate_partial(_read_json(target)) if target.exists() else {}
-            )
-            payload = _deep_merge(existing, patch)
-            _validate_partial(payload)
-            atomic_write_json(target, payload, indent=2)
-        except VSRuntimeConfigError as exc:
-            if str(target.resolve()) in str(exc):
-                raise
-            raise VSRuntimeConfigError(f"{target.resolve()}: {exc}") from exc
+    _update_vs_runtime_override(
+        target,
+        lambda existing, _exists: _deep_merge(existing, patch),
+    )
+
+
+def merge_missing_vs_runtime_override(
+    path: str | os.PathLike[str],
+    defaults: Any,
+    *,
+    skip_valid_existing: bool = False,
+) -> bool:
+    """在共享更新锁内只填充当前缺失的覆盖字段。"""
+    target = Path(path)
+    missing_defaults = _canonicalize_override_paths(
+        _require_object(defaults, "override defaults")
+    )
+    _validate_partial(missing_defaults)
+
+    def merge(existing: dict[str, Any], exists: bool):
+        if skip_valid_existing and exists:
+            return None
+        return _deep_merge(missing_defaults, existing)
+
+    return _update_vs_runtime_override(target, merge)

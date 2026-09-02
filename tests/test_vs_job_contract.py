@@ -1,6 +1,8 @@
 import concurrent.futures
+import ctypes
 import json
 import multiprocessing
+import os
 import tempfile
 import threading
 import unittest
@@ -304,6 +306,36 @@ class RenderJobContractTests(unittest.TestCase):
                 with self.assertRaises(RenderJobError):
                     RenderJob.from_dict(payload)
 
+    def test_job_paths_reject_windows_alias_and_invalid_components(self):
+        cases = (
+            ("drive-nul", "D:\\bad\0name\\file.vpy", True),
+            ("drive-control", "D:\\bad\x1fname\\file.vpy", True),
+            ("drive-trailing-dot", r"D:\trail.\file.vpy", True),
+            ("drive-trailing-space", "D:\\trail \\file.vpy", True),
+            ("drive-device", r"D:\CON\file.vpy", False),
+            ("drive-device-extension", r"D:\con.txt\file.vpy", False),
+            ("unc-nul", "\\\\server\\share\\bad\0name\\file.vpy", True),
+            ("unc-control", "\\\\server\\share\\bad\x01name\\file.vpy", True),
+            ("unc-trailing-dot", r"\\server\share\trail.\file.vpy", True),
+            ("unc-trailing-space", "\\\\server\\share\\trail \\file.vpy", True),
+            ("unc-device", r"\\server\share\AUX.txt\file.vpy", False),
+            ("extended-device", r"\\?\D:\media\file.vpy", True),
+            ("win32-device", r"\\.\PhysicalDrive0", True),
+        )
+        validator = Draft202012Validator(JOB_SCHEMA)
+        for name, invalid_path, schema_can_reject in cases:
+            payload = make_job().to_dict()
+            payload["source"]["path"] = invalid_path
+            with self.subTest(name=name, layer="schema"):
+                if schema_can_reject:
+                    with self.assertRaises(ValidationError):
+                        validator.validate(payload)
+                else:
+                    validator.validate(payload)
+            with self.subTest(name=name, layer="model"):
+                with self.assertRaises(RenderJobError):
+                    RenderJob.from_dict(payload)
+
     def test_float_api_version_and_rotation_tokens_are_rejected(self):
         invalid_payloads = []
         api_payload = make_job().to_dict()
@@ -333,6 +365,109 @@ class RenderJobContractTests(unittest.TestCase):
         with self.assertRaises(RenderJobError):
             write_render_job(replace(job, track="intro"))
         self.assertEqual(path.read_bytes(), before)
+
+    @unittest.skipUnless(os.name == "nt", "Windows publish contract")
+    def test_windows_publish_uses_write_through_without_replace(self):
+        job = make_job(cache_dir=str(self.root), epoch=43)
+
+        def move_file(source, target, flags):
+            os.rename(source, target)
+            return 1
+
+        move = mock.Mock(side_effect=move_file)
+        kernel32 = mock.Mock()
+        kernel32.MoveFileExW = move
+        with mock.patch.object(ctypes, "WinDLL", return_value=kernel32):
+            path = write_render_job(job)
+
+        self.assertEqual(load_render_job(path, for_export=True), job)
+        move.assert_called_once()
+        source, target, flags = move.call_args.args
+        self.assertEqual(Path(target), path)
+        self.assertEqual(flags, 0x00000008)
+        self.assertFalse(Path(source).exists())
+        self.assertFalse(list(self.root.glob(".*.publish")))
+
+    @unittest.skipUnless(os.name == "nt", "Windows publish contract")
+    def test_win32_publish_conflicts_map_to_existing_job_error(self):
+        for epoch, error_code in ((44, 80), (45, 183)):
+            job = make_job(cache_dir=str(self.root), epoch=epoch)
+            kernel32 = mock.Mock()
+            kernel32.MoveFileExW.return_value = 0
+            with self.subTest(error_code=error_code), mock.patch.object(
+                ctypes, "WinDLL", return_value=kernel32
+            ), mock.patch.object(
+                ctypes, "get_last_error", return_value=error_code
+            ), mock.patch.object(
+                ctypes, "FormatError", return_value="already exists"
+            ):
+                with self.assertRaisesRegex(
+                    RenderJobError, "拒绝覆盖既有 RenderJob"
+                ):
+                    write_render_job(job)
+            self.assertFalse((self.root / f"job-{epoch}.json").exists())
+            self.assertFalse(list(self.root.glob(".*.publish")))
+
+    @unittest.skipUnless(os.name == "nt", "Windows publish contract")
+    def test_win32_publish_failure_reports_target_and_cleans_temp(self):
+        job = make_job(cache_dir=str(self.root), epoch=46)
+        target = self.root / "job-46.json"
+        kernel32 = mock.Mock()
+        kernel32.MoveFileExW.return_value = 0
+        with mock.patch.object(
+            ctypes, "WinDLL", return_value=kernel32
+        ), mock.patch.object(
+            ctypes, "get_last_error", return_value=50
+        ), mock.patch.object(
+            ctypes, "FormatError", return_value="not supported"
+        ):
+            with self.assertRaises(RenderJobError) as raised:
+                write_render_job(job)
+
+        self.assertIn(str(target.resolve()), str(raised.exception))
+        self.assertIn("not supported", str(raised.exception))
+        self.assertFalse(target.exists())
+        self.assertFalse(list(self.root.glob(".*.publish")))
+
+    @unittest.skipUnless(os.name == "nt", "Windows publish contract")
+    def test_publish_cleanup_error_does_not_mask_win32_failure(self):
+        job = make_job(cache_dir=str(self.root), epoch=47)
+        kernel32 = mock.Mock()
+        kernel32.MoveFileExW.return_value = 0
+        with mock.patch.object(
+            ctypes, "WinDLL", return_value=kernel32
+        ), mock.patch.object(
+            ctypes, "get_last_error", return_value=50
+        ), mock.patch.object(
+            ctypes, "FormatError", return_value="publish unsupported"
+        ), mock.patch.object(
+            Path, "unlink", side_effect=PermissionError("cleanup denied")
+        ):
+            with self.assertRaises(Exception) as raised:
+                write_render_job(job)
+
+        self.assertIsInstance(raised.exception, RenderJobError)
+        self.assertIn("publish unsupported", str(raised.exception))
+        self.assertNotIn("cleanup denied", str(raised.exception))
+
+    @unittest.skipUnless(os.name == "nt", "Windows publish contract")
+    def test_successful_publish_needs_no_post_publish_cleanup(self):
+        job = make_job(cache_dir=str(self.root), epoch=48)
+
+        with mock.patch.object(
+            Path, "unlink", side_effect=PermissionError("cleanup denied")
+        ) as unlink:
+            try:
+                path = write_render_job(job)
+            except Exception as exc:
+                self.fail(
+                    "successful publish attempted cleanup: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        self.assertEqual(load_render_job(path, for_export=True), job)
+        unlink.assert_not_called()
+        self.assertFalse(list(self.root.glob(".*.publish")))
 
     def test_same_epoch_thread_race_has_exactly_one_winner(self):
         loop = make_job(cache_dir=str(self.root), epoch=77, track="loop")

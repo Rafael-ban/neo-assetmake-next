@@ -23,6 +23,10 @@ class RenderJobError(ValueError):
     """渲染作业读取、结构或阶段语义错误。"""
 
 
+_MOVEFILE_WRITE_THROUGH = 0x00000008
+_WINDOWS_ALREADY_EXISTS = frozenset({80, 183})
+
+
 def _object(value: Any, location: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RenderJobError(f"{location} 必须是对象")
@@ -493,6 +497,37 @@ def load_render_job(
         raise RenderJobError(f"{source_path.resolve()}: {exc}") from exc
 
 
+def _move_file_ex_windows(source: Path, target: Path) -> None:
+    """在 Windows 上原子移动完整文件且不覆盖目标。"""
+    import ctypes
+    from ctypes import wintypes
+
+    move_file_ex = ctypes.WinDLL(
+        "kernel32", use_last_error=True
+    ).MoveFileExW
+    move_file_ex.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+    )
+    move_file_ex.restype = wintypes.BOOL
+    if move_file_ex(str(source), str(target), _MOVEFILE_WRITE_THROUGH):
+        return
+    error_code = ctypes.get_last_error()
+    raise OSError(error_code, ctypes.FormatError(error_code))
+
+
+def _publish_complete_file(source: Path, target: Path) -> None:
+    """从同目录发布完整文件且不覆盖目标。"""
+    if os.name == "nt":
+        _move_file_ex_windows(source, target)
+        return
+
+    # 非 Windows 仅供开发/测试；发布产品固定走上面的 MoveFileExW。
+    os.link(source, target)
+    source.unlink()
+
+
 def write_render_job(job: RenderJob) -> Path:
     """原子新建 ``job-<epoch>.json``，拒绝复用旧 epoch。"""
     if not isinstance(job, RenderJob):
@@ -510,17 +545,23 @@ def write_render_job(job: RenderJob) -> Path:
         os.close(descriptor)
         temp_path = Path(temp_name)
         atomic_write_json(temp_path, job.to_dict(), indent=2)
-        os.link(temp_path, target)
+        _publish_complete_file(temp_path, target)
+        temp_path = None
     except FileExistsError as exc:
         raise RenderJobError(
             f"拒绝覆盖既有 RenderJob: {target.resolve()}"
         ) from exc
     except OSError as exc:
+        error_code = getattr(exc, "winerror", None) or exc.errno
+        if error_code in _WINDOWS_ALREADY_EXISTS:
+            raise RenderJobError(
+                f"拒绝覆盖既有 RenderJob: {target.resolve()}"
+            ) from exc
         raise RenderJobError(f"{target.resolve()}: {exc}") from exc
     finally:
         if temp_path is not None:
             try:
                 temp_path.unlink()
-            except FileNotFoundError:
+            except OSError:
                 pass
     return target

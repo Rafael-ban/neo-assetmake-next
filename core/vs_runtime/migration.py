@@ -13,7 +13,7 @@ from config.vs_runtime import (
     VSRuntimeConfigError,
     default_vs_runtime_path,
     default_vs_runtime_user_path,
-    save_vs_runtime_override,
+    merge_missing_vs_runtime_override,
 )
 from core.file_utils import atomic_write_json, sha256_file
 from utils.windows_paths import canonicalize_windows_absolute_path
@@ -72,18 +72,6 @@ def _set_nested(data: dict[str, Any], dotted: str, value: Any) -> None:
     current[parts[-1]] = value
 
 
-def _deep_merge(
-    base: dict[str, Any], override: dict[str, Any]
-) -> dict[str, Any]:
-    merged = dict(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
 def _canonicalize_legacy_plugin_dirs(value: Any, source: Path) -> Any:
     if not isinstance(value, list):
         return value
@@ -121,7 +109,7 @@ def migrate_legacy_vsconfig_once(
         Path(legacy_path)
         if legacy_path is not None
         else default_vs_runtime_path().with_name("vsconfig.json")
-    )
+    ).resolve()
     target = (
         Path(user_path)
         if user_path is not None
@@ -143,7 +131,12 @@ def migrate_legacy_vsconfig_once(
         present, value = _get_nested(legacy, old_field)
         if present:
             if old_field == "extra_plugin_dirs":
-                value = _canonicalize_legacy_plugin_dirs(value, source)
+                try:
+                    value = _canonicalize_legacy_plugin_dirs(value, source)
+                except ValueError as exc:
+                    raise VSRuntimeConfigError(
+                        f"{source}: {exc}"
+                    ) from exc
             _set_nested(migrated, new_field, value)
             migrated_fields.append(old_field)
     ignored_fields = tuple(
@@ -151,16 +144,19 @@ def migrate_legacy_vsconfig_once(
     )
     report_fields = tuple(migrated_fields)
 
+    same_source_hash = False
     if marker.exists():
         marker_payload = _read_object(marker, "migration marker")
-        if marker_payload.get("source_hash") == source_hash:
-            return MigrationReport(
-                False, report_fields, ignored_fields, source_hash
-            )
+        same_source_hash = marker_payload.get("source_hash") == source_hash
 
-    if target.exists():
-        existing = _read_object(target, "runtime user override")
-        migrated = _deep_merge(migrated, existing)
-    save_vs_runtime_override(target, migrated)
+    applied = merge_missing_vs_runtime_override(
+        target,
+        migrated,
+        skip_valid_existing=same_source_hash,
+    )
+    if not applied:
+        return MigrationReport(
+            False, report_fields, ignored_fields, source_hash
+        )
     atomic_write_json(marker, {"source_hash": source_hash}, indent=2)
     return MigrationReport(True, report_fields, ignored_fields, source_hash)

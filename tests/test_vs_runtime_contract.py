@@ -2,10 +2,12 @@ import concurrent.futures
 import hashlib
 import json
 import multiprocessing
+import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from jsonschema import Draft202012Validator, ValidationError
 
@@ -32,6 +34,85 @@ def _save_override_process(path, patch, barrier, results):
         results.put(("error", str(exc)))
     else:
         results.put(("ok", ""))
+
+
+def _save_override_signal_process(path, patch, started, results):
+    started.set()
+    try:
+        save_vs_runtime_override(path, patch)
+    except Exception as exc:
+        results.put(("error", str(exc)))
+    else:
+        results.put(("ok", ""))
+
+
+def _migration_with_paused_target_read_process(
+    legacy_path,
+    user_path,
+    marker_path,
+    read_started,
+    release_read,
+    results,
+):
+    import config.vs_runtime as runtime_module
+    import core.vs_runtime.migration as migration_module
+
+    target = Path(user_path).resolve()
+    original_runtime_read = runtime_module._read_json
+    original_migration_read = migration_module._read_object
+
+    def pause(path, payload):
+        if Path(path).resolve() == target:
+            read_started.set()
+            if not release_read.wait(timeout=10):
+                raise TimeoutError("migration target read was not released")
+        return payload
+
+    def runtime_read(path):
+        return pause(path, original_runtime_read(path))
+
+    def migration_read(path, location):
+        return pause(path, original_migration_read(path, location))
+
+    runtime_module._read_json = runtime_read
+    migration_module._read_object = migration_read
+    try:
+        report = migration_module.migrate_legacy_vsconfig_once(
+            legacy_path, user_path, marker_path
+        )
+    except Exception as exc:
+        results.put(("error", str(exc)))
+    else:
+        results.put(("ok", report.applied))
+
+
+def _override_file_lock_is_held(path):
+    lock_path = Path(path).with_name(f".{Path(path).name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            return False
+
+        import fcntl
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return False
 
 
 class VSRuntimeContractTests(unittest.TestCase):
@@ -183,6 +264,48 @@ class VSRuntimeContractTests(unittest.TestCase):
             with self.subTest(plugin_dir=invalid_path):
                 with self.assertRaises(ValidationError):
                     Draft202012Validator(RUNTIME_SCHEMA).validate(payload)
+                with self.assertRaises(VSRuntimeConfigError):
+                    VSRuntimeConfig.from_dict(payload)
+
+    def test_runtime_paths_reject_windows_alias_and_invalid_components(self):
+        cases = (
+            ("drive-nul", "D:\\bad\0name\\pipeline.vpy", True),
+            ("drive-control", "D:\\bad\x1fname\\pipeline.vpy", True),
+            ("drive-trailing-dot", r"D:\trail.\pipeline.vpy", True),
+            ("drive-trailing-space", "D:\\trail \\pipeline.vpy", True),
+            ("drive-device", r"D:\NUL\pipeline.vpy", False),
+            ("drive-device-extension", r"D:\LPT1.log\pipeline.vpy", False),
+            ("unc-nul", "\\\\server\\share\\bad\0name\\pipeline.vpy", True),
+            ("unc-control", "\\\\server\\share\\bad\x01name\\pipeline.vpy", True),
+            ("unc-trailing-dot", r"\\server\share\trail.\pipeline.vpy", True),
+            ("unc-trailing-space", "\\\\server\\share\\trail \\pipeline.vpy", True),
+            ("unc-device", r"\\server\share\COM9.txt\pipeline.vpy", False),
+            ("extended-device", r"\\?\D:\VS\pipeline.vpy", True),
+            ("win32-device", r"\\.\PhysicalDrive0", True),
+        )
+        validator = Draft202012Validator(RUNTIME_SCHEMA)
+        for name, invalid_path, schema_can_reject in cases:
+            payload = VSRuntimeConfig().to_dict()
+            payload["scripts"]["global_script_path"] = invalid_path
+            with self.subTest(name=name, layer="schema"):
+                if schema_can_reject:
+                    with self.assertRaises(ValidationError):
+                        validator.validate(payload)
+                else:
+                    validator.validate(payload)
+            with self.subTest(name=name, layer="model"):
+                with self.assertRaises(VSRuntimeConfigError):
+                    VSRuntimeConfig.from_dict(payload)
+
+            payload = VSRuntimeConfig().to_dict()
+            payload["plugins"]["native_plugin_dirs"] = [invalid_path]
+            with self.subTest(name=name, layer="plugin-schema"):
+                if schema_can_reject:
+                    with self.assertRaises(ValidationError):
+                        validator.validate(payload)
+                else:
+                    validator.validate(payload)
+            with self.subTest(name=name, layer="plugin-model"):
                 with self.assertRaises(VSRuntimeConfigError):
                     VSRuntimeConfig.from_dict(payload)
 
@@ -451,6 +574,168 @@ class LegacyVSConfigMigrationTests(unittest.TestCase):
             )
         self.assertIn(str(self.user_path.resolve()), str(target_error.exception))
 
+    def test_same_hash_marker_validates_target_before_short_circuit(self):
+        self.write_legacy()
+        migrate_legacy_vsconfig_once(
+            self.legacy_path, self.user_path, self.marker_path
+        )
+        self.user_path.write_text("{", encoding="utf-8")
+
+        with self.assertRaises(VSRuntimeConfigError) as raised:
+            migrate_legacy_vsconfig_once(
+                self.legacy_path, self.user_path, self.marker_path
+            )
+
+        self.assertIn(str(self.user_path.resolve()), str(raised.exception))
+
+    def test_same_hash_marker_rebuilds_missing_target(self):
+        self.write_legacy()
+        first = migrate_legacy_vsconfig_once(
+            self.legacy_path, self.user_path, self.marker_path
+        )
+        self.user_path.unlink()
+
+        second = migrate_legacy_vsconfig_once(
+            self.legacy_path, self.user_path, self.marker_path
+        )
+
+        self.assertTrue(first.applied)
+        self.assertTrue(second.applied)
+        self.assertEqual(second.source_hash, first.source_hash)
+        payload = json.loads(self.user_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["core"]["num_threads"], 4)
+        self.assertEqual(payload["core"]["max_cache_size_mb"], 512)
+
+    def test_migration_and_save_thread_race_keeps_latest_patch(self):
+        import config.vs_runtime as runtime_module
+        import core.vs_runtime.migration as migration_module
+
+        self.write_legacy()
+        save_vs_runtime_override(
+            self.user_path, {"core": {"num_threads": 9}}
+        )
+        read_started = threading.Event()
+        release_read = threading.Event()
+        target = self.user_path.resolve()
+        original_runtime_read = runtime_module._read_json
+        original_migration_read = migration_module._read_object
+
+        def pause(path, payload):
+            if (
+                threading.current_thread().name == "migration"
+                and Path(path).resolve() == target
+            ):
+                read_started.set()
+                self.assertTrue(release_read.wait(timeout=10))
+            return payload
+
+        def runtime_read(path):
+            return pause(path, original_runtime_read(path))
+
+        def migration_read(path, location):
+            return pause(path, original_migration_read(path, location))
+
+        migration_result = []
+
+        def migrate():
+            migration_result.append(
+                migrate_legacy_vsconfig_once(
+                    self.legacy_path, self.user_path, self.marker_path
+                )
+            )
+
+        with mock.patch.object(
+            runtime_module, "_read_json", side_effect=runtime_read
+        ), mock.patch.object(
+            migration_module, "_read_object", side_effect=migration_read
+        ):
+            migration_thread = threading.Thread(
+                target=migrate, name="migration"
+            )
+            migration_thread.start()
+            self.assertTrue(read_started.wait(timeout=10))
+            shared_lock = runtime_module._thread_lock_for(self.user_path)
+            migration_holds_lock = not shared_lock.acquire(blocking=False)
+            if not migration_holds_lock:
+                shared_lock.release()
+                save_vs_runtime_override(
+                    self.user_path, {"core": {"num_threads": 10}}
+                )
+                release_read.set()
+                migration_thread.join(timeout=10)
+            else:
+                save_thread = threading.Thread(
+                    target=save_vs_runtime_override,
+                    args=(
+                        self.user_path,
+                        {"core": {"num_threads": 10}},
+                    ),
+                )
+                save_thread.start()
+                release_read.set()
+                migration_thread.join(timeout=10)
+                save_thread.join(timeout=10)
+                self.assertFalse(save_thread.is_alive())
+
+        self.assertFalse(migration_thread.is_alive())
+        self.assertEqual(len(migration_result), 1)
+        payload = json.loads(self.user_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["core"]["num_threads"], 10)
+        self.assertEqual(payload["core"]["max_cache_size_mb"], 512)
+
+    def test_migration_and_save_process_race_keeps_latest_patch(self):
+        self.write_legacy()
+        save_vs_runtime_override(
+            self.user_path, {"core": {"num_threads": 9}}
+        )
+        context = multiprocessing.get_context("spawn")
+        read_started = context.Event()
+        release_read = context.Event()
+        migration_results = context.Queue()
+        save_started = context.Event()
+        save_results = context.Queue()
+        migration_process = context.Process(
+            target=_migration_with_paused_target_read_process,
+            args=(
+                self.legacy_path,
+                self.user_path,
+                self.marker_path,
+                read_started,
+                release_read,
+                migration_results,
+            ),
+        )
+        migration_process.start()
+        self.assertTrue(read_started.wait(timeout=10))
+        migration_holds_lock = _override_file_lock_is_held(self.user_path)
+        save_process = context.Process(
+            target=_save_override_signal_process,
+            args=(
+                self.user_path,
+                {"core": {"num_threads": 10}},
+                save_started,
+                save_results,
+            ),
+        )
+        save_process.start()
+        self.assertTrue(save_started.wait(timeout=10))
+        if not migration_holds_lock:
+            save_process.join(timeout=10)
+            self.assertFalse(save_process.is_alive())
+        release_read.set()
+        migration_process.join(timeout=15)
+        save_process.join(timeout=15)
+        self.assertFalse(migration_process.is_alive())
+        self.assertFalse(save_process.is_alive())
+        self.assertEqual(migration_process.exitcode, 0)
+        self.assertEqual(save_process.exitcode, 0)
+        self.assertEqual(migration_results.get(timeout=5)[0], "ok")
+        self.assertEqual(save_results.get(timeout=5)[0], "ok")
+
+        payload = json.loads(self.user_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["core"]["num_threads"], 10)
+        self.assertEqual(payload["core"]["max_cache_size_mb"], 512)
+
     def test_relative_legacy_plugin_dir_is_canonicalized_from_install_root(self):
         install_root = self.root / "ArknightsPassMaker"
         legacy_path = install_root / "config" / "vsconfig.json"
@@ -463,6 +748,36 @@ class LegacyVSConfigMigrationTests(unittest.TestCase):
         )
 
         migrate_legacy_vsconfig_once(legacy_path, user_path, marker_path)
+
+        payload = json.loads(user_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            payload["plugins"]["native_plugin_dirs"],
+            [str(install_root / "tools" / "media" / "vs-plugins")],
+        )
+
+    def test_relative_legacy_source_uses_resolved_install_root(self):
+        worktree_temp = tempfile.TemporaryDirectory(dir=Path.cwd())
+        self.addCleanup(worktree_temp.cleanup)
+        install_root = Path(worktree_temp.name).resolve() / "ArknightsPassMaker"
+        legacy_path = install_root / "config" / "vsconfig.json"
+        user_path = self.root / "user-relative" / "vs_runtime.user.json"
+        marker_path = self.root / "user-relative" / "migration.json"
+        legacy_path.parent.mkdir(parents=True)
+        legacy_path.write_text(
+            json.dumps({"extra_plugin_dirs": ["vs-plugins"]}),
+            encoding="utf-8",
+        )
+        relative_legacy = os.path.relpath(legacy_path, Path.cwd())
+
+        try:
+            migrate_legacy_vsconfig_once(
+                relative_legacy, user_path, marker_path
+            )
+        except Exception as exc:
+            self.fail(
+                "relative legacy source leaked an exception: "
+                f"{type(exc).__name__}: {exc}"
+            )
 
         payload = json.loads(user_path.read_text(encoding="utf-8"))
         self.assertEqual(
