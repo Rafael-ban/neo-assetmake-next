@@ -117,6 +117,16 @@ class PreviewRenderContext:
         )
 
 
+@dataclass(frozen=True)
+class _RequestOwner:
+    """UI 侧为每个 worker 请求保存的唯一终态身份。"""
+
+    epoch: int
+    kind: Literal["load", "frame", "capture"]
+    surface: str | None = None
+    index: int | None = None
+
+
 @lru_cache(maxsize=4)
 def _runtime_fingerprint_for_app(app_dir: str) -> str:
     """只哈希 runtime 文件；不得在 Qt 进程导入 VapourSynth。"""
@@ -207,8 +217,9 @@ class VideoPreviewWidget(QWidget):
         self._metadata_resolved = False
         self._job_dirty = False
         self._load_request_id: int | None = None
-        self._request_epochs: dict[int, tuple[int, str]] = {}
-        self._pending_captures: list[tuple[int, int, Callable]] = []
+        self._request_epochs: dict[int, _RequestOwner] = {}
+        self._latest_display_request_id: int | None = None
+        self._pending_captures: dict[int, Callable] = {}
         self._job_paths: set[Path] = set()
         self._retiring_job_paths: set[Path] = set()
         self._retire_after_unload: dict[int, set[Path]] = {}
@@ -322,6 +333,10 @@ class VideoPreviewWidget(QWidget):
     def _teardown_media(self, sync_shutdown: bool = False):
         """取消当前 epoch；close 时再终止该 widget 独占的 worker。"""
         self._job_debounce.stop()
+        self._resolve_all_pending_captures()
+        self._dismiss_timeout_dialogs()
+        self._request_epochs.clear()
+        self._latest_display_request_id = None
         old_session = self._render_session
         client = self._worker_client
         if old_session is not None:
@@ -332,7 +347,6 @@ class VideoPreviewWidget(QWidget):
         self._metadata_resolved = False
         self._selection = None
         self._load_request_id = None
-        self._pending_captures.clear()
         self._vs_active = False
         self._has_video = False
         if sync_shutdown and client is not None:
@@ -383,6 +397,12 @@ class VideoPreviewWidget(QWidget):
             client.ready.connect(self._on_worker_ready)
             client.metadata_ready.connect(self._on_worker_metadata)
             client.frame_ready.connect(self._on_worker_frame)
+            frame_discarded = getattr(client, "frame_discarded", None)
+            if frame_discarded is not None:
+                frame_discarded.connect(self._on_worker_frame_discarded)
+            frame_submitted = getattr(client, "frame_submitted", None)
+            if frame_submitted is not None:
+                frame_submitted.connect(self._on_worker_frame_submitted)
             client.request_failed.connect(self._on_worker_request_failed)
             client.request_timed_out.connect(self._on_worker_timeout)
             operation_completed = getattr(client, "operation_completed", None)
@@ -466,7 +486,7 @@ class VideoPreviewWidget(QWidget):
         client = self._ensure_worker()
         request_id = client.load(session)
         self._load_request_id = request_id
-        self._request_epochs[request_id] = (session.epoch, "load")
+        self._request_epochs[request_id] = _RequestOwner(session.epoch, "load")
         return session
 
     def _viewport_size(self) -> Tuple[int, int]:
@@ -546,10 +566,38 @@ class VideoPreviewWidget(QWidget):
             coalesce=coalesce,
         )
         if request_id is not None:
-            self._request_epochs[request_id] = (
+            self._register_display_request(
+                request_id,
                 self._render_session.epoch,
-                "frame",
+                surface,
+                index,
             )
+
+    def _register_display_request(
+        self, request_id: int, epoch: int, surface: str, index: int
+    ) -> None:
+        """登记最新显示请求；只允许它覆盖当前图像。"""
+
+        self._request_epochs[request_id] = _RequestOwner(
+            epoch, "frame", surface, index
+        )
+        self._latest_display_request_id = request_id
+
+    def _on_worker_frame_submitted(
+        self, request_id: int, epoch: int, surface: str, index: int
+    ) -> None:
+        """补登记 transport 延后提交的 coalesced frame。"""
+
+        session = self._render_session
+        if (
+            session is None
+            or epoch != session.epoch
+            or surface not in {"editor", "final"}
+            or type(request_id) is not int
+            or type(index) is not int
+        ):
+            return
+        self._register_display_request(request_id, epoch, surface, index)
 
     def _on_worker_ready(self) -> None:
         if not self._restart_pending or self._render_session is None:
@@ -557,12 +605,17 @@ class VideoPreviewWidget(QWidget):
         self._restart_pending = False
         request_id = self._worker_client.load(self._render_session)
         self._load_request_id = request_id
-        self._request_epochs[request_id] = (self._render_session.epoch, "load")
+        self._request_epochs[request_id] = _RequestOwner(
+            self._render_session.epoch, "load"
+        )
 
     def _on_worker_metadata(self, epoch: int, metadata: SessionMetadata) -> None:
         session = self._render_session
         if session is None or epoch != session.epoch:
             return
+        load_owner = self._request_epochs.get(self._load_request_id)
+        if load_owner is not None and load_owner.epoch == epoch:
+            self._request_epochs.pop(self._load_request_id, None)
         if metadata.mode != self._selection.mode:
             self._fail_current_load("worker 返回的脚本模式与冻结选择不一致")
             return
@@ -597,36 +650,86 @@ class VideoPreviewWidget(QWidget):
             self.video_loaded.emit(self.total_frames, self.video_fps)
         self._request_current_frame()
 
-    def _on_worker_frame(self, epoch: int, index: int, array) -> None:
+    def _on_worker_frame(
+        self, request_id: int, epoch: int, surface: str, index: int, array
+    ) -> None:
         session = self._render_session
-        if session is None or epoch != session.epoch or array is None:
+        owner = self._request_epochs.pop(request_id, None)
+        if (
+            session is None
+            or owner is None
+            or owner.epoch != epoch
+            or epoch != session.epoch
+            or owner.surface != surface
+            or owner.index != index
+        ):
             return
+        if array is None:
+            if owner.kind == "capture":
+                self._resolve_capture(request_id, None)
+            if request_id == self._latest_display_request_id:
+                self._latest_display_request_id = None
+            return
+        if owner.kind == "capture":
+            self._resolve_capture(request_id, np.array(array, copy=True))
+            return
+        if owner.kind != "frame" or request_id != self._latest_display_request_id:
+            return
+        self._latest_display_request_id = None
         owned = np.array(array, copy=True)
         self.current_frame = owned
         self._display_frame(owned)
-        pending = self._pending_captures
-        self._pending_captures = []
-        for capture_epoch, capture_index, callback in pending:
-            if capture_epoch == epoch and capture_index == index:
-                callback(np.array(array, copy=True))
-            else:
-                self._pending_captures.append(
-                    (capture_epoch, capture_index, callback)
-                )
+
+    def _on_worker_frame_discarded(
+        self, request_id: int, epoch: int, surface: str, index: int
+    ) -> None:
+        owner = self._request_epochs.pop(request_id, None)
+        if owner is None or (
+            owner.epoch != epoch
+            or owner.surface != surface
+            or owner.index != index
+        ):
+            return
+        if request_id == self._latest_display_request_id:
+            self._latest_display_request_id = None
+        if owner.kind == "capture":
+            self._resolve_capture(request_id, None)
+
+    def _resolve_capture(self, request_id: int, frame: np.ndarray | None) -> None:
+        callback = self._pending_captures.pop(request_id, None)
+        if callback is None:
+            return
+        try:
+            callback(None if frame is None else np.array(frame, copy=True))
+        except Exception:
+            logger.exception("截帧回调失败")
+
+    def _resolve_all_pending_captures(self) -> None:
+        callbacks = tuple(self._pending_captures.values())
+        self._pending_captures.clear()
+        for callback in callbacks:
+            try:
+                callback(None)
+            except Exception:
+                logger.exception("截帧回调失败")
 
     def _on_worker_request_failed(
         self, request_id: int, code: str, message: str
     ) -> None:
         owner = self._request_epochs.pop(request_id, None)
+        if owner is not None and owner.kind == "capture":
+            self._resolve_capture(request_id, None)
+        if request_id == self._latest_display_request_id:
+            self._latest_display_request_id = None
         if owner is not None:
             session = self._render_session
-            if session is None or owner[0] != session.epoch:
+            if session is None or owner.epoch != session.epoch:
                 return
         elif request_id != 0:
             return
         detail = message or code or "VapourSynth worker 请求失败"
         self._retire_job_paths(self._retire_after_unload.pop(request_id, set()))
-        if owner is not None and owner[1] == "load":
+        if owner is not None and owner.kind == "load":
             self._fail_current_load(detail)
         elif request_id == 0 and code in {
             "worker.restart_failed",
@@ -694,10 +797,28 @@ class VideoPreviewWidget(QWidget):
 
         self._retire_job_paths(set(self._retiring_job_paths))
         self._retire_after_unload.clear()
+        self._resolve_all_pending_captures()
+        self._dismiss_timeout_dialogs()
+        self._request_epochs.clear()
+        self._latest_display_request_id = None
+
+    def _dismiss_timeout_dialogs(self) -> None:
+        dialogs = tuple(self._timeout_dialogs.values())
+        self._timeout_dialogs.clear()
+        for box in dialogs:
+            box.close()
+            box.deleteLater()
 
     def _on_worker_timeout(self, request_id: int, epoch: int) -> None:
         session = self._render_session
-        if session is None or epoch != session.epoch:
+        owner = self._request_epochs.get(request_id)
+        if (
+            session is None
+            or owner is None
+            or owner.kind != "frame"
+            or owner.epoch != epoch
+            or epoch != session.epoch
+        ):
             return
         box = QMessageBox(self)
         box.setWindowTitle("渲染超时")
@@ -706,17 +827,26 @@ class VideoPreviewWidget(QWidget):
         restart = box.addButton("终止并重启", QMessageBox.ButtonRole.DestructiveRole)
 
         def _finished(_result: int) -> None:
+            if self._timeout_dialogs.get(request_id) is not box:
+                box.deleteLater()
+                return
             self._timeout_dialogs.pop(request_id, None)
+            active_owner = self._request_epochs.get(request_id)
+            if active_owner != owner or self._worker_client is not client:
+                box.deleteLater()
+                return
             if box.clickedButton() is keep_waiting:
-                if self._worker_client is not None:
-                    self._worker_client.continue_wait(request_id)
+                client.continue_wait(request_id)
             elif box.clickedButton() is restart:
                 self.restart_rendering()
             box.deleteLater()
 
         box.finished.connect(_finished)
         self._timeout_dialogs[request_id] = box
-        box.open()
+        client = self._worker_client
+        box.setWindowModality(Qt.WindowModality.NonModal)
+        box.setModal(False)
+        box.show()
 
     def _on_worker_crashed(self, message: str) -> None:
         # 旧测试替身没有 worker_stopped；crash 本身同样是安全的退休边界。
@@ -725,6 +855,11 @@ class VideoPreviewWidget(QWidget):
 
     def _show_worker_unavailable(self, message: str) -> None:
         """Put a transport-level failure into a recoverable preview state."""
+        self.pause()
+        self._resolve_all_pending_captures()
+        self._dismiss_timeout_dialogs()
+        self._request_epochs.clear()
+        self._latest_display_request_id = None
         self._restart_pending = False
         self._worker_ready_for_frames = False
         self._vs_active = False
@@ -1095,6 +1230,8 @@ class VideoPreviewWidget(QWidget):
         )
 
     def _on_timer_tick(self):
+        if not self.is_playing:
+            return
         if not (self._has_video or self._loop_frame is not None):
             return
         numerator = self._fps_rational.numerator if self._fps_rational else 30
@@ -1210,8 +1347,10 @@ class VideoPreviewWidget(QWidget):
         if request_id is None:
             callback(None)
             return
-        self._request_epochs[request_id] = (self._render_session.epoch, "capture")
-        self._pending_captures.append((self._render_session.epoch, index, callback))
+        self._request_epochs[request_id] = _RequestOwner(
+            self._render_session.epoch, "capture", surface, index
+        )
+        self._pending_captures[request_id] = callback
 
     def get_current_frame(self) -> int:
         return self.current_frame_index

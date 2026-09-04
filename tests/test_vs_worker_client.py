@@ -146,9 +146,11 @@ class _ThreadProbe(QObject):
         super().__init__()
         self.calls = []
 
-    @pyqtSlot(object, object, object)
-    def receive(self, epoch, index, frame):
-        self.calls.append((epoch, index, frame, QThread.currentThread()))
+    @pyqtSlot(object, object, str, object, object)
+    def receive(self, request_id, epoch, surface, index, frame):
+        self.calls.append(
+            (request_id, epoch, surface, index, frame, QThread.currentThread())
+        )
 
 
 class VSWorkerClientTests(unittest.TestCase):
@@ -214,6 +216,7 @@ class VSWorkerClientTests(unittest.TestCase):
             "request_id": 9,
             "epoch": 7,
             "index": 2,
+            "surface": "editor",
             "frame": frame,
             "generation": 0,
         }
@@ -224,8 +227,8 @@ class VSWorkerClientTests(unittest.TestCase):
         self._drain_events()
 
         self.assertEqual(len(probe.calls), 1)
-        self.assertEqual(probe.calls[0][:3], (7, 2, frame))
-        self.assertIs(probe.calls[0][3], self.app.thread())
+        self.assertEqual(probe.calls[0][:5], (9, 7, "editor", 2, frame))
+        self.assertIs(probe.calls[0][5], self.app.thread())
 
     def test_frame_timeout_continue_wait_reuses_request_and_does_not_kill(self):
         timeouts = []

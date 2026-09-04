@@ -247,7 +247,9 @@ class PreviewWorkerRetirementTests(unittest.TestCase):
 
         self.widget.clear()
         self.client.frame_ready.emit(
+            request.request_id,
             request.epoch,
+            request.surface,
             request.index,
             np.full((4, 4, 3), 255, dtype=np.uint8),
         )

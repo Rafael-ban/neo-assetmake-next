@@ -51,7 +51,8 @@ def _node(
 class FakeWorkerClient(QObject):
     ready = pyqtSignal()
     metadata_ready = pyqtSignal(object, object)
-    frame_ready = pyqtSignal(object, object, object)
+    frame_ready = pyqtSignal(object, object, str, object, object)
+    frame_discarded = pyqtSignal(object, object, str, object)
     request_failed = pyqtSignal(object, str, str)
     request_timed_out = pyqtSignal(object, object)
     worker_crashed = pyqtSignal(str)
@@ -304,7 +305,11 @@ class PreviewWorkerContractTests(unittest.TestCase):
             stale_session.epoch, self._metadata(stale_session.epoch)
         )
         self.client.frame_ready.emit(
-            stale_session.epoch, 0, np.full((4, 4, 3), 255, np.uint8)
+            999,
+            stale_session.epoch,
+            "editor",
+            0,
+            np.full((4, 4, 3), 255, np.uint8),
         )
         self.client.request_failed.emit(stale_request, "script.error", "late")
         QCoreApplication.processEvents()
@@ -320,7 +325,13 @@ class PreviewWorkerContractTests(unittest.TestCase):
         request = self.client.requests[-1]
         self.assertFalse(request.coalesce)
         frame = np.full((8, 6, 3), (2, 3, 4), np.uint8)
-        self.client.frame_ready.emit(request.epoch, request.index, frame)
+        self.client.frame_ready.emit(
+            request.request_id,
+            request.epoch,
+            request.surface,
+            request.index,
+            frame,
+        )
         QCoreApplication.processEvents()
         self.assertEqual(len(received), 1)
         self.assertFalse(np.shares_memory(received[0], frame))

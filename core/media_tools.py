@@ -225,10 +225,12 @@ class MediaToolchain:
             root / "tools" / "media" / "portable.vs",
             root / "resources" / "vapoursynth" / "assetmaker_runner.vpy",
             root / "resources" / "vapoursynth" / "default_pipeline.vpy",
+            root / "resources" / "vapoursynth" / "python" / "assetmaker_vs" / "__init__.py",
             root / "resources" / "vapoursynth" / "python" / "assetmaker_vs" / "executor.py",
             root / "resources" / "vapoursynth" / "python" / "assetmaker_vs" / "contract.py",
             root / "resources" / "vapoursynth" / "python" / "assetmaker_vs" / "display.py",
             root / "resources" / "vapoursynth" / "python" / "assetmaker_vs" / "job_api.py",
+            root / "resources" / "vapoursynth" / "python" / "assetmaker_vs" / "script_header.py",
         )
         missing.extend(path.name for path in required if not path.is_file())
         plugin_dir = root / "tools" / "media" / "vs-plugins"

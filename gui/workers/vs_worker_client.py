@@ -32,7 +32,11 @@ class VSWorkerClient(QObject):
     # 避免 pyqtSignal(int) 在长会话中静默截断 2**31 以上的标识。
     ready = pyqtSignal()
     metadata_ready = pyqtSignal(object, object)
-    frame_ready = pyqtSignal(object, object, object)
+    # ``frame_ready`` 必须保留 worker wire 的完整身份；epoch/index 本身
+    # 不能区分同一 session 中先后到达的 editor/final 请求。
+    frame_ready = pyqtSignal(object, object, str, object, object)
+    frame_discarded = pyqtSignal(object, object, str, object)
+    frame_submitted = pyqtSignal(object, object, str, object)
     request_failed = pyqtSignal(object, str, str)
     request_timed_out = pyqtSignal(object, object)
     operation_completed = pyqtSignal(object, str)
@@ -344,6 +348,12 @@ class VSWorkerClient(QObject):
                     self.worker_config.frame_timeout_ms,
                     generation=generation,
                 )
+            self.frame_submitted.emit(
+                request_id,
+                event.get("epoch"),
+                str(event.get("surface", "")),
+                event.get("index"),
+            )
             return
         shutdown_ack = (
             event_type == "ready" and event.get("operation") == "shutdown"
@@ -373,10 +383,20 @@ class VSWorkerClient(QObject):
             return
         if event_type == "frame_ready":
             self.frame_ready.emit(
-                event.get("epoch"), event.get("index"), event.get("frame")
+                request_id,
+                event.get("epoch"),
+                str(event.get("surface", "")),
+                event.get("index"),
+                event.get("frame"),
             )
             return
         if event_type == "frame_discarded":
+            self.frame_discarded.emit(
+                request_id,
+                event.get("epoch"),
+                str(event.get("surface", "")),
+                event.get("index"),
+            )
             return
         if event_type in {
             "requirement_error",
