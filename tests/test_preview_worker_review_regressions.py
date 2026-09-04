@@ -96,7 +96,10 @@ class PreviewWorkerReviewRegressionTests(unittest.TestCase):
     def _load_resolved(self):
         self.assertTrue(self.widget.load_video(str(self.media)))
         session = self.client.loads[-1]
-        self.client.metadata_ready.emit(session.epoch, self._metadata(session.epoch))
+        self.client.emit_metadata(
+            self.widget._load_request_id,
+            self._metadata(session.epoch),
+        )
         QCoreApplication.processEvents()
         return session
 
@@ -123,8 +126,9 @@ class PreviewWorkerReviewRegressionTests(unittest.TestCase):
         # 否则测试测到的只是预期的旧 epoch 丢弃，而不是 surface 身份问题。
         if self.widget._job_dirty:
             session = self.widget.flush_render_job()
-            self.client.metadata_ready.emit(
-                session.epoch, self._metadata(session.epoch)
+            self.client.emit_metadata(
+                self.widget._load_request_id,
+                self._metadata(session.epoch),
             )
             QCoreApplication.processEvents()
         editor_request = self.client.requests[-1]
@@ -201,6 +205,49 @@ class PreviewWorkerReviewRegressionTests(unittest.TestCase):
         QCoreApplication.processEvents()
         self.assertEqual(self.client.continued, [])
         self.assertEqual(self.client.restarts, 0)
+
+    def test_replaced_session_invalidates_old_timeout_dialog_actions(self):
+        session_a = self._load_resolved()
+        request_a = self.client.requests[-1]
+        self.client.request_timed_out.emit(request_a.request_id, session_a.epoch)
+        QCoreApplication.processEvents()
+        old_dialog = self.widget._timeout_dialogs[request_a.request_id]
+
+        session_b = self.widget.flush_render_job()
+        self.assertIs(self.widget.current_render_session(), session_b)
+        self.assertNotIn(request_a.request_id, self.widget._timeout_dialogs)
+        old_dialog.done(0)
+        QCoreApplication.processEvents()
+
+        self.assertEqual(self.client.continued, [])
+        self.assertEqual(self.client.restarts, 0)
+        self.assertIs(self.widget.current_render_session(), session_b)
+
+    def test_stale_metadata_releases_only_its_own_load_owner(self):
+        # bootstrap 已解析，随后连续两个 resolved job 才能复现真实竞态：
+        # A 仍在等待 metadata 时，B 已被 flush 成 current session。
+        self._load_resolved()
+        session_a = self.widget.flush_render_job()
+        request_a = self.widget._load_request_id
+        session_b = self.widget.flush_render_job()
+        request_b = self.widget._load_request_id
+        self.assertIn(request_a, self.widget._request_epochs)
+
+        self.client.emit_metadata(
+            request_a, self._metadata(session_a.epoch)
+        )
+        QCoreApplication.processEvents()
+
+        self.assertNotIn(request_a, self.widget._request_epochs)
+        self.assertIn(request_b, self.widget._request_epochs)
+        self.assertIs(self.widget.current_render_session(), session_b)
+
+        self.client.emit_metadata(
+            request_b, self._metadata(session_b.epoch)
+        )
+        QCoreApplication.processEvents()
+        self.assertTrue(self.widget._has_video)
+        self.assertIs(self.widget.current_render_session(), session_b)
 
     def test_crash_pauses_playback_and_old_tick_cannot_resume_it(self):
         self._load_resolved()

@@ -179,7 +179,9 @@ class VSWorkerClientTests(unittest.TestCase):
     def test_wraps_the_supplied_transport_and_emits_typed_metadata(self):
         received = []
         self.client.metadata_ready.connect(
-            lambda epoch, metadata: received.append((epoch, metadata))
+            lambda request_id, epoch, metadata: received.append(
+                (request_id, epoch, metadata)
+            )
         )
 
         hello = self.client.start()
@@ -205,7 +207,7 @@ class VSWorkerClientTests(unittest.TestCase):
         self._drain_events()
 
         self.assertIs(self.client.transport, self.transport)
-        self.assertEqual(received, [(7, metadata)])
+        self.assertEqual(received, [(request_id, 7, metadata)])
 
     def test_reader_thread_event_reaches_receiver_on_gui_thread(self):
         probe = _ThreadProbe()

@@ -232,8 +232,8 @@ class PreviewWorkerRetirementTests(unittest.TestCase):
     def _load_resolved(self):
         self.assertTrue(self.widget.load_video(str(self.media)))
         session = self.client.loads[-1]
-        self.client.metadata_ready.emit(
-            session.epoch,
+        self.client.emit_metadata(
+            self.widget._load_request_id,
             self._metadata(session.epoch),
         )
         QCoreApplication.processEvents()

@@ -466,6 +466,10 @@ class VideoPreviewWidget(QWidget):
     def _load_render_job(self, *, bootstrap: bool) -> RenderSession:
         retired_session = self._render_session
         if retired_session is not None:
+            # timeout 属于旧 session 的 frame 请求。换代后它不再有资格
+            # continue/restart 当前 session；只关闭同 epoch 的框，绝不影响
+            # 随后为新 epoch 创建的合法 timeout dialog。
+            self._dismiss_timeout_dialogs(epoch=retired_session.epoch)
             self._retire_render_session(retired_session)
         context = self._effective_context()
         job = self._make_render_job(bootstrap=bootstrap)
@@ -609,13 +613,19 @@ class VideoPreviewWidget(QWidget):
             self._render_session.epoch, "load"
         )
 
-    def _on_worker_metadata(self, epoch: int, metadata: SessionMetadata) -> None:
+    def _on_worker_metadata(
+        self, request_id: int, epoch: int, metadata: SessionMetadata
+    ) -> None:
+        # 先按 terminal request_id 收束 owner。它必须发生在 current-epoch
+        # guard 前，否则 A metadata 在 B 已 current 时永远无法释放 A owner。
+        owner = self._request_epochs.pop(request_id, None)
+        if owner is None or owner.kind != "load" or owner.epoch != epoch:
+            return
         session = self._render_session
         if session is None or epoch != session.epoch:
             return
-        load_owner = self._request_epochs.get(self._load_request_id)
-        if load_owner is not None and load_owner.epoch == epoch:
-            self._request_epochs.pop(self._load_request_id, None)
+        if self._load_request_id == request_id:
+            self._load_request_id = None
         if metadata.mode != self._selection.mode:
             self._fail_current_load("worker 返回的脚本模式与冻结选择不一致")
             return
@@ -802,9 +812,14 @@ class VideoPreviewWidget(QWidget):
         self._request_epochs.clear()
         self._latest_display_request_id = None
 
-    def _dismiss_timeout_dialogs(self) -> None:
-        dialogs = tuple(self._timeout_dialogs.values())
-        self._timeout_dialogs.clear()
+    def _dismiss_timeout_dialogs(self, *, epoch: int | None = None) -> None:
+        dialogs: list[QMessageBox] = []
+        for request_id, box in tuple(self._timeout_dialogs.items()):
+            owner = self._request_epochs.get(request_id)
+            if epoch is not None and (owner is None or owner.epoch != epoch):
+                continue
+            self._timeout_dialogs.pop(request_id, None)
+            dialogs.append(box)
         for box in dialogs:
             box.close()
             box.deleteLater()
@@ -832,7 +847,13 @@ class VideoPreviewWidget(QWidget):
                 return
             self._timeout_dialogs.pop(request_id, None)
             active_owner = self._request_epochs.get(request_id)
-            if active_owner != owner or self._worker_client is not client:
+            current_session = self._render_session
+            if (
+                active_owner != owner
+                or self._worker_client is not client
+                or current_session is None
+                or current_session.epoch != owner.epoch
+            ):
                 box.deleteLater()
                 return
             if box.clickedButton() is keep_waiting:

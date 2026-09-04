@@ -31,7 +31,9 @@ class VSWorkerClient(QObject):
     # request_id/epoch 是协议严格正整数、没有 32-bit 上限；使用 object
     # 避免 pyqtSignal(int) 在长会话中静默截断 2**31 以上的标识。
     ready = pyqtSignal()
-    metadata_ready = pyqtSignal(object, object)
+    # metadata 也是 request terminal。保留 request_id 才能让 widget 在
+    # session 换代后精确收束旧 load owner。
+    metadata_ready = pyqtSignal(object, object, object)
     # ``frame_ready`` 必须保留 worker wire 的完整身份；epoch/index 本身
     # 不能区分同一 session 中先后到达的 editor/final 请求。
     frame_ready = pyqtSignal(object, object, str, object, object)
@@ -379,7 +381,7 @@ class VSWorkerClient(QObject):
                     "worker 返回了未解析的 metadata",
                 )
                 return
-            self.metadata_ready.emit(metadata.epoch, metadata)
+            self.metadata_ready.emit(request_id, metadata.epoch, metadata)
             return
         if event_type == "frame_ready":
             self.frame_ready.emit(

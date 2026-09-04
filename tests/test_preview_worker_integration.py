@@ -50,7 +50,7 @@ def _node(
 
 class FakeWorkerClient(QObject):
     ready = pyqtSignal()
-    metadata_ready = pyqtSignal(object, object)
+    metadata_ready = pyqtSignal(object, object, object)
     frame_ready = pyqtSignal(object, object, str, object, object)
     frame_discarded = pyqtSignal(object, object, str, object)
     request_failed = pyqtSignal(object, str, str)
@@ -81,6 +81,9 @@ class FakeWorkerClient(QObject):
     def load(self, session):
         self.loads.append(session)
         return self._id()
+
+    def emit_metadata(self, request_id, metadata):
+        self.metadata_ready.emit(request_id, metadata.epoch, metadata)
 
     def request_frame(self, **kwargs):
         request_id = self._id()
@@ -173,14 +176,17 @@ class PreviewWorkerContractTests(unittest.TestCase):
         job = load_render_job(session.job_path)
         self.assertIsNone(job.timeline.end_frame)
         self.assertIsNone(job.timeline.fps)
-        self.client.metadata_ready.emit(session.epoch, self._metadata(session.epoch))
+        self.client.emit_metadata(
+            self.widget._load_request_id, self._metadata(session.epoch)
+        )
         QCoreApplication.processEvents()
         return session
 
     def _resolve_current(self, *, compatible=True):
         epoch = self.client.loads[-1].epoch
-        self.client.metadata_ready.emit(
-            epoch, self._metadata(epoch, compatible=compatible)
+        self.client.emit_metadata(
+            self.widget._load_request_id,
+            self._metadata(epoch, compatible=compatible),
         )
         QCoreApplication.processEvents()
 
@@ -263,7 +269,10 @@ class PreviewWorkerContractTests(unittest.TestCase):
         )
         self.assertTrue(self.widget.load_video(str(self.media)))
         epoch = self.client.loads[-1].epoch
-        self.client.metadata_ready.emit(epoch, self._metadata(epoch, compatible=False))
+        self.client.emit_metadata(
+            self.widget._load_request_id,
+            self._metadata(epoch, compatible=False),
+        )
         QCoreApplication.processEvents()
         self.widget.current_frame_index = 200
         self.widget.set_preview_mode(False)
@@ -288,7 +297,7 @@ class PreviewWorkerContractTests(unittest.TestCase):
             output0=metadata.output0,
             editor=None,
         )
-        self.client.metadata_ready.emit(epoch, metadata)
+        self.client.emit_metadata(self.widget._load_request_id, metadata)
         QCoreApplication.processEvents()
         self.assertFalse(self.widget._has_video)
         self.assertEqual(len(failures), 1)
@@ -301,8 +310,8 @@ class PreviewWorkerContractTests(unittest.TestCase):
         stale_session = self.client.loads[-1]
         stale_request = self.client.loads and self.widget._load_request_id
         self.widget.clear()
-        self.client.metadata_ready.emit(
-            stale_session.epoch, self._metadata(stale_session.epoch)
+        self.client.emit_metadata(
+            stale_request, self._metadata(stale_session.epoch)
         )
         self.client.frame_ready.emit(
             999,

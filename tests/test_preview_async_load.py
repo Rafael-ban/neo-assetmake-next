@@ -101,7 +101,7 @@ class AsyncLoadTests(unittest.TestCase):
         self.assertFalse(self.w._has_video)
 
         epoch = self.client.loads[-1].epoch
-        self.client.metadata_ready.emit(epoch, self._metadata(epoch))
+        self.client.emit_metadata(self.w._load_request_id, self._metadata(epoch))
         QCoreApplication.processEvents()
         self.assertEqual(loaded.get("n"), 90)
         self.assertTrue(self.w._has_video)
@@ -121,19 +121,21 @@ class AsyncLoadTests(unittest.TestCase):
     def test_stale_probe_result_is_discarded_after_newer_load(self):
         self.assertTrue(self.w.load_video(self.file_a))
         epoch_a = self.client.loads[-1].epoch
+        request_a = self.w._load_request_id
         self.assertTrue(self.w.load_video(self.file_b))
         epoch_b = self.client.loads[-1].epoch
+        request_b = self.w._load_request_id
 
         loaded = []
         self.w.video_loaded.connect(lambda n, fps: loaded.append(self.w.video_path))
-        self.client.metadata_ready.emit(
-            epoch_a, self._metadata(epoch_a, width=111, height=222)
+        self.client.emit_metadata(
+            request_a, self._metadata(epoch_a, width=111, height=222)
         )
         QCoreApplication.processEvents()
         self.assertEqual(loaded, [], "stale probe result must be discarded")
         self.assertFalse(self.w._has_video)
 
-        self.client.metadata_ready.emit(epoch_b, self._metadata(epoch_b))
+        self.client.emit_metadata(request_b, self._metadata(epoch_b))
         QCoreApplication.processEvents()
         self.assertEqual(loaded, [self.file_b])
         self.assertEqual(self.w.video_path, self.file_b)
