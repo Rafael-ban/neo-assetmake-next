@@ -15,8 +15,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-_VS_BEFORE_WORKER_IMPORTS = sys.modules.get("vapoursynth")
-
 from config.vs_runtime import (
     PluginConfig,
     VSRuntimeConfig,
@@ -55,6 +53,14 @@ from core.vs_runtime.worker_process import (
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLCHAIN = MediaToolchain.discover(str(ROOT))
+
+
+class ParentProcessIsolationTests(unittest.TestCase):
+    """Worker loader tests share a Qt parent and must never load local VS."""
+
+    def test_parent_does_not_import_vapoursynth_or_legacy_vs_engine(self):
+        self.assertNotIn("vapoursynth", sys.modules)
+        self.assertNotIn("core.vs_engine", sys.modules)
 
 
 def _write_job(path: Path, *, epoch: int = 3, track: str = "loop") -> None:
@@ -277,9 +283,8 @@ class VSRuntimeFingerprintTests(unittest.TestCase):
         self.assertIn("portable.vs", str(raised.exception))
 
     def test_importing_loader_does_not_import_vapoursynth(self):
-        self.assertIs(
-            sys.modules.get("vapoursynth"), _VS_BEFORE_WORKER_IMPORTS
-        )
+        self.assertNotIn("vapoursynth", sys.modules)
+        self.assertNotIn("core.vs_engine", sys.modules)
 
 
 class WorkerProcessTransportTests(unittest.TestCase):
@@ -1504,9 +1509,8 @@ class WorkerProcessTransportTests(unittest.TestCase):
         response = client.shutdown(timeout_ms=10_000)
         self.assertEqual(response["operation"], "shutdown")
         self.assertEqual(client.wait(timeout_ms=10_000), 0)
-        self.assertIs(
-            sys.modules.get("vapoursynth"), _VS_BEFORE_WORKER_IMPORTS
-        )
+        self.assertNotIn("vapoursynth", sys.modules)
+        self.assertNotIn("core.vs_engine", sys.modules)
 
     def test_response_schema_rejects_unknown_fields(self):
         child = (
@@ -2819,11 +2823,13 @@ class WorkerProcessLifecycleTests(unittest.TestCase):
         code = (
             "import sys; "
             "assert 'vapoursynth' not in sys.modules; "
+            "assert 'core.vs_engine' not in sys.modules; "
             "from pathlib import Path; "
             "from core.vs_runtime.worker_process import SyncVSWorkerProcess; "
             f"c=SyncVSWorkerProcess(app_dir=Path({str(ROOT)!r}),self_test=True); "
             "c.start(timeout_ms=10000); c.shutdown(timeout_ms=10000); "
-            "assert 'vapoursynth' not in sys.modules"
+            "assert 'vapoursynth' not in sys.modules; "
+            "assert 'core.vs_engine' not in sys.modules"
         )
 
         result = subprocess.run(
@@ -2880,7 +2886,8 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
             )
 
     def setUp(self):
-        self.vs_before = sys.modules.get("vapoursynth")
+        self.assertNotIn("vapoursynth", sys.modules)
+        self.assertNotIn("core.vs_engine", sys.modules)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.root = Path(self.temp_dir.name).resolve() / "素材" / "黍"
@@ -2981,7 +2988,8 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
         response = self.client.shutdown(timeout_ms=10_000)
         self.assertEqual(response["operation"], "shutdown")
         self.assertEqual(self.client.wait(timeout_ms=10_000), 0)
-        self.assertIs(sys.modules.get("vapoursynth"), self.vs_before)
+        self.assertNotIn("vapoursynth", sys.modules)
+        self.assertNotIn("core.vs_engine", sys.modules)
 
     def test_script_and_contract_errors_do_not_replace_worker(self):
         bad_script = self._write_script(
@@ -3146,7 +3154,8 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
             self.client.load(self._session(crash), timeout_ms=15_000)
 
         self.assertEqual(raised.exception.exit_code, 23)
-        self.assertIs(sys.modules.get("vapoursynth"), self.vs_before)
+        self.assertNotIn("vapoursynth", sys.modules)
+        self.assertNotIn("core.vs_engine", sys.modules)
         self.assertTrue(root_record.is_file())
         crashed_root_text = root_record.read_text(encoding="utf-8")
         self.assertTrue(crashed_root_text)
@@ -3319,7 +3328,8 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
         self.assertNotEqual(self.client.wait(timeout_ms=10_000), 0)
         self.client.terminate_and_restart(timeout_ms=15_000)
         self.assertGreater(self.client.generation, generation)
-        self.assertIs(sys.modules.get("vapoursynth"), self.vs_before)
+        self.assertNotIn("vapoursynth", sys.modules)
+        self.assertNotIn("core.vs_engine", sys.modules)
 
     def test_script_failure_environment_restore_error_also_kills_worker(self):
         poison_then_raise = (

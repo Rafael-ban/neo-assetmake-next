@@ -14,6 +14,8 @@ from typing import Iterable, Optional
 
 from utils.file_utils import get_app_dir
 from config.vsconfig import load_vsconfig
+from config.vs_runtime import load_vs_runtime
+from core.vs_runtime.session import resolve_worker_command
 
 
 # Single source of truth for the required VS plugin set + plugin dir + output
@@ -206,19 +208,33 @@ class MediaToolchain:
         return missing
 
     def missing_for_preview(self) -> list[str]:
-        """What preview still needs. Preview is in-process VapourSynth now.
-
-        Checked against the loaded core rather than by probing VSPipe: the
-        preview renders through the very core this process holds, so an
-        out-of-process answer could disagree with it.
-        """
-        from core import vs_engine
-
+        """检查 worker/runtime 分发文件；绝不在调用进程 import VS。"""
+        root = Path(get_app_dir()).resolve()
+        missing: list[str] = []
         try:
-            vs_engine.load_vapoursynth()
-        except Exception:
-            return ["VapourSynth"]
-        return [f"VapourSynth plugin {n}" for n in vs_engine.missing_plugins()]
+            load_vs_runtime()
+        except Exception as exc:
+            missing.append(f"VS runtime config: {exc}")
+        command = resolve_worker_command(root)
+        worker_path = Path(command[-1])
+        if not worker_path.is_file():
+            missing.append(worker_path.name)
+        required = (
+            root / "tools" / "media" / "vapoursynth.pyd",
+            root / "tools" / "media" / "vapoursynth.dll",
+            root / "tools" / "media" / "portable.vs",
+            root / "resources" / "vapoursynth" / "assetmaker_runner.vpy",
+            root / "resources" / "vapoursynth" / "default_pipeline.vpy",
+            root / "resources" / "vapoursynth" / "python" / "assetmaker_vs" / "executor.py",
+            root / "resources" / "vapoursynth" / "python" / "assetmaker_vs" / "contract.py",
+            root / "resources" / "vapoursynth" / "python" / "assetmaker_vs" / "display.py",
+            root / "resources" / "vapoursynth" / "python" / "assetmaker_vs" / "job_api.py",
+        )
+        missing.extend(path.name for path in required if not path.is_file())
+        plugin_dir = root / "tools" / "media" / "vs-plugins"
+        if not plugin_dir.is_dir():
+            missing.append("vs-plugins")
+        return missing
 
     def describe(self) -> str:
         parts = {

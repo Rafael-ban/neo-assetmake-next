@@ -1,20 +1,11 @@
-"""S2: asynchronous preview lifecycle tests.
-
-Old code ran the blocking mpv metadata probe (waitForStarted/waitForConnected/
-waitForReadyRead chains, PyQt6 QtNetwork.pyi:202-205 + QtCore.pyi:6985-6988)
-directly inside load_video on the GUI thread, freezing the UI for up to tens
-of seconds per load, and tore mpv down with waitForFinished(3000) x2 on every
-reload. These tests pin the contract that replaced it: load_video = accepted +
-async outcome signals, epoch-guarded continuations. The probe now runs
-in-process against a VapourSynth source node, still on a worker thread because
-building the lsmas .lwi index blocks just as long.
-"""
+"""M4: worker 预览的异步受理、结果和 epoch 生命周期。"""
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import time
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -25,10 +16,16 @@ except ImportError:
     HAS_CV2 = False
 
 from tests.qt_harness import ensure_app
-from PyQt6.QtCore import QCoreApplication, QObject, pyqtSignal
+from PyQt6.QtCore import QCoreApplication
 
 from core.media_tools import MediaToolchain
-from core.video_processor import VideoInfo
+from core.vs_runtime.script_header import parse_script_header
+from core.vs_runtime.session import (
+    ScriptSelection,
+    SessionMetadata,
+    compute_script_bundle_hash,
+)
+from tests.test_preview_worker_integration import FakeWorkerClient, _node
 
 REPO = Path(__file__).resolve().parent.parent
 TC = MediaToolchain.discover(str(REPO))
@@ -39,61 +36,59 @@ def setUpModule():
     ensure_app()
 
 
-class FakeProbeWorker(QObject):
-    """Stands in for MetadataProbeWorker: resolves only when the test says so."""
-
-    result = pyqtSignal(object)
-    failed = pyqtSignal(str)
-    finished = pyqtSignal()
-    instances: list = []
-
-    def __init__(self, input_path, parent=None):
-        super().__init__(parent)
-        self.input_path = input_path
-        FakeProbeWorker.instances.append(self)
-
-    def start(self):
-        pass
-
-    def resolve(self, info):
-        self.result.emit(info)
-        self.finished.emit()
-
-    def reject(self, message):
-        self.failed.emit(message)
-        self.finished.emit()
-
-
-def _info(width=240, height=360, fps=30.0, frames=90):
-    return VideoInfo(
-        width=width, height=height, duration=frames / fps,
-        fps=fps, total_frames=frames,
-    )
-
-
 class AsyncLoadTests(unittest.TestCase):
     def setUp(self):
         import gui.widgets.video_preview as vp
 
         self.vp = vp
-        self._orig_worker = vp.MetadataProbeWorker
-        vp.MetadataProbeWorker = FakeProbeWorker
-        FakeProbeWorker.instances = []
-
-        self.w = vp.VideoPreviewWidget()
-        # These are pure lifecycle tests: pretend the VS core is usable and that
-        # building the graph succeeded, so no real media/decoding is involved.
-        self.w._use_vs_preview = lambda: True
-        self.w._start_vs_preview = lambda path: True
-
+        self.client = FakeWorkerClient()
         self.tmp = tempfile.mkdtemp()
         self.file_a = os.path.join(self.tmp, "a.mp4")
         self.file_b = os.path.join(self.tmp, "b.mp4")
         Path(self.file_a).write_bytes(b"x")
         Path(self.file_b).write_bytes(b"x")
+        script = REPO / "resources" / "vapoursynth" / "default_pipeline.vpy"
+        header = parse_script_header(script)
+        selection = ScriptSelection.from_header(
+            script, header, compute_script_bundle_hash(script)
+        )
+        self.patch = mock.patch.object(
+            vp, "_runtime_fingerprint_for_app", return_value="b" * 64
+        )
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        self.w = vp.VideoPreviewWidget(
+            worker_client_factory=lambda _parent: self.client
+        )
+        self.addCleanup(lambda: self.w.clear(sync_shutdown=True))
+        self.w.set_render_context(
+            vp.PreviewRenderContext(
+                project_root=self.tmp,
+                track="loop",
+                selection=selection,
+                cache_dir=os.path.join(self.tmp, "cache"),
+            )
+        )
 
-    def tearDown(self):
-        self.vp.MetadataProbeWorker = self._orig_worker
+    @staticmethod
+    def _metadata(epoch, width=240, height=360, frames=90):
+        return SessionMetadata(
+            epoch=epoch,
+            mode="compatible",
+            capabilities=frozenset({"source"}),
+            output0=_node(
+                frames=frames,
+                fps=(30, 1),
+                size=(384, 640),
+                final=True,
+            ),
+            editor=_node(
+                frames=frames,
+                fps=(30, 1),
+                size=(width, height),
+                final=False,
+            ),
+        )
 
     def test_load_is_accepted_immediately_and_resolves_via_signal(self):
         loaded = {}
@@ -105,7 +100,8 @@ class AsyncLoadTests(unittest.TestCase):
         self.assertEqual(self.w.video_label.text(), "正在加载视频元数据…")
         self.assertFalse(self.w._has_video)
 
-        FakeProbeWorker.instances[-1].resolve(_info())
+        epoch = self.client.loads[-1].epoch
+        self.client.metadata_ready.emit(epoch, self._metadata(epoch))
         QCoreApplication.processEvents()
         self.assertEqual(loaded.get("n"), 90)
         self.assertTrue(self.w._has_video)
@@ -116,7 +112,7 @@ class AsyncLoadTests(unittest.TestCase):
         failures = []
         self.w.load_failed.connect(failures.append)
         self.assertTrue(self.w.load_video(self.file_a))
-        FakeProbeWorker.instances[-1].reject("boom")
+        self.client.request_failed.emit(self.w._load_request_id, "script.error", "boom")
         QCoreApplication.processEvents()
         self.assertEqual(failures, ["boom"])
         self.assertFalse(self.w._has_video)
@@ -124,18 +120,20 @@ class AsyncLoadTests(unittest.TestCase):
 
     def test_stale_probe_result_is_discarded_after_newer_load(self):
         self.assertTrue(self.w.load_video(self.file_a))
-        worker_a = FakeProbeWorker.instances[-1]
+        epoch_a = self.client.loads[-1].epoch
         self.assertTrue(self.w.load_video(self.file_b))
-        worker_b = FakeProbeWorker.instances[-1]
+        epoch_b = self.client.loads[-1].epoch
 
         loaded = []
         self.w.video_loaded.connect(lambda n, fps: loaded.append(self.w.video_path))
-        worker_a.resolve(_info(width=111, height=222))  # late result from load A
+        self.client.metadata_ready.emit(
+            epoch_a, self._metadata(epoch_a, width=111, height=222)
+        )
         QCoreApplication.processEvents()
         self.assertEqual(loaded, [], "stale probe result must be discarded")
         self.assertFalse(self.w._has_video)
 
-        worker_b.resolve(_info())
+        self.client.metadata_ready.emit(epoch_b, self._metadata(epoch_b))
         QCoreApplication.processEvents()
         self.assertEqual(loaded, [self.file_b])
         self.assertEqual(self.w.video_path, self.file_b)
@@ -144,9 +142,9 @@ class AsyncLoadTests(unittest.TestCase):
         failures = []
         self.w.load_failed.connect(failures.append)
         self.assertTrue(self.w.load_video(self.file_a))
-        worker = FakeProbeWorker.instances[-1]
+        request_id = self.w._load_request_id
         self.w.clear()
-        worker.reject("late failure")
+        self.client.request_failed.emit(request_id, "script.error", "late failure")
         QCoreApplication.processEvents()
         self.assertEqual(failures, [], "failure from a cleared load must be dropped")
 

@@ -3,11 +3,31 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QThread, pyqtSignal
+from config.vs_runtime import load_vs_runtime
+from core.vs_runtime.job import (
+    CropSpec,
+    OutputSpec,
+    PathSpec,
+    RenderJob,
+    SourceSpec,
+    TimelineSpec,
+    TransformSpec,
+    write_render_job,
+)
+from core.vs_runtime.script_header import parse_script_header
+from core.vs_runtime.session import (
+    RenderSession,
+    ScriptSelection,
+    compute_script_bundle_hash,
+)
+from core.vs_runtime.vs_loader import compute_runtime_fingerprint
+from core.vs_runtime.worker_process import SyncVSWorkerProcess
+from utils.file_utils import get_app_dir
 
 logger = logging.getLogger(__name__)
 
@@ -73,29 +93,70 @@ class VideoInfo:
 
 
 def probe_video_info(input_path: str) -> VideoInfo:
-    """Read metadata straight off a VapourSynth clip (in-process, EXACT).
-
-    This replaced an mpv JSON-IPC probe that could only report *estimates*: it
-    fell back to ``round(duration * fps)`` for the frame count and to a
-    hardcoded 30.0 for fps, so the preview's frame indices only ever
-    approximated the export's ``clip[start:end]``. A VS clip carries the real
-    values as attributes (VS R73 stub: ``width``/``height``/``fps_num``/
-    ``fps_den``/``num_frames``), and it is the SAME source node the export
-    uses, so preview and export cannot disagree about frame indices.
-
-    Raises VSUnavailable when VapourSynth or a required plugin is missing.
-    """
-    from core.vs_engine import source_clip
-
-    clip = source_clip(input_path)
-    fps_num = int(getattr(clip, "fps_num", 0) or 0)
-    fps_den = int(getattr(clip, "fps_den", 0) or 0)
-    fps = (fps_num / fps_den) if fps_num > 0 and fps_den > 0 else 30.0
-    total_frames = max(1, int(clip.num_frames))
+    """用短生命周期 worker/default vpy 读取精确 editor metadata。"""
+    source = Path(input_path).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    app_dir = Path(get_app_dir()).resolve()
+    script = app_dir / "resources" / "vapoursynth" / "default_pipeline.vpy"
+    header = parse_script_header(script)
+    selection = ScriptSelection.from_header(
+        script, header, compute_script_bundle_hash(script)
+    )
+    runtime = load_vs_runtime()
+    fingerprint = compute_runtime_fingerprint(app_dir, runtime)
+    with tempfile.TemporaryDirectory(prefix="assetmaker-vs-probe-") as temp:
+        cache = Path(temp).resolve()
+        job = RenderJob(
+            api_version=1,
+            epoch=1,
+            track="loop",
+            project_root=str(source.parent),
+            source=SourceSpec(
+                path=str(source), kind="video", virtual_frame_count=None
+            ),
+            timeline=TimelineSpec(start_frame=0, end_frame=None, fps=None),
+            transform=TransformSpec(
+                rotation=0,
+                crop=CropSpec(
+                    coordinate_space="post_rotation_source_pixels",
+                    x=0,
+                    y=0,
+                    width=0,
+                    height=0,
+                ),
+            ),
+            output=OutputSpec.from_profile("360x640"),
+            paths=PathSpec(cache_dir=str(cache)),
+        )
+        job_path = write_render_job(job)
+        session = RenderSession(
+            epoch=1,
+            track="loop",
+            selection=selection,
+            job_path=str(job_path),
+            runtime_fingerprint=fingerprint,
+        )
+        worker = SyncVSWorkerProcess(app_dir=app_dir)
+        try:
+            worker.start(timeout_ms=runtime.worker.startup_timeout_ms)
+            metadata = worker.load(
+                session, timeout_ms=runtime.worker.startup_timeout_ms
+            )
+            if metadata.mode != "compatible" or metadata.editor is None:
+                raise RuntimeError("内置 pipeline 未返回 editor output 1 元数据")
+            node = metadata.editor
+            worker.shutdown(timeout_ms=runtime.worker.shutdown_timeout_ms)
+        finally:
+            worker.close()
+    fps_num = node.fps_num
+    fps_den = node.fps_den
+    fps = fps_num / fps_den
+    total_frames = node.num_frames
     duration = total_frames / fps if fps > 0 else 0.0
     return VideoInfo(
-        width=int(clip.width),
-        height=int(clip.height),
+        width=node.width,
+        height=node.height,
         duration=duration,
         fps=fps,
         total_frames=total_frames,
@@ -103,7 +164,7 @@ def probe_video_info(input_path: str) -> VideoInfo:
 
 
 class VideoProcessor:
-    """Probe video metadata through the in-process VapourSynth source node."""
+    """通过独立 worker 探测视频元数据。"""
 
     def get_video_info(self, input_path: str) -> Optional[VideoInfo]:
         """Return metadata for the first video stream, or None on failure.
@@ -119,35 +180,3 @@ class VideoProcessor:
         except Exception as exc:
             logger.error("metadata probe failed for %s: %s", input_path, exc)
             return None
-
-
-class MetadataProbeWorker(QThread):
-    """Probe media metadata off the GUI thread.
-
-    Still a worker thread even though the probe is now in-process: ``lsmas``
-    builds a full ``.lwi`` index the first time it opens a file, which blocks
-    the calling thread just as long as the old mpv JSON-IPC probe did (that one
-    accumulated up to ~46s of ``waitFor*`` timeouts on a dead pipe — PyQt6
-    QtNetwork.pyi:202-205, QtCore.pyi:6985-6988 — and froze the whole UI on
-    every video load because it ran inline on the GUI thread).
-    """
-
-    result = pyqtSignal(object)  # VideoInfo
-    failed = pyqtSignal(str)
-
-    def __init__(self, input_path: str, parent=None) -> None:
-        super().__init__(parent)
-        self.input_path = input_path
-        self.epoch = -1  # set by the owner to correlate results to a load
-
-    def run(self) -> None:  # executed on the worker thread
-        try:
-            if not Path(self.input_path).exists():
-                self.failed.emit(f"文件不存在: {self.input_path}")
-                return
-            self.result.emit(probe_video_info(self.input_path))
-        except Exception as exc:
-            logger.error(
-                "metadata probe failed for %s: %s", self.input_path, exc
-            )
-            self.failed.emit(str(exc))

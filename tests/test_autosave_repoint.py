@@ -102,6 +102,8 @@ class AutoSaveRepointTests(unittest.TestCase):
             w.basic_config_panel = types.SimpleNamespace(set_config=_null)
             w.json_preview = types.SimpleNamespace(set_config=_null)
             w.status_bar = types.SimpleNamespace(showMessage=_null)
+            w.video_preview = types.SimpleNamespace(set_render_context=_null)
+            w.intro_preview = types.SimpleNamespace(set_render_context=_null)
 
             fake_dialog = types.SimpleNamespace(
                 getSaveFileName=staticmethod(lambda *a, **k: (target, ""))

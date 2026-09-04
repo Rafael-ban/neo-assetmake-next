@@ -1,10 +1,17 @@
-"""Video preview widget backed by the in-process VapourSynth render graph."""
+"""由独立 VapourSynth worker 驱动的视频预览控件。"""
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional, Tuple, TYPE_CHECKING
+import shutil
+import tempfile
+import time
+from dataclasses import dataclass
+from fractions import Fraction
+from functools import lru_cache
+from pathlib import Path
+from typing import Callable, Literal, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 
@@ -27,6 +34,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
@@ -34,25 +42,31 @@ from PyQt6.QtWidgets import (
 )
 from qfluentwidgets import CaptionLabel, PushButton, Slider, setCustomStyleSheet
 
-from core.media_tools import MediaToolchain
-from core.video_processor import MetadataProbeWorker
+from config.vs_runtime import load_vs_runtime
+from core.vs_runtime.job import (
+    CropSpec,
+    OutputSpec,
+    PathSpec,
+    RationalFPS,
+    RenderJob,
+    SourceSpec,
+    TimelineSpec,
+    TransformSpec,
+    write_render_job,
+)
+from core.vs_runtime.script_header import parse_script_header
+from core.vs_runtime.session import (
+    RenderSession,
+    ScriptSelection,
+    SessionMetadata,
+    compute_script_bundle_hash,
+)
+from core.vs_runtime.vs_loader import compute_runtime_fingerprint
+from gui.workers.vs_worker_client import VSWorkerClient
+from utils.file_utils import get_app_dir
 
 if TYPE_CHECKING:
     from config.epconfig import EPConfig
-
-# In-flight metadata probe workers. A superseded load drops the widget's own
-# reference to its worker; without this keep-alive the unparented QThread's
-# wrapper gets garbage-collected while the thread is still running, which
-# destroys the C++ QThread mid-run and aborts the process.
-_ACTIVE_PROBE_WORKERS: list = []
-
-
-def _release_probe_worker(worker):
-    try:
-        _ACTIVE_PROBE_WORKERS.remove(worker)
-    except ValueError:
-        return  # already released
-    worker.deleteLater()
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +78,61 @@ DEFAULT_TARGET_HEIGHT = 640
 # accurately (w=2 -> 2/4 = 0.5, i.e. 11% off), so the lock would appear to
 # "break" at extreme zoom-out. 64px keeps the error well under 1%.
 _MIN_CROP_SIDE = 64
+
+
+@dataclass(frozen=True)
+class PreviewRenderContext:
+    """一个预览轨道冻结的脚本选择与作业路径。"""
+
+    project_root: str
+    track: Literal["loop", "intro"]
+    selection: ScriptSelection
+    cache_dir: str
+
+    def __post_init__(self) -> None:
+        if self.track not in ("loop", "intro"):
+            raise ValueError("track 必须是 loop/intro")
+        if not isinstance(self.selection, ScriptSelection):
+            raise TypeError("selection 必须是 ScriptSelection")
+        for name in ("project_root", "cache_dir"):
+            value = Path(getattr(self, name))
+            if not value.is_absolute():
+                raise ValueError(f"{name} 必须是绝对路径")
+            object.__setattr__(self, name, str(value.resolve()))
+
+    @classmethod
+    def builtin(
+        cls,
+        *,
+        project_root: str,
+        track: Literal["loop", "intro"],
+        cache_dir: str,
+    ) -> "PreviewRenderContext":
+        app_dir = str(Path(get_app_dir()).resolve())
+        return cls(
+            project_root=str(Path(project_root).resolve()),
+            track=track,
+            selection=_default_selection_for_app(app_dir),
+            cache_dir=str(Path(cache_dir).resolve()),
+        )
+
+
+@lru_cache(maxsize=4)
+def _runtime_fingerprint_for_app(app_dir: str) -> str:
+    """只哈希 runtime 文件；不得在 Qt 进程导入 VapourSynth。"""
+
+    return compute_runtime_fingerprint(app_dir, load_vs_runtime())
+
+
+@lru_cache(maxsize=4)
+def _default_selection_for_app(app_dir: str) -> ScriptSelection:
+    script = Path(app_dir) / "resources" / "vapoursynth" / "default_pipeline.vpy"
+    header = parse_script_header(script)
+    return ScriptSelection.from_header(
+        script,
+        header,
+        compute_script_bundle_hash(script),
+    )
 
 
 class _PreviewLabel(QLabel):
@@ -102,7 +171,12 @@ class VideoPreviewWidget(QWidget):
     DRAG_RESIZE_BL = 4
     DRAG_RESIZE_BR = 5
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        worker_client_factory: Callable[[QWidget], VSWorkerClient] | None = None,
+    ):
         super().__init__(parent)
         self.video_path = ""
         self.video_fps = 30.0
@@ -112,18 +186,39 @@ class VideoPreviewWidget(QWidget):
         self.current_frame_index = 0
         self.current_frame: Optional[np.ndarray] = None
 
-        # Load-generation token: bumped by every new load/clear. Deferred
-        # continuations (probe results, frame deliveries) capture it at
-        # schedule time and no-op when stale, so a slow continuation from
-        # load A can never corrupt load B's session. Still load-bearing:
-        # lsmas index building is slow and asynchronous.
+        # 每个 job/session 使用独立 epoch。旧 worker 事件即使迟到，也只能
+        # 释放传输资源，不能再回写这个 widget。
         self._load_epoch = 0
-        self._probe_worker: Optional[MetadataProbeWorker] = None
-        # In-process VapourSynth preview: frames are pulled on a VS worker
-        # thread and delivered here by Qt signals.
-        self._frame_requester = None
+        self._worker_client_factory = worker_client_factory or (
+            lambda parent: VSWorkerClient(parent)
+        )
+        self._worker_client: VSWorkerClient | None = None
+        self._worker_started = False
+        self._worker_ready_for_frames = False
+        self._restart_pending = False
+        self._render_context: PreviewRenderContext | None = None
+        self._render_session: RenderSession | None = None
+        self._selection: ScriptSelection | None = None
+        self._session_metadata: SessionMetadata | None = None
+        self._fps_rational: RationalFPS | None = None
+        self._output0_frames = 0
+        self._timeline_start = 0
+        self._timeline_end_exclusive: int | None = None
+        self._metadata_resolved = False
+        self._job_dirty = False
+        self._load_request_id: int | None = None
+        self._request_epochs: dict[int, tuple[int, str]] = {}
+        self._pending_captures: list[tuple[int, int, Callable]] = []
+        self._job_paths: set[Path] = set()
+        self._retiring_job_paths: set[Path] = set()
+        self._retire_after_unload: dict[int, set[Path]] = {}
+        self._owned_cache_dir: Path | None = None
+        self._job_debounce = QTimer(self)
+        self._job_debounce.setSingleShot(True)
+        self._job_debounce.timeout.connect(self._flush_debounced_render_job)
+        self._timeout_dialogs: dict[int, QMessageBox] = {}
+        # 兼容旧测试/调用者：名字保留，但含义是“worker session 已加载”。
         self._vs_active = False
-        self._media_toolchain = MediaToolchain.discover()
         self._has_video = False
         self._loop_frame: Optional[np.ndarray] = None
         self._preview_mode = False
@@ -138,8 +233,11 @@ class VideoPreviewWidget(QWidget):
 
         self.is_playing = False
         self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
         self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self._on_timer_tick)
+        self._play_origin_ns = 0
+        self._play_origin_frame = 0
 
         self.target_width = DEFAULT_TARGET_WIDTH
         self.target_height = DEFAULT_TARGET_HEIGHT
@@ -182,6 +280,10 @@ class VideoPreviewWidget(QWidget):
         self._display_stack.addWidget(self.video_label)
 
         layout.addWidget(self._display_stack)
+        self.restart_button = PushButton("重启渲染")
+        self.restart_button.setVisible(False)
+        self.restart_button.clicked.connect(self.restart_rendering)
+        layout.addWidget(self.restart_button)
         self.info_label = CaptionLabel("Frame 0/0 | Crop: (0, 0, 0, 0)")
         setCustomStyleSheet(
             self.info_label,
@@ -198,7 +300,7 @@ class VideoPreviewWidget(QWidget):
 
         # 对数刻度:slider 0..200 → 10^(v/100) → 1.0x..100.0x(100%..10000%)
         self.zoom_slider = Slider(Qt.Orientation.Horizontal)
-        self.zoom_slider.setMinimum(0)
+        self.zoom_slider.setMinimum(-200)
         self.zoom_slider.setMaximum(200)
         self.zoom_slider.setValue(0)
         self.zoom_slider.valueChanged.connect(self._on_zoom_slider_changed)
@@ -209,7 +311,7 @@ class VideoPreviewWidget(QWidget):
         self.zoom_label.setMinimumWidth(60)
         zoom_layout.addWidget(self.zoom_label)
 
-        for percent in (100, 1000, 10000):
+        for percent in (1, 100, 10000):
             btn = PushButton(f"{percent}%")
             btn.setMaximumWidth(70)
             btn.clicked.connect(lambda checked, p=percent: self._set_zoom_percent(p))
@@ -218,119 +320,154 @@ class VideoPreviewWidget(QWidget):
         layout.addWidget(zoom_container)
 
     def _teardown_media(self, sync_shutdown: bool = False):
-        """Release the preview backend. No child process, so nothing to wait on.
-
-        This used to tear down an mpv QProcess + QLocalSocket: a `quit`
-        handshake, detaching the process into a module-level keep-alive list,
-        and two escalating kill timers — all to dodge the blocking
-        QProcess.waitForFinished (PyQt6 QtCore.pyi:6985) that froze the UI for
-        seconds on every video switch. Dropping the VS graph is synchronous and
-        cheap, so the whole apparatus is gone.
-        """
-        self._stop_vs_preview(permanent=sync_shutdown)
+        """取消当前 epoch；close 时再终止该 widget 独占的 worker。"""
+        self._job_debounce.stop()
+        old_session = self._render_session
+        client = self._worker_client
+        if old_session is not None:
+            self._retire_render_session(old_session)
+        self._worker_ready_for_frames = False
+        self._render_session = None
+        self._session_metadata = None
+        self._metadata_resolved = False
+        self._selection = None
+        self._load_request_id = None
+        self._pending_captures.clear()
+        self._vs_active = False
         self._has_video = False
+        if sync_shutdown and client is not None:
+            client.close()
+            self._worker_client = None
+            self._worker_started = False
+            self._cleanup_job_files()
+            if self._owned_cache_dir is not None:
+                shutil.rmtree(self._owned_cache_dir, ignore_errors=True)
+                self._owned_cache_dir = None
 
     # ------------------------------------------------------------------
-    # VapourSynth frame-request preview (replaces the mpv IPC player)
+    # 独立 VapourSynth worker 预览
     # ------------------------------------------------------------------
 
     def _is_image_source(self) -> bool:
         ext = os.path.splitext(self.video_path)[1].lower()
         return ext in (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 
-    def _build_export_params(self):
-        """The same VideoExportParams the export would use for this media.
+    def set_render_context(self, context: PreviewRenderContext | None) -> None:
+        if context is not None and not isinstance(context, PreviewRenderContext):
+            raise TypeError("context 必须是 PreviewRenderContext 或 None")
+        self._render_context = context
 
-        Reusing the export's parameter object (rather than a preview-only
-        approximation) is what keeps 预览 and 导出 on one code path.
-        """
-        from core.export_service import VideoExportParams
+    def current_render_session(self) -> RenderSession | None:
+        return self._render_session
 
-        return VideoExportParams(
-            video_path=self.video_path,
-            cropbox=tuple(self.cropbox),
-            rotation=self._rotation,
-            start_frame=0,
-            end_frame=max(1, self.total_frames),
-            resolution=f"{self.target_width}x{self.target_height}",
-            fps=self.video_fps,
-            is_image=self._is_image_source(),
+    def _effective_context(self) -> PreviewRenderContext:
+        if self._render_context is not None:
+            return self._render_context
+        root = Path(self.video_path).resolve().parent
+        if self._owned_cache_dir is None:
+            self._owned_cache_dir = Path(
+                tempfile.mkdtemp(prefix="assetmaker-vs-preview-")
+            ).resolve()
+        app_dir = str(Path(get_app_dir()).resolve())
+        return PreviewRenderContext(
+            project_root=str(root),
+            track="loop",
+            selection=_default_selection_for_app(app_dir),
+            cache_dir=str(self._owned_cache_dir),
         )
 
-    def _use_vs_preview(self) -> bool:
-        """True when the in-process VapourSynth core is usable for preview.
+    def _ensure_worker(self) -> VSWorkerClient:
+        if self._worker_client is None:
+            client = self._worker_client_factory(self)
+            self._worker_client = client
+            client.ready.connect(self._on_worker_ready)
+            client.metadata_ready.connect(self._on_worker_metadata)
+            client.frame_ready.connect(self._on_worker_frame)
+            client.request_failed.connect(self._on_worker_request_failed)
+            client.request_timed_out.connect(self._on_worker_timeout)
+            operation_completed = getattr(client, "operation_completed", None)
+            if operation_completed is not None:
+                operation_completed.connect(self._on_worker_operation_completed)
+            client.worker_crashed.connect(self._on_worker_crashed)
+            worker_stopped = getattr(client, "worker_stopped", None)
+            if worker_stopped is not None:
+                worker_stopped.connect(self._on_worker_stopped)
+            client.log_received.connect(self._on_worker_log)
+        if not self._worker_started:
+            self._worker_client.start()
+            self._worker_started = True
+        return self._worker_client
 
-        The core must have been warmed BEFORE PyQt6 loaded (main.py /
-        tests.qt_harness call vs_engine.prewarm()); initializing it after Qt
-        segfaults on this bundle, so we never try to build it lazily here.
-        """
-        try:
-            from core import vs_engine
+    def _next_epoch(self) -> int:
+        self._load_epoch += 1
+        return self._load_epoch
 
-            if vs_engine._core is None:      # not prewarmed -> do not risk it
-                return False
-            return not vs_engine.missing_plugins()
-        except Exception:
-            return False
-
-    def _ensure_requester(self):
-        from core.vs_player import FrameRequester
-
-        if self._frame_requester is None:
-            self._frame_requester = FrameRequester(self)
-            self._frame_requester.frame_ready.connect(self._on_vs_frame_ready)
-            self._frame_requester.frame_failed.connect(self._on_vs_frame_failed)
-        return self._frame_requester
-
-    def _start_vs_preview(self, path: str) -> bool:
-        """Point the requester at a source graph and pull the first frame."""
-        if not self._use_vs_preview():
-            return False
-        try:
-            clip = self._build_preview_clip()
-            requester = self._ensure_requester()
-            requester.set_clip(clip, self._load_epoch)
-            self._vs_active = True
-            # Display page 0 (the QLabel) — with no mpv child window there is
-            # nothing to occlude the painted cropbox, so cropping is live.
-            self._display_stack.setCurrentIndex(0)
-            requester.request(self.current_frame_index)
-            return True
-        except Exception as exc:
-            logger.warning("VapourSynth preview unavailable for %s: %s", path, exc)
-            self._vs_active = False
-            return False
-
-    def _build_preview_clip(self):
-        """The clip the preview should show for the current mode.
-
-        Preview mode ("导出预览") renders the REAL export graph converted back
-        to RGB, so what is on screen is the pixels the device gets — including
-        the export's own resizer, padding and final 180° turn. Edit mode shows
-        the whole (rotated) source with the crop rectangle painted over it.
-
-        Zoom is a final viewport magnifier stage (see
-        ``vs_graph.apply_preview_zoom``) — it crops the visible window first, so
-        cost stays flat instead of scaling with the factor.
-        """
-        from core.vs_graph import (apply_preview_zoom, build_display_graph,
-                                   build_source_graph)
-
-        if not self._preview_mode:
-            clip = build_source_graph(self.video_path, is_image=self._is_image_source(),
-                                      rotation=self._rotation)
+    def _make_render_job(self, *, bootstrap: bool) -> RenderJob:
+        context = self._effective_context()
+        epoch = self._next_epoch()
+        is_image = self._is_image_source()
+        if bootstrap and not is_image:
+            timeline = TimelineSpec(start_frame=0, end_frame=None, fps=None)
         else:
-            clip = build_display_graph(self._build_export_params())
+            if self._fps_rational is None:
+                raise RuntimeError("视频元数据尚未解析，无法生成 resolved job")
+            end = self._timeline_end_exclusive
+            if end is None:
+                end = max(1, self.total_frames)
+            start = max(0, min(self._timeline_start, end - 1))
+            timeline = TimelineSpec(start_frame=start, end_frame=end, fps=self._fps_rational)
+        crop = CropSpec(
+            coordinate_space="post_rotation_source_pixels",
+            x=int(self.cropbox[0]),
+            y=int(self.cropbox[1]),
+            width=int(self.cropbox[2]),
+            height=int(self.cropbox[3]),
+        )
+        virtual_count = max(1, self.total_frames) if is_image else None
+        job = RenderJob(
+            api_version=1,
+            epoch=epoch,
+            track=context.track,
+            project_root=context.project_root,
+            source=SourceSpec(
+                path=str(Path(self.video_path).resolve()),
+                kind="image" if is_image else "video",
+                virtual_frame_count=virtual_count,
+            ),
+            timeline=timeline,
+            transform=TransformSpec(rotation=self._rotation, crop=crop),
+            output=OutputSpec.from_profile(
+                f"{self.target_width}x{self.target_height}"
+            ),
+            paths=PathSpec(cache_dir=context.cache_dir),
+        )
+        return job
 
-        if self._zoom_factor > 1.0:
-            clip = apply_preview_zoom(
-                clip,
-                zoom_factor=self._zoom_factor,
-                viewport=self._viewport_size(),
-                pan=self._zoom_pan,
-                kernel=self._zoom_kernel,
-            )
-        return clip
+    def _load_render_job(self, *, bootstrap: bool) -> RenderSession:
+        retired_session = self._render_session
+        if retired_session is not None:
+            self._retire_render_session(retired_session)
+        context = self._effective_context()
+        job = self._make_render_job(bootstrap=bootstrap)
+        job_path = write_render_job(job)
+        self._job_paths.add(job_path)
+        session = RenderSession(
+            epoch=job.epoch,
+            track=context.track,
+            selection=context.selection,
+            job_path=str(job_path),
+            runtime_fingerprint=_runtime_fingerprint_for_app(
+                str(Path(get_app_dir()).resolve())
+            ),
+        )
+        self._selection = context.selection
+        self._render_session = session
+        self._worker_ready_for_frames = False
+        client = self._ensure_worker()
+        request_id = client.load(session)
+        self._load_request_id = request_id
+        self._request_epochs[request_id] = (session.epoch, "load")
+        return session
 
     def _viewport_size(self) -> Tuple[int, int]:
         """Visible preview area in device pixels (what zoom renders into)."""
@@ -339,50 +476,296 @@ class VideoPreviewWidget(QWidget):
         return (max(2, round(size.width() * dpr)),
                 max(2, round(size.height() * dpr)))
 
-    def _rebuild_vs_graph(self) -> None:
-        """Re-derive the graph (rotation / crop / preview-mode change)."""
-        if not self._vs_active or not self.video_path:
+    def _schedule_render_job(self) -> None:
+        if not self._metadata_resolved or not self.video_path:
             return
+        self._job_dirty = True
+        self._job_debounce.start(100)
+
+    def _flush_debounced_render_job(self) -> None:
         try:
-            self._ensure_requester().set_clip(self._build_preview_clip(),
-                                              self._load_epoch)
-            self._request_current_frame()
+            self.flush_render_job()
         except Exception as exc:
-            logger.warning("VapourSynth graph rebuild failed: %s", exc)
+            self._fail_current_load(f"无法更新 VapourSynth 预览作业：{exc}")
+
+    def flush_render_job(self) -> RenderSession:
+        if not self._metadata_resolved or self._fps_rational is None:
+            raise RuntimeError("视频元数据尚未解析")
+        self._job_debounce.stop()
+        self._job_dirty = False
+        return self._load_render_job(bootstrap=False)
+
+    def set_timeline_range(self, start_frame: int, end_exclusive: int) -> None:
+        if type(start_frame) is not int or type(end_exclusive) is not int:
+            raise TypeError("timeline 边界必须是整数")
+        if start_frame < 0 or end_exclusive <= start_frame:
+            raise ValueError("timeline 必须满足 0 <= start < end_exclusive")
+        if self.total_frames > 0:
+            end_exclusive = min(end_exclusive, self.total_frames)
+            start_frame = min(start_frame, end_exclusive - 1)
+        changed = (
+            start_frame != self._timeline_start
+            or end_exclusive != self._timeline_end_exclusive
+        )
+        self._timeline_start = start_frame
+        self._timeline_end_exclusive = end_exclusive
+        if changed:
+            self._schedule_render_job()
+
+    def _frame_request_target(self) -> tuple[str, int]:
+        if self._selection is None or self._session_metadata is None:
+            raise RuntimeError("预览 session 尚未加载")
+        if self._selection.mode == "raw":
+            return (
+                "final",
+                min(max(0, self.current_frame_index), self._output0_frames - 1),
+            )
+        end = self._timeline_end_exclusive or self.total_frames
+        source_index = min(
+            max(self._timeline_start, self.current_frame_index), end - 1
+        )
+        if self._preview_mode:
+            return "final", source_index - self._timeline_start
+        return "editor", source_index
 
     def _request_current_frame(self, *, coalesce: bool = False) -> None:
-        if not self._vs_active or self._frame_requester is None:
+        if (
+            not self._worker_ready_for_frames
+            or self._worker_client is None
+            or self._render_session is None
+        ):
             return
-        self._frame_requester.request(self.current_frame_index, coalesce=coalesce)
+        surface, index = self._frame_request_target()
+        request_id = self._worker_client.request_frame(
+            epoch=self._render_session.epoch,
+            index=index,
+            surface=surface,
+            viewport=self._viewport_size(),
+            zoom_factor=self._zoom_factor,
+            pan=self._zoom_pan,
+            coalesce=coalesce,
+        )
+        if request_id is not None:
+            self._request_epochs[request_id] = (
+                self._render_session.epoch,
+                "frame",
+            )
 
-    def _on_vs_frame_ready(self, epoch: int, index: int, array) -> None:
-        """A decoded frame arrived (queued from a VS worker thread)."""
-        if epoch != self._load_epoch or array is None:
-            return  # superseded load: drop the late frame
-        self.current_frame = array
-        if self.video_width <= 0 or self.video_height <= 0:
-            self.video_height, self.video_width = array.shape[:2]
-        self._display_frame(array)
-
-    def _on_vs_frame_failed(self, epoch: int, index: int, message: str) -> None:
-        if epoch != self._load_epoch:
+    def _on_worker_ready(self) -> None:
+        if not self._restart_pending or self._render_session is None:
             return
-        logger.warning("VapourSynth frame %s failed: %s", index, message)
+        self._restart_pending = False
+        request_id = self._worker_client.load(self._render_session)
+        self._load_request_id = request_id
+        self._request_epochs[request_id] = (self._render_session.epoch, "load")
 
-    def _stop_vs_preview(self, *, permanent: bool = False) -> None:
-        """Drop the graph. ``permanent`` = the widget itself is going away.
+    def _on_worker_metadata(self, epoch: int, metadata: SessionMetadata) -> None:
+        session = self._render_session
+        if session is None or epoch != session.epoch:
+            return
+        if metadata.mode != self._selection.mode:
+            self._fail_current_load("worker 返回的脚本模式与冻结选择不一致")
+            return
+        if metadata.mode == "compatible":
+            if metadata.editor is None:
+                self._fail_current_load(
+                    "compatible 脚本声明了 editor output 1，但未返回 output 1 元数据"
+                )
+                return
+            source_meta = metadata.editor
+        else:
+            source_meta = metadata.output0
+        first_metadata = not self._metadata_resolved
+        self._session_metadata = metadata
+        self._output0_frames = metadata.output0.num_frames
+        self._worker_ready_for_frames = True
+        self._vs_active = True
+        self.restart_button.setVisible(False)
+        if first_metadata:
+            self._fps_rational = RationalFPS(source_meta.fps_num, source_meta.fps_den)
+            self.video_fps = source_meta.fps_num / source_meta.fps_den
+            self.video_width = source_meta.width
+            self.video_height = source_meta.height
+            self.total_frames = source_meta.num_frames
+            self.current_frame_index = 0
+            self._timeline_start = 0
+            self._timeline_end_exclusive = self.total_frames
+            self.current_frame = None
+            self._has_video = True
+            self._metadata_resolved = True
+            self._init_cropbox()
+            self.video_loaded.emit(self.total_frames, self.video_fps)
+        self._request_current_frame()
 
-        A reload only needs ``clear()`` (the requester is reused for the next
-        media). Window teardown must ``close()`` it: frames already handed to
-        VapourSynth still call back, and by then Qt may have deleted this
-        widget's children.
-        """
-        self._vs_active = False
-        if self._frame_requester is not None:
-            if permanent:
-                self._frame_requester.close()
+    def _on_worker_frame(self, epoch: int, index: int, array) -> None:
+        session = self._render_session
+        if session is None or epoch != session.epoch or array is None:
+            return
+        owned = np.array(array, copy=True)
+        self.current_frame = owned
+        self._display_frame(owned)
+        pending = self._pending_captures
+        self._pending_captures = []
+        for capture_epoch, capture_index, callback in pending:
+            if capture_epoch == epoch and capture_index == index:
+                callback(np.array(array, copy=True))
             else:
-                self._frame_requester.clear()
+                self._pending_captures.append(
+                    (capture_epoch, capture_index, callback)
+                )
+
+    def _on_worker_request_failed(
+        self, request_id: int, code: str, message: str
+    ) -> None:
+        owner = self._request_epochs.pop(request_id, None)
+        if owner is not None:
+            session = self._render_session
+            if session is None or owner[0] != session.epoch:
+                return
+        elif request_id != 0:
+            return
+        detail = message or code or "VapourSynth worker 请求失败"
+        self._retire_job_paths(self._retire_after_unload.pop(request_id, set()))
+        if owner is not None and owner[1] == "load":
+            self._fail_current_load(detail)
+        elif request_id == 0 and code in {
+            "worker.restart_failed",
+            "worker.staging_cleanup_failed",
+        }:
+            # These transport-level terminals have no media request owner.  They
+            # still mean the worker can no longer serve the current graph; merely
+            # logging them strands the UI at "正在重启" forever.
+            self._show_worker_unavailable(detail)
+        else:
+            logger.warning("VapourSynth worker 请求失败 [%s]: %s", code, detail)
+
+    def _on_worker_operation_completed(self, request_id: int, operation: str) -> None:
+        if operation == "unload":
+            self._retire_job_paths(self._retire_after_unload.pop(request_id, set()))
+
+    def _retire_render_session(self, session: RenderSession) -> None:
+        """让旧 session 先排队 cancel/unload，再异步等待 unload terminal。"""
+
+        try:
+            retired_paths = {Path(session.job_path)}
+            epoch = session.epoch
+        except AttributeError:
+            # 测试替身或半初始化 session 不会被 worker 使用，无须异步退休。
+            return
+        self._retiring_job_paths.update(retired_paths)
+        client = self._worker_client
+        if client is None or not self._worker_started:
+            self._retire_job_paths(retired_paths)
+            return
+        try:
+            client.cancel_epoch(epoch)
+        except Exception:
+            logger.debug("取消旧预览 epoch 失败", exc_info=True)
+        # 两个请求必须在新 load 之前按顺序进入 worker 管道。cancel 的 ACK
+        # 同时保证此前的帧 terminal 不会再写入；unload 的 terminal 才允许
+        # 删除被 worker 读取过的 job 文件。
+        self._begin_unload_retirement(retired_paths)
+
+    def _begin_unload_retirement(self, paths: set[Path]) -> None:
+        if not paths:
+            return
+        client = self._worker_client
+        if client is None or not self._worker_started:
+            return
+        try:
+            unload_id = client.unload()
+        except Exception:
+            logger.debug("卸载退休预览 session 失败", exc_info=True)
+            return
+        self._retire_after_unload[unload_id] = paths
+
+    def _retire_job_paths(self, paths: set[Path]) -> None:
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("无法删除退休预览 job: %s", path)
+                continue
+            self._job_paths.discard(path)
+            self._retiring_job_paths.discard(path)
+
+    def _on_worker_stopped(self) -> None:
+        """worker 已停止时，所有退休 job 都已不可能再被其读取。"""
+
+        self._retire_job_paths(set(self._retiring_job_paths))
+        self._retire_after_unload.clear()
+
+    def _on_worker_timeout(self, request_id: int, epoch: int) -> None:
+        session = self._render_session
+        if session is None or epoch != session.epoch:
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("渲染超时")
+        box.setText("VapourSynth 渲染帧超时。")
+        keep_waiting = box.addButton("继续等待", QMessageBox.ButtonRole.AcceptRole)
+        restart = box.addButton("终止并重启", QMessageBox.ButtonRole.DestructiveRole)
+
+        def _finished(_result: int) -> None:
+            self._timeout_dialogs.pop(request_id, None)
+            if box.clickedButton() is keep_waiting:
+                if self._worker_client is not None:
+                    self._worker_client.continue_wait(request_id)
+            elif box.clickedButton() is restart:
+                self.restart_rendering()
+            box.deleteLater()
+
+        box.finished.connect(_finished)
+        self._timeout_dialogs[request_id] = box
+        box.open()
+
+    def _on_worker_crashed(self, message: str) -> None:
+        # 旧测试替身没有 worker_stopped；crash 本身同样是安全的退休边界。
+        self._on_worker_stopped()
+        self._show_worker_unavailable(message)
+
+    def _show_worker_unavailable(self, message: str) -> None:
+        """Put a transport-level failure into a recoverable preview state."""
+        self._restart_pending = False
+        self._worker_ready_for_frames = False
+        self._vs_active = False
+        self.current_frame = None
+        self.video_label.clear()
+        self.video_label.setText("渲染进程已退出")
+        self.restart_button.setVisible(self._render_session is not None)
+        logger.error("VapourSynth worker 不可用: %s", message)
+
+    @staticmethod
+    def _on_worker_log(level: str, message: str) -> None:
+        getattr(logger, level if hasattr(logger, level) else "debug")(
+            "VS worker: %s", message
+        )
+
+    def restart_rendering(self) -> None:
+        if self._worker_client is None or self._render_session is None:
+            return
+        self._worker_ready_for_frames = False
+        self.current_frame = None
+        self.video_label.clear()
+        self.video_label.setText("正在重启渲染进程…")
+        self._restart_pending = True
+        self._worker_client.terminate_and_restart()
+
+    def _fail_current_load(self, message: str) -> None:
+        self._worker_ready_for_frames = False
+        self._vs_active = False
+        self._has_video = False
+        self.current_frame = None
+        self.video_label.clear()
+        self.video_label.setText("无法加载视频元数据")
+        self.load_failed.emit(message)
+
+    def _cleanup_job_files(self) -> None:
+        for path in tuple(self._job_paths):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.debug("无法删除退休预览 job: %s", path)
+            self._job_paths.discard(path)
 
     def set_target_resolution(self, width: int, height: int):
         if self.target_width == width and self.target_height == height:
@@ -402,97 +785,32 @@ class VideoPreviewWidget(QWidget):
             self.cropbox = self._fit_cropbox_to_ratio(*self.cropbox) if (
                 self.video_width > 0
             ) else [0, 0, width, height]
+        self._schedule_render_job()
 
     def load_video(self, path: str) -> bool:
-        """Begin loading a video (asynchronous).
-
-        Returns True when the load was *accepted*; the metadata probe then runs
-        on a worker thread and the outcome arrives via ``video_loaded`` /
-        ``load_failed``. Returns False only for synchronous rejections (missing
-        file, or no usable VapourSynth core). The probe used to be a blocking
-        mpv JSON-IPC ``waitFor*`` chain running right here on the GUI thread,
-        freezing the UI for up to tens of seconds per load (PyQt6
-        QtNetwork.pyi:202-205, QtCore.pyi:6985-6988 — blocking calls).
-        """
+        """写 bootstrap job 并异步交给独立 worker；本方法不加载 VS。"""
         logger.info("Loading video: %s", path)
         if not os.path.exists(path):
             self.video_label.setText(f"File not found: {path}")
             return False
-
-        if not self._use_vs_preview():
-            self.video_label.setText("VapourSynth 不可用,无法预览")
-            return False
-
-        self._load_epoch += 1
-        epoch = self._load_epoch
         self._teardown_media()
         self.pause()
+        self.video_path = str(Path(path).resolve())
         self._loop_frame = None
         self._has_video = False
+        self._metadata_resolved = False
+        self._fps_rational = None
+        self._timeline_start = 0
+        self._timeline_end_exclusive = None
         self.current_frame = None
         self._display_stack.setCurrentIndex(0)
         self.video_label.setText("正在加载视频元数据…")
-
-        # No parent: a parented QThread would be cascade-deleted with the
-        # widget while possibly still running (fatal). The worker keeps itself
-        # alive until `finished` -> deleteLater; the bound-method connections
-        # below auto-disconnect if this widget's C++ side goes away first.
-        worker = MetadataProbeWorker(path)
-        worker.epoch = epoch
-        self._probe_worker = worker
-        worker.result.connect(self._on_probe_worker_result)
-        worker.failed.connect(self._on_probe_worker_failed)
-        # Keep-alive until the thread actually finishes: `self._probe_worker`
-        # alone is not enough, a superseding load overwrites it immediately.
-        _ACTIVE_PROBE_WORKERS.append(worker)
-        worker.finished.connect(lambda w=worker: _release_probe_worker(w))
-        worker.start()
+        try:
+            self._load_render_job(bootstrap=True)
+        except Exception as exc:
+            self._fail_current_load(str(exc))
+            return False
         return True
-
-    def _on_probe_worker_result(self, info):
-        worker = self.sender()
-        self._on_probe_finished(
-            getattr(worker, "epoch", -1), getattr(worker, "input_path", ""), info
-        )
-
-    def _on_probe_worker_failed(self, message: str):
-        worker = self.sender()
-        self._on_probe_failed(getattr(worker, "epoch", -1), message)
-
-    def _on_probe_finished(self, epoch: int, path: str, info):
-        if epoch != self._load_epoch:
-            return  # superseded by a newer load/clear
-        self._probe_worker = None
-        self.video_path = path
-        self.video_fps = info.fps or 30.0
-        self.video_width = max(1, info.width)
-        self.video_height = max(1, info.height)
-        self.total_frames = max(1, info.total_frames)
-        self.current_frame_index = 0
-        # current_frame stays None until the first real frame arrives. Never
-        # seed a black placeholder: a consumer (截取帧 / crop) reading it early
-        # would silently get black pixels, which is exactly the defect the old
-        # mpv screenshot round trip produced.
-        self.current_frame = None
-        self._has_video = True
-        self._init_cropbox()
-        self._update_info_label()
-        if not self._start_vs_preview(path):
-            self._has_video = False
-            self.video_label.setText("无法建立 VapourSynth 预览")
-            self.load_failed.emit("无法建立 VapourSynth 预览")
-            return
-        self.video_loaded.emit(self.total_frames, self.video_fps)
-
-    def _on_probe_failed(self, epoch: int, message: str):
-        if epoch != self._load_epoch:
-            return
-        self._probe_worker = None
-        self._has_video = False
-        self.current_frame = None
-        self._display_stack.setCurrentIndex(0)
-        self.video_label.setText("无法加载视频元数据")
-        self.load_failed.emit(message or "无法获取视频元数据")
 
     def load_static_image_from_file(self, image_path: str) -> bool:
         if not HAS_CV2:
@@ -529,21 +847,40 @@ class VideoPreviewWidget(QWidget):
     def load_image_as_loop(
         self, path: str, fps: float = 30.0, duration: float = 5.0
     ) -> bool:
-        if not self.load_static_image_from_file(path):
+        if not os.path.exists(path) or not HAS_CV2:
             return False
-        self.video_path = path
-        self._loop_frame = self.current_frame.copy()
-        self.video_fps = fps
-        self.total_frames = max(1, int(fps * duration))
-        self._has_video = True
-        self.video_loaded.emit(self.total_frames, self.video_fps)
-        self._update_info_label()
+        data = np.fromfile(path, dtype=np.uint8)
+        image = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
+        if image is None:
+            return False
+        self._teardown_media()
+        self.pause()
+        self.video_path = str(Path(path).resolve())
+        self.video_width = image.shape[1]
+        self.video_height = image.shape[0]
+        fraction = Fraction(str(fps)).limit_denominator(1_000_000)
+        self._fps_rational = RationalFPS(fraction.numerator, fraction.denominator)
+        self.video_fps = self._fps_rational.numerator / self._fps_rational.denominator
+        self.total_frames = max(1, round(self.video_fps * duration))
+        self._timeline_start = 0
+        self._timeline_end_exclusive = self.total_frames
+        self._metadata_resolved = False
+        self._loop_frame = None
+        self.current_frame = None
+        self.current_frame_index = 0
+        self._init_cropbox()
+        self.video_label.setText("正在加载图片渲染作业…")
+        try:
+            self._load_render_job(bootstrap=False)
+        except Exception as exc:
+            self._fail_current_load(str(exc))
+            return False
         return True
 
     def _load_static_frame(self, frame: np.ndarray) -> bool:
-        self._load_epoch += 1  # invalidate pending probe/retry continuations
         self.pause()
         self._teardown_media()
+        self._load_epoch += 1
         self._loop_frame = None
         self._display_stack.setCurrentIndex(0)
         self.video_width = frame.shape[1]
@@ -654,6 +991,7 @@ class VideoPreviewWidget(QWidget):
         x, y, w, h = self.cropbox
         self.cropbox_changed.emit(x, y, w, h)
         self._update_info_label()
+        self._schedule_render_job()
 
     def _update_info_label(self):
         x, y, w, h = self.cropbox
@@ -712,10 +1050,8 @@ class VideoPreviewWidget(QWidget):
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     def _refresh_display(self):
-        if self._vs_active and self._preview_mode and self.video_path:
-            # 预览模式显示的是导出图,裁剪框一变缓存帧就过期了 —— 必须重新构图取帧,
-            # 而不是重画上一帧(那会让"导出预览"落后于实际参数)。
-            self._rebuild_vs_graph()
+        if self._vs_active and self.video_path:
+            self._request_current_frame(coalesce=True)
             self._update_info_label()
             return
         if self.current_frame is not None:
@@ -761,24 +1097,45 @@ class VideoPreviewWidget(QWidget):
     def _on_timer_tick(self):
         if not (self._has_video or self._loop_frame is not None):
             return
-        self.current_frame_index += 1
-        if self.current_frame_index >= max(1, self.total_frames):
-            self.current_frame_index = 0
-        # THIS timer is the playback clock. Ask for the frame we just advanced
-        # to; coalesce so a slow decode drops frames instead of queueing a
-        # backlog that is already stale by the time it lands.
+        numerator = self._fps_rational.numerator if self._fps_rational else 30
+        denominator = self._fps_rational.denominator if self._fps_rational else 1
+        elapsed_ns = max(0, time.perf_counter_ns() - self._play_origin_ns)
+        elapsed_frames = max(
+            1,
+            (elapsed_ns * numerator) // (1_000_000_000 * denominator),
+        )
+        low, high = self._playback_bounds()
+        span = max(1, high - low)
+        self.current_frame_index = low + (
+            self._play_origin_frame - low + elapsed_frames
+        ) % span
         self._request_current_frame(coalesce=True)
         self.frame_changed.emit(self.current_frame_index)
         self._update_info_label()
+        self._schedule_next_playback_tick(elapsed_frames + 1)
+
+    def _playback_bounds(self) -> tuple[int, int]:
+        if self._preview_mode and self._selection is not None and self._selection.mode == "compatible":
+            return self._timeline_start, self._timeline_end_exclusive or self.total_frames
+        return 0, max(1, self.total_frames)
+
+    def _schedule_next_playback_tick(self, sequence: int) -> None:
+        if not self.is_playing:
+            return
+        fps = self._fps_rational or RationalFPS(30, 1)
+        target_ns = self._play_origin_ns + (
+            sequence * 1_000_000_000 * fps.denominator
+        ) // fps.numerator
+        remaining_ns = max(0, target_ns - time.perf_counter_ns())
+        self.timer.start(max(0, (remaining_ns + 999_999) // 1_000_000))
 
     def play(self):
         if self.is_playing or not (self._has_video or self._loop_frame is not None):
             return
-        # `self.timer` IS the playback clock (_on_timer_tick advances the index
-        # and requests that frame).
-        interval = max(1, round(1000 / max(self.video_fps, 1.0)))
-        self.timer.start(interval)
         self.is_playing = True
+        self._play_origin_ns = time.perf_counter_ns()
+        self._play_origin_frame = self.current_frame_index
+        self._schedule_next_playback_tick(1)
         self.playback_state_changed.emit(True)
 
     def pause(self):
@@ -834,58 +1191,27 @@ class VideoPreviewWidget(QWidget):
         if self._vs_active:
             self._request_current_frame(coalesce=True)
 
-    def _capture_frame_vs(self, callback) -> bool:
-        """Deliver the current frame from the VS graph. No PNG round trip.
-
-        The mpv path had to ask the player to write a temp PNG, decode it, undo
-        the rotation mpv had baked in, and retry while mpv refused the request
-        during loading. With VapourSynth the frame is already in memory and
-        ``current_frame`` is kept in source orientation, so this is a plain
-        hand-off.
-        """
-        if not self._vs_active:
-            return False
-        if self.current_frame is not None:
-            callback(self.current_frame)
-            return True
-        requester = self._frame_requester
-        if requester is None:
-            return False
-        epoch = self._load_epoch
-        index = self.current_frame_index
-
-        def _once(got_epoch: int, got_index: int, array) -> None:
-            if got_epoch != epoch:
-                return
-            try:
-                requester.frame_ready.disconnect(_once)
-            except Exception:
-                pass
-            callback(array)
-
-        requester.frame_ready.connect(_once)
-        if not requester.request(index):
-            try:
-                requester.frame_ready.disconnect(_once)
-            except Exception:
-                pass
-            callback(self.current_frame)
-        return True
-
     def capture_frame_async(self, callback):
-        """Deliver the current frame (source orientation) to ``callback``.
-
-        VapourSynth hands the frame over directly; static images / image loops
-        already hold it. The mpv path had to pause, round-trip a temp PNG through
-        the player, undo the rotation it had baked in, and retry while mpv
-        refused the request during loading — that whole detour (and the black
-        frames it produced when it failed) is gone.
-        """
-        if self._vs_active:
-            self.pause()
-            if self._capture_frame_vs(callback):
-                return
-        callback(self.current_frame)
+        """非合并地请求当前 surface/index；绝不返回可能过期的缓存帧。"""
+        if not self._vs_active or self._worker_client is None or self._render_session is None:
+            callback(None if self.current_frame is None else self.current_frame.copy())
+            return
+        self.pause()
+        surface, index = self._frame_request_target()
+        request_id = self._worker_client.request_frame(
+            epoch=self._render_session.epoch,
+            index=index,
+            surface=surface,
+            viewport=self._viewport_size(),
+            zoom_factor=self._zoom_factor,
+            pan=self._zoom_pan,
+            coalesce=False,
+        )
+        if request_id is None:
+            callback(None)
+            return
+        self._request_epochs[request_id] = (self._render_session.epoch, "capture")
+        self._pending_captures.append((self._render_session.epoch, index, callback))
 
     def get_current_frame(self) -> int:
         return self.current_frame_index
@@ -910,9 +1236,19 @@ class VideoPreviewWidget(QWidget):
             return
         self._preview_mode = bool(enabled)
         if self._vs_active:
-            # Swap between the source graph and the real export graph; the frame
-            # itself changes, so rebuild rather than re-render the cached one.
-            self._rebuild_vs_graph()
+            if self._job_dirty:
+                self.flush_render_job()
+            if self._preview_mode and self._selection is not None and self._selection.mode == "compatible":
+                end = self._timeline_end_exclusive or self.total_frames
+                clamped = min(max(self._timeline_start, self.current_frame_index), end - 1)
+                if clamped != self.current_frame_index:
+                    self.current_frame_index = clamped
+                    self.frame_changed.emit(clamped)
+            # surface 已改变，先清掉旧 editor/final 帧，避免短暂闪回。
+            self.current_frame = None
+            self.video_label.clear()
+            self.video_label.setText("正在渲染…")
+            self._request_current_frame()
         else:
             self._refresh_display()
 
@@ -935,10 +1271,6 @@ class VideoPreviewWidget(QWidget):
         if has_video:
             original_box = self._cropbox_to_original_coords(*self.cropbox)
         self._rotation = degrees
-        if self._vs_active:
-            # Rotation is part of the graph, so re-derive it (and refresh the
-            # displayed frame) instead of asking a player to rotate for us.
-            self._rebuild_vs_graph()
         if has_video:
             if original_box is not None:
                 self.cropbox = list(self._original_to_rotated_coords(*original_box))
@@ -947,6 +1279,7 @@ class VideoPreviewWidget(QWidget):
             else:
                 self._init_cropbox()
         self.rotation_changed.emit(degrees)
+        self._schedule_render_job()
         self._refresh_display()
 
     def get_rotation(self) -> int:
@@ -1165,7 +1498,7 @@ class VideoPreviewWidget(QWidget):
             return
         self._zoom_factor = factor
         self.zoom_label.setText(f"{int(factor * 100)}%")
-        self._rebuild_vs_graph()
+        self._request_current_frame(coalesce=True)
 
     def _set_zoom_percent(self, percent: int):
         """Quick-zoom button: set zoom to an exact percentage."""
@@ -1188,9 +1521,9 @@ class VideoPreviewWidget(QWidget):
         return self._zoom_factor
 
     def clear(self, sync_shutdown: bool = False):
-        self._load_epoch += 1  # invalidate pending probe/retry continuations
         self.pause()
         self._teardown_media(sync_shutdown=sync_shutdown)
+        self._load_epoch += 1
         self._loop_frame = None
         self.video_path = ""
         self.total_frames = 0
@@ -1198,6 +1531,11 @@ class VideoPreviewWidget(QWidget):
         self.video_width = 0
         self.video_height = 0
         self.current_frame = None
+        self._fps_rational = None
+        self._output0_frames = 0
+        self._timeline_start = 0
+        self._timeline_end_exclusive = None
+        self._job_dirty = False
         self._display_stack.setCurrentIndex(0)
         self.video_label.clear()
         self.video_label.setText("No media loaded")

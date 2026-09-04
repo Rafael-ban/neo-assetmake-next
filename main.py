@@ -40,25 +40,6 @@ else:
 
 sys.path.insert(0, APP_DIR)
 
-# ---------------------------------------------------------------------------
-# VapourSynth 必须在导入 PyQt6 之前初始化。
-#
-# 实测(本捆绑包):进程中只要已 import 任意 PyQt6 扩展模块(QtCore/QtGui/
-# QtWidgets/QtNetwork 均可复现,与是否已创建 QApplication 无关,也与
-# add_dll_directory / 预加载 VapourSynth.dll 无关),再初始化 VapourSynth
-# core 会直接段错误(exit 139)。反序则完全正常:先建 VS core,之后导入全部
-# Qt 模块、创建 QApplication、拉取真实帧都没问题。
-#
-# 因此在这里预热;失败只记日志不阻断启动(导出仍走 VSPipe 子进程),
-# 但预览与元数据探测都依赖它——预热失败时素材将无法加载。
-# ---------------------------------------------------------------------------
-try:
-    from core.vs_engine import prewarm as _vs_prewarm
-    _vs_prewarm()
-except Exception:  # 引擎不可用不应妨碍应用启动
-    pass
-
-
 def check_dependencies():
     """检查必要的依赖是否已安装"""
     missing = []

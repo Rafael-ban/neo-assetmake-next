@@ -35,7 +35,9 @@ class VSWorkerClient(QObject):
     frame_ready = pyqtSignal(object, object, object)
     request_failed = pyqtSignal(object, str, str)
     request_timed_out = pyqtSignal(object, object)
+    operation_completed = pyqtSignal(object, str)
     worker_crashed = pyqtSignal(str)
+    worker_stopped = pyqtSignal()
     log_received = pyqtSignal(str, str)
 
     _transport_event = pyqtSignal(object)
@@ -184,7 +186,7 @@ class VSWorkerClient(QObject):
         self,
         error: BaseException,
         *,
-        cleanup_terminal_already_reported: bool = False,
+        cleanup_terminal_generation: int | None = None,
     ) -> None:
         """把 queued 自动重启的本地异常收敛为单次稳定 terminal。"""
         self._restart_requested = False
@@ -208,7 +210,8 @@ class VSWorkerClient(QObject):
         except BaseException:
             error_code = None
         if (
-            cleanup_terminal_already_reported
+            cleanup_terminal_generation is not None
+            and generation == cleanup_terminal_generation
             and error_code == STAGING_CLEANUP_ERROR_CODE
         ):
             return
@@ -348,8 +351,14 @@ class VSWorkerClient(QObject):
         if type(request_id) is int and not shutdown_ack:
             self._clear_timeout(request_id)
         if event_type == "ready":
-            if event.get("operation") == "hello":
+            operation = str(event.get("operation", ""))
+            if operation == "hello":
                 self.ready.emit()
+            else:
+                # cancel/unload/shutdown are request terminals too.  Preview
+                # retirement needs their exact request_id before it may remove
+                # the job file that the worker was still reading.
+                self.operation_completed.emit(request_id, operation)
             return
         if event_type == "metadata":
             metadata = event.get("metadata")
@@ -399,6 +408,9 @@ class VSWorkerClient(QObject):
             return
         if event_type in {"worker_crashed", "worker_exited"}:
             self._clear_all_timeouts()
+            # 不论是 crash 还是已观察到的退出，旧进程均不再会读取退休 job。
+            # 这与 worker_crashed 分开，避免有意重启时把 UI 误报为故障。
+            self.worker_stopped.emit()
             cleanup_failure = (
                 event.get("code") == STAGING_CLEANUP_ERROR_CODE
             )
@@ -419,8 +431,10 @@ class VSWorkerClient(QObject):
                 except BaseException as error:
                     self._report_restart_failure(
                         error,
-                        cleanup_terminal_already_reported=(
-                            self._failure_reported_generation == generation
+                        cleanup_terminal_generation=(
+                            generation
+                            if self._failure_reported_generation == generation
+                            else None
                         ),
                     )
                 return

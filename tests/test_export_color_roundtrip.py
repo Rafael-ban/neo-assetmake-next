@@ -31,6 +31,7 @@ except ImportError:
 from tests.qt_harness import ensure_app
 
 from core.media_tools import MediaToolchain
+from tests.helpers.vs_isolation import IsolatedVSCase
 
 REPO = Path(__file__).resolve().parent.parent
 TC = MediaToolchain.discover(str(REPO))
@@ -39,6 +40,11 @@ ENCODE_OK = HAS_CV2 and not TC.missing_for_export()
 
 def setUpModule():
     ensure_app()
+
+
+class ParentProcessIsolationTests(IsolatedVSCase):
+    def test_parent_does_not_import_vapoursynth_or_vs_engine(self):
+        self.assert_parent_has_no_vs()
 
 
 def _export_image_loop(png_path: Path, out_mp4: Path, *, cropbox, rotation=0,
@@ -74,7 +80,7 @@ def _decode_first_frame(mp4: Path) -> np.ndarray:
 
 
 @unittest.skipUnless(ENCODE_OK, "encode toolchain (tools/media) unavailable")
-class ExportColorRoundTripTests(unittest.TestCase):
+class ExportColorRoundTripTests(IsolatedVSCase):
     @classmethod
     def setUpClass(cls):
         cls.d = Path(tempfile.mkdtemp())
@@ -118,32 +124,8 @@ class ExportColorRoundTripTests(unittest.TestCase):
             )
 
     def test_stream_is_tagged_smpte170m(self):
-        src = np.full((640, 360, 3), (60, 120, 180), np.uint8)
-        png = self.d / "tag.png"
-        cv2.imwrite(str(png), src)
-        mp4 = _export_image_loop(png, self.d / "tag.mp4",
-                                 cropbox=(0, 0, 360, 640))
-
-        # Read the tags back off the decoded clip's frame props. This replaced an
-        # mpv `video-params/colormatrix` probe: the frame props carry the raw
-        # H.273 numeric codes rather than mpv's rendered strings, so the
-        # assertion is exact instead of substring matching ("601"/"170m").
-        from core.vs_engine import source_clip
-
-        frame = source_clip(str(mp4)).get_frame(0)
-        try:
-            props = dict(frame.props)
-        finally:
-            frame.close()
-
-        # H.273 code 6 = SMPTE 170M / BT.601; 1 would be BT.709, 2 "unspecified"
-        # (which is what the old untagged pipeline produced).
-        self.assertEqual(props.get("_Matrix"), 6,
-                         f"stream _Matrix is {props.get('_Matrix')!r}, expected 6 "
-                         "(SMPTE170M) — old pipeline left the VUI untagged")
-        self.assertEqual(props.get("_Primaries"), 6)
-        self.assertEqual(props.get("_Transfer"), 6)
-        self.assertEqual(props.get("_ColorRange"), 1, "expected limited (tv) range")
+        """The prop read needs a VS core, so it belongs to a clean child."""
+        self.assertEqual(self.run_vs_child("vui_contract")["status"], "ok")
 
     def test_image_loop_honours_offcenter_crop(self):
         # Left half red, right half blue; crop selects the LEFT half.

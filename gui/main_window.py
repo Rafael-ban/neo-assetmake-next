@@ -12,7 +12,7 @@ from core.auto_save_service import AutoSaveService, AutoSaveConfig
 from gui.widgets.json_preview import JsonPreviewWidget
 from gui.widgets.timeline import TimelineWidget
 from gui.widgets.transition_preview import TransitionPreviewWidget
-from gui.widgets.video_preview import VideoPreviewWidget
+from gui.widgets.video_preview import PreviewRenderContext, VideoPreviewWidget
 from gui.widgets.config_panel import ConfigPanel
 from config.constants import (
     APP_NAME, APP_VERSION, APP_VERSION_LABEL, get_resolution_spec,
@@ -1068,6 +1068,7 @@ class MainWindow(QMainWindow):
         self.basic_config_panel.set_config(self._config, self._base_dir)
         self.json_preview.set_config(self._config, self._base_dir)
         self.video_preview.set_epconfig(self._config)
+        self._configure_preview_render_contexts()
         self._update_title()
         self.status_bar.showMessage("已创建临时项目，可以开始编辑")
         logger.info(f"已初始化临时项目: {temp_dir}")
@@ -1219,6 +1220,7 @@ class MainWindow(QMainWindow):
         self.timeline.set_total_frames(0)
         self._loop_in_out = (0, 0)
         self._intro_in_out = (0, 0)
+        self._configure_preview_render_contexts()
 
         self.advanced_config_panel.set_config(self._config, self._base_dir)
         self.basic_config_panel.set_config(self._config, self._base_dir)
@@ -1360,6 +1362,7 @@ class MainWindow(QMainWindow):
             self.advanced_config_panel.set_config(self._config, self._base_dir)
             self.basic_config_panel.set_config(self._config, self._base_dir)
             self.json_preview.set_config(self._config, self._base_dir)
+            self._configure_preview_render_contexts()
 
             # 重新指向自动保存(路径已切换;服务缓存的是 start() 时的值)。
             self._auto_save_service.start(
@@ -1997,6 +2000,8 @@ class MainWindow(QMainWindow):
                     if self._is_timeline_bound_to(preview):
                         self.timeline.set_in_point(in_f)
                         self.timeline.set_out_point(out_f)
+                    start, end = self._get_trim_bounds(preview)
+                    preview.set_timeline_range(start, end)
             finally:
                 self._restoring_editor_state = False
 
@@ -3153,11 +3158,36 @@ class MainWindow(QMainWindow):
                 self.timeline.get_in_point(),
                 self.timeline.get_out_point(),
             )
+            start, end = self._get_trim_bounds(self.intro_preview)
+            self.intro_preview.set_timeline_range(start, end)
         elif self._timeline_preview is self.video_preview:
             self._loop_in_out = (
                 self.timeline.get_in_point(),
                 self.timeline.get_out_point(),
             )
+            start, end = self._get_trim_bounds(self.video_preview)
+            self.video_preview.set_timeline_range(start, end)
+
+    def _configure_preview_render_contexts(self) -> None:
+        """为 loop/intro 分配互不共享的 worker job/cache 上下文。"""
+        if not self._base_dir:
+            return
+        project_root = str(os.path.abspath(self._base_dir))
+        cache_root = os.path.join(project_root, ".assetmaker-vs", "preview")
+        self.video_preview.set_render_context(
+            PreviewRenderContext.builtin(
+                project_root=project_root,
+                track="loop",
+                cache_dir=os.path.join(cache_root, "loop"),
+            )
+        )
+        self.intro_preview.set_render_context(
+            PreviewRenderContext.builtin(
+                project_root=project_root,
+                track="intro",
+                cache_dir=os.path.join(cache_root, "intro"),
+            )
+        )
 
     def _get_cached_in_out(
         self, preview: VideoPreviewWidget
@@ -3380,11 +3410,7 @@ class MainWindow(QMainWindow):
             source_preview = self._current_video_preview
             frame = source_preview.current_frame
             if frame is not None:
-                from gui.widgets.video_preview import VideoPreviewWidget
                 frame = frame.copy()
-                rotation = source_preview.get_rotation()
-                frame = VideoPreviewWidget.apply_rotation_to_frame(
-                    frame, rotation)
                 self.frame_capture_preview.update_static_frame(frame)
                 logger.info(
                     f"更新截取帧编辑页面，帧: {source_preview.current_frame_index}")
@@ -3437,6 +3463,8 @@ class MainWindow(QMainWindow):
             self.timeline.set_out_point(total_frames - 1)
         self._intro_in_out = (0, total_frames - 1)
         self._finish_editor_restore(self.intro_preview)
+        start, end = self._get_trim_bounds(self.intro_preview)
+        self.intro_preview.set_timeline_range(start, end)
         self.status_bar.showMessage(
             f"入场视频已加载: {total_frames} 帧, {fps:.1f} FPS")
 
@@ -3698,6 +3726,8 @@ class MainWindow(QMainWindow):
             self.timeline.set_out_point(total_frames - 1)
         self._loop_in_out = (0, total_frames - 1)
         self._finish_editor_restore(self.video_preview)
+        start, end = self._get_trim_bounds(self.video_preview)
+        self.video_preview.set_timeline_range(start, end)
         self.status_bar.showMessage(f"视频已加载: {total_frames} 帧, {fps:.1f} FPS")
 
     def _on_editor_state_changed(self, preview):
@@ -3821,12 +3851,12 @@ class MainWindow(QMainWindow):
         else:
             source_preview = self.intro_preview
 
-        if source_preview.current_frame is None:
+        if not getattr(source_preview, "_has_video", False):
             other = self.video_preview if source_preview is self.intro_preview else self.intro_preview
-            if other.current_frame is not None:
+            if getattr(other, "_has_video", False):
                 source_preview = other
 
-        if source_preview.current_frame is None:
+        if not getattr(source_preview, "_has_video", False):
             logger.warning("所有预览器的当前帧都为 None，显示警告")
             QMessageBox.warning(self, "警告", "请先加载视频")
             return
@@ -3842,12 +3872,8 @@ class MainWindow(QMainWindow):
         source_preview.capture_frame_async(_deliver)
 
     def _finish_capture_frame(self, source_preview, frame):
-        """截取帧就绪：旋转后载入截取帧编辑页并切换标签。"""
-        from gui.widgets.video_preview import VideoPreviewWidget
-
+        """当前 worker surface 的 BGR 帧就绪后载入静态截图编辑器。"""
         frame = frame.copy()
-        rotation = source_preview.get_rotation()
-        frame = VideoPreviewWidget.apply_rotation_to_frame(frame, rotation)
 
         logger.info(f"加载到截取帧编辑预览，帧尺寸: {frame.shape}")
         self.frame_capture_preview.load_static_image_from_array(frame)

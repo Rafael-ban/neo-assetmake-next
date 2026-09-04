@@ -518,6 +518,78 @@ class VSWorkerClientTests(unittest.TestCase):
         )
         self.assertEqual(crashes, [])
 
+    def test_new_generation_cleanup_coded_start_failure_is_reported_once(self):
+        class NewGenerationCleanupError(RuntimeError):
+            code = STAGING_CLEANUP_ERROR_CODE
+
+        class AdvancedGenerationTransport(_FakeTransport):
+            def __init__(self):
+                super().__init__()
+                self.start_count = 0
+
+            def start(self):
+                self.start_count += 1
+                generation = super().start()
+                if self.start_count == 2:
+                    raise NewGenerationCleanupError(
+                        "worker 协议线程启动失败；新 generation staging 清理失败"
+                    )
+                return generation
+
+        transport = AdvancedGenerationTransport()
+        client = VSWorkerClient(
+            transport=transport,
+            worker_config=self.client.worker_config,
+            timer_factory=_FakeTimer,
+        )
+        self.addCleanup(client.close)
+        failures = []
+        crashes = []
+        client.request_failed.connect(
+            lambda request_id, code, message: failures.append(
+                (request_id, code, message)
+            )
+        )
+        client.worker_crashed.connect(crashes.append)
+
+        client.start()
+        client.terminate_and_restart()
+        transport.emit(
+            {
+                "type": "worker_crashed",
+                "generation": 1,
+                "exit_code": 0,
+                "code": STAGING_CLEANUP_ERROR_CODE,
+                "message": "旧 generation staging 清理失败",
+            }
+        )
+        self._drain_events()
+
+        self.assertEqual(transport.generation, 2)
+        self.assertEqual(transport.start_count, 2)
+        self.assertEqual(
+            [item[:2] for item in failures],
+            [
+                (0, STAGING_CLEANUP_ERROR_CODE),
+                (0, "worker.restart_failed"),
+            ],
+        )
+        self.assertIn("worker 协议线程启动失败", failures[1][2])
+
+        transport.emit(
+            {
+                "type": "worker_crashed",
+                "generation": 2,
+                "exit_code": 0,
+                "code": STAGING_CLEANUP_ERROR_CODE,
+                "message": "新 generation staging 清理失败",
+            }
+        )
+        self._drain_events()
+
+        self.assertEqual(len(failures), 2)
+        self.assertEqual(crashes, [])
+
     def test_queued_restart_startup_failures_are_single_safe_terminals(self):
         class FailingRestartTransport(_FakeTransport):
             def __init__(self, stage):

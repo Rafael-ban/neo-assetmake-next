@@ -3,6 +3,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import math
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -69,6 +70,30 @@ class PreviewZoomTests(unittest.TestCase):
         cls.marker_mp4 = cls.d / "marker.mp4"
         MediaEncoder(TC).encode_vpy_to_mp4(str(marker_vpy), str(cls.marker_mp4), 30.0)
 
+    @staticmethod
+    def _pump_until(condition, timeout=20.0):
+        from PyQt6.QtCore import QCoreApplication
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            if condition():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def _load_real(self, path):
+        from gui.widgets.video_preview import VideoPreviewWidget
+
+        widget = VideoPreviewWidget()
+        self.addCleanup(lambda: widget.clear(sync_shutdown=True))
+        self.assertTrue(widget.load_video(str(path)))
+        self.assertTrue(
+            self._pump_until(lambda: widget.current_frame is not None),
+            "worker 未返回首帧",
+        )
+        return widget
+
     def test_initial_zoom_is_100_percent(self):
         from gui.widgets.video_preview import VideoPreviewWidget
 
@@ -129,44 +154,42 @@ class PreviewZoomTests(unittest.TestCase):
         而视口最多只能显示约 1000x1800。新写法先 CropAbs 出视口窗口再放大,
         成本与倍率无关。
         """
-        from core.vs_graph import apply_preview_zoom, build_source_graph
-
-        viewport = (1000, 1800)
-        base = build_source_graph(str(self.mp4), is_image=False, rotation=0)
-        for factor in (2.0, 10.0, 100.0):
+        widget = self._load_real(self.mp4)
+        viewport = widget._viewport_size()
+        for factor in (0.01, 1.0, 100.0):
             with self.subTest(zoom=factor):
-                clip = apply_preview_zoom(base, zoom_factor=factor,
-                                          viewport=viewport, kernel="Point")
-                # 永不超过视口 —— 这正是旧写法违反的那条
-                self.assertLessEqual(clip.width, viewport[0])
-                self.assertLessEqual(clip.height, viewport[1])
+                previous = widget.current_frame
+                widget.current_frame = None
+                widget.set_zoom_factor(factor)
+                if factor == 1.0:
+                    widget._request_current_frame()
+                self.assertTrue(
+                    self._pump_until(lambda: widget.current_frame is not None),
+                    f"zoom={factor} 未返回帧",
+                )
+                height, width = widget.current_frame.shape[:2]
+                self.assertLessEqual(width, viewport[0])
+                self.assertLessEqual(height, viewport[1])
+                self.assertIsNot(widget.current_frame, previous)
 
     def test_zoom_preserves_pixel_content(self):
         """放大后内容不能错位:上半仍是红、下半仍是蓝。"""
-        from core.vs_graph import apply_preview_zoom, build_source_graph
-
-        base = build_source_graph(str(self.marker_mp4), is_image=False, rotation=0)
-        # 2x：视口窗口覆盖足够多的源行，红/蓝分界仍落在窗口中间。
-        # (100x 时窗口只有 6 行源像素，整窗都是分界过渡带，测不出方位。)
-        clip = apply_preview_zoom(base, zoom_factor=2.0, viewport=(400, 600),
-                                  pan=(0.5, 0.5), kernel="Point")
-        frame = clip.get_frame(0)
-        try:
-            r = np.asarray(frame[0]); b = np.asarray(frame[2])
-            h, w = r.shape
-            top_r, top_b = int(r[h // 8, w // 2]), int(b[h // 8, w // 2])
-            bot_r, bot_b = int(r[7 * h // 8, w // 2]), int(b[7 * h // 8, w // 2])
-            self.assertGreater(top_r, top_b, f"上半应偏红, got R={top_r} B={top_b}")
-            self.assertGreater(bot_b, bot_r, f"下半应偏蓝, got R={bot_r} B={bot_b}")
-        finally:
-            frame.close()
+        widget = self._load_real(self.marker_mp4)
+        widget.current_frame = None
+        widget.set_zoom_factor(2.0)
+        self.assertTrue(self._pump_until(lambda: widget.current_frame is not None))
+        frame = widget.current_frame
+        h, w = frame.shape[:2]
+        top_b, _top_g, top_r = (int(v) for v in frame[h // 8, w // 2])
+        bot_b, _bot_g, bot_r = (int(v) for v in frame[7 * h // 8, w // 2])
+        self.assertGreater(top_r, top_b, f"上半应偏红, got R={top_r} B={top_b}")
+        self.assertGreater(bot_b, bot_r, f"下半应偏蓝, got R={bot_r} B={bot_b}")
 
     def test_zoom_at_1x_returns_the_clip_untouched(self):
-        from core.vs_graph import apply_preview_zoom, build_source_graph
-
-        base = build_source_graph(str(self.mp4), is_image=False, rotation=0)
-        self.assertIs(apply_preview_zoom(base, zoom_factor=1.0,
-                                         viewport=(800, 600)), base)
+        widget = self._load_real(self.mp4)
+        self.assertEqual(widget.get_zoom_factor(), 1.0)
+        self.assertIsNotNone(widget.current_frame)
+        self.assertNotIn("vapoursynth", __import__("sys").modules)
 
     def test_cropbox_is_locked_while_zoomed(self):
         """放大后 display_scale 不再对应源坐标,画框与拖拽都必须停手。"""

@@ -7,9 +7,12 @@ Covers:
        thread (this replaced "mpv QProcess is created on the GUI thread": there
        is no child-process player any more).
 """
-import time
+import os
+import subprocess
+import sys
 import types
 import unittest
+from pathlib import Path
 
 from tests.qt_harness import ensure_app
 
@@ -114,34 +117,50 @@ class PreviewBackendTests(unittest.TestCase):
                      "_seek_mpv_to_current_frame", "request_screenshot"):
             self.assertFalse(hasattr(cls, gone), f"{gone} should be gone")
 
-    def test_frames_are_delivered_on_the_gui_thread(self):
-        from PyQt6.QtCore import QThread
-        from PyQt6.QtWidgets import QApplication
-        from core import vs_engine
+    def test_qt_process_does_not_import_or_prewarm_vapoursynth(self):
+        root = Path(__file__).resolve().parents[1]
+        main_source = (root / "main.py").read_text(encoding="utf-8")
+        harness_source = (root / "tests" / "qt_harness.py").read_text(
+            encoding="utf-8"
+        )
+        preview_source = (
+            root / "gui" / "widgets" / "video_preview.py"
+        ).read_text(encoding="utf-8")
 
-        if vs_engine._core is None or vs_engine.missing_plugins():
-            self.skipTest("VapourSynth core unavailable")
-        from core.vs_player import FrameRequester
+        self.assertNotIn("vs_engine.prewarm", main_source)
+        self.assertNotIn("vs_engine.prewarm", harness_source)
+        self.assertNotIn("from core import vs_engine", preview_source)
 
-        vs = vs_engine.load_vapoursynth()
-        core = vs_engine.get_core()
-        clip = core.std.BlankClip(width=32, height=32, length=5,
-                                  format=vs.RGB24, color=[10, 20, 30])
-        req = FrameRequester()
-        req.set_clip(clip, epoch=1)
-        seen = {}
-        req.frame_ready.connect(
-            lambda e, i, a: seen.update(thread=QThread.currentThread()))
-        req.request(0)
-        app = QApplication.instance()
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and "thread" not in seen:
-            app.processEvents()
-            time.sleep(0.01)
-        self.addCleanup(req.close)
-        self.assertIn("thread", seen, "no frame delivered")
-        self.assertIs(seen["thread"], app.thread(),
-                      "frames must arrive on the GUI thread, not a VS worker")
+    def test_widget_constructs_after_qt_without_loading_vapoursynth(self):
+        root = Path(__file__).resolve().parents[1]
+        code = "\n".join(
+            [
+                "import os, sys",
+                "os.environ['QT_QPA_PLATFORM'] = 'offscreen'",
+                "from PyQt6.QtWidgets import QApplication",
+                "app = QApplication([])",
+                "from gui.widgets.video_preview import VideoPreviewWidget",
+                "widget = VideoPreviewWidget()",
+                "assert 'vapoursynth' not in sys.modules, sorted(",
+                "    name for name in sys.modules if 'vapoursynth' in name)",
+                "widget.clear(sync_shutdown=True)",
+            ]
+        )
+        env = os.environ.copy()
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", code],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
 
 
 if __name__ == "__main__":
