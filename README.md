@@ -1,411 +1,198 @@
 # 明日方舟通行证素材工具箱
 
-Arknights Pass Material Toolbox — 用于制作明日方舟电子通行证 2.1 素材的图形化工具。
+Arknights Pass Material Toolbox 是一个面向明日方舟电子通行证 2.1 素材的 Windows 图形化制作工具。它将项目配置、素材编辑、VapourSynth 渲染、x264 编码、设备模拟和素材管理整合到同一套工作流中。
 
-## 功能概览
+> 本仓库是**源代码**。用户实际运行的是由 `build.py` 生成的 `ArknightsPassMaker` 构建目录或安装包；修改源代码后，必须重新构建或发布，变更才会进入可运行程序。
 
-### 素材制作（核心功能）
+## 核心能力
 
-- 可视化配置编辑界面，支持基础模式和高级模式
-- 实时 JSON 配置预览
-- 视频预览与裁剪，支持 0°/90°/180°/270° 四方向旋转（与导出结果保持一致）
-- 后台线程视频预览，长视频加载不阻塞 UI
-- 拖放文件导入，支持将视频/图片直接拖入预览区域
-- 时间轴控制与帧精准定位
-- 配置验证（UUID、颜色值、文件路径等）
-- 截取帧编辑，从视频中截取帧并保存为图标
-- 过渡效果预览（fade、move、swipe 等）
+- **素材制作**：编辑 `epconfig.json`、循环/入场素材、过渡、图标和叠加层。
+- **统一视频渲染**：预览与导出共用同一份用户 `.vpy` 脚本和同一份冻结渲染作业；“导出预览”展示的就是导出图。
+- **可交互编辑**：时间轴逐帧定位、播放/暂停、裁剪、四向旋转、预览缩放，以及视频帧截取为图标。
+- **自定义 VapourSynth**：可选择内置、当前 Windows 用户全局或项目内 `.vpy` 脚本；用户可在明确 ABI 和输出契约下编写自己的滤镜图。
+- **可靠导出**：`VSPipe → x264-7mod → MP4Box/lsmash-muxer` 生成设备素材；导出前校验颜色、帧率、几何和配置。
+- **设备模拟**：Rust/egui 模拟器按当前项目参数播放入场、循环、过渡和叠加层。
+- **素材生态**：素材论坛、下载管理、OAuth/FIDO2 登录、USB/MTP 与 EPass RNDIS 远程管理。
+- **项目保护**：自动保存、崩溃恢复、临时项目、更新检查和操作日志。
 
-### 明日方舟叠加 UI
+## 渲染架构
 
-- Arknights 风格叠加层：干员名称、代号、条码、职业图标
-- 自定义左上角文字（替代 Rhodes Island logo）
-- 自定义右上栏文字
-- 自定义图片叠加
-- 600+ 干员信息库，支持模糊搜索
+```text
+素材文件 + EPConfig + 用户 .vpy
+            │
+            ├── 预览：Qt → vs_worker.exe → VapourSynth → BGR 帧共享内存 → Qt
+            │
+            └── 导出：VSPipe → x264-7mod → MP4Box / lsmash-muxer
+```
 
-### 通行证模拟预览
+预览 worker 和 VSPipe 运行的是同一份主 `.vpy`、同一份 job、同一份输出契约。主 GUI 进程不直接加载 VapourSynth DLL，避免 Qt/DLL 生命周期冲突；worker 隔离的是渲染运行时，并不是运行不可信 Python 的安全沙箱。
 
-- Rust 编写的 egui 模拟器，屏幕尺寸跟随项目 `screen` 配置
-- 完整播放流程：入场过渡 → 入场视频 → 循环过渡 → 循环视频 + 叠加层
-- 模拟预览会分别继承入场视频和循环视频各自的裁切框、旋转角度与时间轴 in/out，行为与导出保持一致
-- Python ↔ Rust 通过 Windows 命名管道 IPC 通信
+## 环境要求
 
-### 素材论坛
+- Windows 10/11（项目当前仅支持 Windows）
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/)
+- Rust stable（只在编译 `simulator/` 或完整打包时需要）
+- Inno Setup（只在本地生成安装包时需要；`build.py` 可尝试下载便携版）
+- 媒体工具包：VapourSynth、VSPipe、x264-7mod、MP4Box/lsmash-muxer 及所需插件
 
-- 在线素材市场，支持搜索、分类过滤、排序
-- OAuth + FIDO2 认证登录
-- 多线程下载引擎（最多 3 并发）
-- 本地素材库管理
-- USB/MTP 设备管理
+## 快速开始
 
-### EPass RNDIS 远程管理
-
-- 侧边栏远程管理入口（WiFi 图标）
-- 通过 `EPass RNDIS Remote NDIS Compatible Device` 自动连接设备
-- 固定访问 `http://192.168.137.2/` 的设备端 HTTP API
-- 连接时校验 RNDIS 路由和 `/api/v1/health` 设备协议信息
-- 远程素材列表刷新，以及上传 / 下载 / 删除 / 编辑入口
-- 一键上传文件到通行证设备，实时进度显示
-- 上传完毕后可选自动重启通行证程序
-
-### 其他功能
-
-- 自动保存（5 分钟间隔）与崩溃恢复
-- 自动更新检查（多源竞速：GitHub API + 代理源）
-- 临时项目（启动即可编辑，首次保存时迁移）
-- 固件烧录工具集成（FEL 模式、DFU 模式；运行时依赖 `epass_flasher/` 目录）
-- 用户设置系统（主题、字体、视频、导出、网络）
-- 快捷键帮助（F1）
-
-## 系统要求
-
-- Windows
-- Python 3.10+
-- [uv](https://docs.astral.sh/uv/)（包管理器）
-- Rust 工具链（仅编译模拟器时需要）
-- 若需本地编译 `simulator/`，需要可用的 Rust stable 工具链
-
-## 文档
-
-- [用户手册](docs/USER_MANUAL.md)
-- [更新日志](docs/CHANGELOG.md)
-
-## 安装与运行
-
-### 1. 克隆项目
-
-```bash
+```powershell
 git clone https://github.com/rhodesepass/neo-assetmaker.git
 cd neo-assetmaker
-```
-
-### 2. 安装依赖
-
-```bash
 uv sync --no-install-project
-```
-
-### 3. 运行程序
-
-```bash
 uv run python main.py
 ```
 
-## 使用方法
+首次运行前，请将媒体工具包解压到 `tools/media/`。至少应包含：
 
-### 侧边栏导航
-
-软件左侧侧边栏包含以下模块：
-
-1. **固件烧录** — 为迷你 Linux 手持开发板烧录固件，支持 FEL 模式和 DFU 模式
-2. **素材制作** — 核心功能，创建和编辑通行证素材
-3. **素材论坛** — 在线素材资源下载
-4. **项目介绍** — 访问项目官网获取最新信息
-5. **远程管理** — 通过 EPass RNDIS HTTP API 同步文件到通行证设备
-6. **设置** — 主题、界面、视频、导出、网络等配置
-
-### 创建项目
-
-1. 点击顶部导航栏"文件" → "新建项目"
-2. 选择项目目录
-3. 在配置面板中填写各项配置
-4. 点击"文件" → "保存"保存项目
-
-### 打开现有项目
-
-1. 点击"文件" → "打开项目"
-2. 选择 `epconfig.json` 文件
-
-### 配置面板
-
-**基础模式：** 简化界面，适合快速创建素材，仅显示循环视频标签页。
-
-**高级模式：** 完整功能，包含四个选项卡：
-
-| 选项卡 | 内容 |
-|--------|------|
-| 基本信息 | UUID、名称、描述、分辨率、图标 |
-| 视频配置 | 循环视频（必选）、入场视频（可选） |
-| 过渡效果 | 进入过渡、循环过渡（none / fade / slide_down / slide_up / slide_left / slide_right） |
-| 叠加 UI | none / arknights（干员模板）/ image（自定义图片） |
-
-### 截取帧编辑
-
-1. 在中间预览区切换到"截取帧编辑"标签页
-2. 加载视频并定位到需要截取的帧
-3. 点击"保存为图标"保存当前帧
-
-### 临时项目
-
-- 启动时自动创建临时项目，用户可立即开始编辑
-- 首次保存时自动触发"另存为"，迁移到永久目录
-- 关闭软件时自动清理临时项目
-
-## 配置文件格式
-
-配置文件为 JSON 格式（`epconfig.json`）：
-
-```json
-{
-  "version": 1,
-  "uuid": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
-  "name": "示例素材",
-  "description": "素材描述",
-  "screen": "360x640",
-  "icon": "icon.png",
-  "loop": {
-    "file": "loop.mp4",
-    "is_image": false
-  },
-  "intro": {
-    "enabled": false,
-    "file": "",
-    "duration": 5000000
-  },
-  "transition_in": {
-    "type": "fade",
-    "options": {
-      "duration": 500000,
-      "background_color": "#000000"
-    }
-  },
-  "transition_loop": {
-    "type": "none"
-  },
-  "overlay": {
-    "type": "arknights",
-    "arknights_options": {
-      "appear_time": 100000,
-      "operator_name": "OPERATOR",
-      "operator_code": "ARKNIGHTS - UNK0",
-      "barcode_text": "OPERATOR - ARKNIGHTS",
-      "aux_text": "Operator of Rhodes Island",
-      "staff_text": "STAFF",
-      "color": "#000000",
-      "top_left_rhodes": "",
-      "top_right_bar_text": ""
-    }
-  }
-}
+```text
+tools/media/
+├── VSPipe.exe
+├── x264-7mod.exe
+├── mp4box.exe 或 lsmash-muxer.exe
+├── vapoursynth.pyd / vapoursynth.dll / portable.vs
+└── vs-plugins/
+    ├── LSMASHSource.dll
+    └── libimwri.dll
 ```
 
-时间单位为微秒（1 秒 = 1,000,000 微秒）。
+`portable.vs` 与 `vs-plugins/` 不是可选装饰文件：VapourSynth 便携运行时通过它们定位插件，缺失时插件加载可能退化为“没有可用插件”。GitHub Actions 会在构建前检查这些文件。
 
-## 目录结构
+## 基本使用
 
-```
+1. 选择“新建项目”或“打开项目”，项目主配置为 `epconfig.json`。
+2. 在“素材制作”页导入循环视频/图片；高级模式可额外导入入场素材。
+3. 用时间轴、裁剪框和旋转控制调整素材；“导出预览”用于核对实际设备输出画面。
+4. 在配置面板填写名称、UUID、屏幕规格、过渡和叠加层；保存项目。
+5. 运行导出。输出目录包含 `epconfig.json`、`loop.mp4`、可选 `intro.mp4`、图标与叠加资源。
+6. 可启动模拟器核对最终播放流程，再上传到设备或通过 RNDIS 远程管理同步。
+
+所有配置中的时间值均使用**微秒**：`1 秒 = 1_000_000`。
+
+## 自定义 VapourSynth `.vpy`
+
+`.vpy` 是实际的 Python/VapourSynth 脚本；`epconfig.json` 是项目和设备配置，二者用途不同。
+
+脚本来源有三种：
+
+| 来源 | 保存位置 | 适用场景 |
+|---|---|---|
+| 内置 | `resources/vapoursynth/default_pipeline.vpy` | 默认工作流或复制为模板 |
+| 全局 | 当前 Windows 用户的运行时覆盖配置 | 同一台电脑上复用个人脚本，不写入项目 |
+| 项目 | 项目目录内的相对路径 | 与项目一起保存和分享 |
+
+自定义脚本必须显式调用 `clip.set_output(0)`。`compatible` 模式若声明编辑能力，还需要以 `output 1` 提供可交互裁剪画布；`raw` 模式则完全由脚本自行构图，只输出 `output 0`。
+
+项目脚本第一次运行或其目录内容发生变化后，需要由本机用户重新确认。确认不是安全沙箱：只应运行你已经审查过的 `.vpy` 及其 Python 模块。
+
+完整接口、脚本头、注入变量、输出约束、插件声明和信任规则请阅读：
+
+- [用户 `.vpy` 脚本接口](docs/vapoursynth-kb/13-user-vpy-abi.md)
+- [预览 worker 与帧传输](docs/vapoursynth-kb/14-worker-protocol.md)
+- [output 0/1 与设备编码契约](docs/vapoursynth-kb/15-output-contract.md)
+- [脚本来源与本机信任](docs/vapoursynth-kb/16-script-trust.md)
+- [VapourSynth 知识库索引](docs/vapoursynth-kb/INDEX.md)
+
+## 配置与目录
+
+```text
 neo-assetmaker/
-├── main.py                          # 应用入口
-├── pyproject.toml                   # 项目配置和依赖管理
-├── build.py                         # cx_Freeze + Inno Setup 构建脚本
-├── build.bat                        # 批处理构建包装器
-├── installer.iss                    # Inno Setup 安装程序配置
-│
-├── docs/                            # 项目文档
-│   ├── CHANGELOG.md                 # 版本更新日志（Release 触发源）
-│   └── USER_MANUAL.md               # 面向使用者的操作手册
-│
-├── config/                          # 配置模块
-│   ├── constants.py                 # 常量定义（分辨率、格式、默认值）
-│   ├── epconfig.py                  # EPConfig 统一数据模型
-│   └── operator_db.py               # 干员数据库（600+ 干员）
-│
-├── core/                            # 核心业务逻辑
-│   ├── validator.py                 # EPConfig 配置校验器
-│   ├── image_processor.py           # 图片缩放、旋转、格式转换
-│   ├── video_processor.py           # 视频处理
-│   ├── optimized_processor.py       # 优化的视频处理器
-│   ├── overlay_renderer.py          # 叠加 UI 渲染器
-│   ├── export_service.py            # 素材导出和打包服务
-│   ├── auto_save_service.py         # 自动保存服务（5 分钟间隔）
-│   ├── crash_recovery_service.py    # 崩溃恢复服务
-│   ├── error_handler.py             # 错误处理（模式匹配 + 用户提示）
-│   └── update_service.py            # 自动更新检查服务
-│
-├── gui/                             # 图形用户界面
-│   ├── main_window.py               # 主窗口（无边框、自定义标题栏）
-│   ├── widgets/                     # UI 组件
-│   │   ├── config_panel.py          # 高级配置面板
-│   │   ├── basic_config_panel.py    # 基础配置面板
-│   │   ├── video_preview.py         # 视频预览（进程内 VapourSynth 帧请求）
-│   │   ├── gl_video_renderer.py     # OpenGL 视频渲染器
-│   │   ├── frame_reader_thread.py   # 旧帧读取接口兼容层
-│   │   ├── drop_overlay.py          # 拖放文件导入覆盖层
-│   │   ├── json_preview.py          # JSON 配置预览
-│   │   ├── timeline.py              # 时间轴控制
-│   │   ├── transition_preview.py    # 过渡效果预览
-│   │   ├── remote_page.py           # EPass RNDIS HTTP 远程管理页面
-│   │   └── settings_page.py         # 设置页面
-│   └── dialogs/                     # 对话框
-│       ├── welcome_dialog.py        # 欢迎引导
-│       ├── update_dialog.py         # 更新日志
-│       ├── export_progress_dialog.py # 导出进度
-│       ├── flasher_dialog.py        # 固件烧录
-│       ├── shortcuts_dialog.py      # 快捷键帮助
-│       └── crash_recovery_dialog.py # 崩溃恢复
-│
-├── utils/                           # 工具函数
-│   ├── logger.py                    # 日志系统（轮转文件 + 自动清理）
-│   ├── color_utils.py               # 颜色转换（hex ↔ RGB ↔ BGR）
-│   └── file_utils.py                # 文件操作工具
-│
-├── _mext/                           # 素材论坛扩展模块
-│   ├── core/                        # API 配置、服务管理
-│   ├── services/                    # API 客户端、OAuth 认证、FIDO2、下载引擎、USB/MTP
-│   ├── models/                      # 素材、用户、下载状态数据模型
-│   ├── ui/                          # 市场页、下载页、素材库页、登录页、USB 页、设置页
-│   └── utils/                       # 平台检测、加密工具
-│
-├── resources/                       # 资源文件
-│   ├── icons/                       # 应用图标
-│   ├── data/                        # 干员信息库、叠加 UI 模板和素材
-│   ├── class_icons/                 # 干员职业图标（8 个职业）
-│   └── installer/                   # 安装程序资源（向导图、语言包、许可证）
-│
-├── simulator/                       # Rust 通行证模拟器
-│   ├── src/                         # egui 应用、IPC、视频解码、渲染、动画
-│   ├── resources/fonts/             # 嵌入字体（DejaVuSans-Bold）
-│   └── Cargo.toml                   # Rust 项目配置
-│
-└── .github/workflows/               # CI/CD
-    ├── build.yml                    # CI 入口工作流
-    ├── build-app.yml                # 可复用的 Windows 构建流程
-    └── release.yml                  # 自动发布（docs/CHANGELOG.md 版本变更触发）
+├── main.py                         # Qt 应用入口
+├── build.py                         # cx_Freeze、安装包与发布构建入口
+├── installer.iss                    # Inno Setup 安装包定义
+├── config/
+│   ├── epconfig.py                  # 项目/设备配置数据模型
+│   ├── constants.py                 # 设备规格、默认值、版本
+│   ├── vs_runtime.py                # worker、核心、插件路径的运行时配置校验
+│   └── vs_runtime.json              # 运行时默认值；不定义滤镜链
+├── core/
+│   ├── export_service.py            # 导出编排
+│   ├── media_pipeline.py            # VSPipe、x264 与复用器管线
+│   ├── media_tools.py               # 媒体工具发现与能力检查
+│   ├── vs_runtime/                  # job、协议、worker、信任与迁移逻辑
+│   └── validator.py                 # EPConfig 校验
+├── gui/
+│   ├── main_window.py               # 主窗口与项目工作流
+│   ├── widgets/video_preview.py     # 预览、时间轴、裁剪与 worker 客户端协作
+│   └── widgets/vs_script_panel.py   # `.vpy` 来源选择界面
+├── resources/vapoursynth/
+│   ├── default_pipeline.vpy          # 内置 compatible 脚本模板
+│   ├── assetmaker_runner.vpy         # worker/VSPipe 的脚本启动器
+│   └── python/assetmaker_vs/         # 用户脚本 ABI 与输出校验辅助模块
+├── simulator/                        # Rust/egui 设备模拟器
+├── _mext/                            # 素材论坛、下载、认证和 USB/MTP 扩展
+├── docs/                             # 用户手册、知识库、变更日志
+└── .github/workflows/                # CI、构建与发布工作流
 ```
 
-## 构建与打包
+`config/vs_runtime.json` 仅控制 worker 超时、VS core 资源上限、插件目录和全局脚本位置；滤镜顺序、裁剪、颜色与输出由内置或用户 `.vpy` 明确编写，不能把这两类职责混在一起。
+
+## 测试
+
+```powershell
+# 完整 Python/Qt/协议/脚本契约测试
+uv run python -m unittest discover -s tests -p "test_*.py"
+
+# 导入与语法检查
+uv run python -m compileall main.py config core gui utils _mext build.py tests resources/vapoursynth/python
+
+# VPY 默认模板、输出与 worker 的重点验证
+uv run python -m unittest `
+  tests.test_default_vpy_pipeline `
+  tests.test_vs_output_contract `
+  tests.test_vs_worker_process `
+  tests.test_preview_export_parity -v
+```
+
+真实编码、worker 与预览集成测试需要本地 `tools/media/` 可用；没有媒体工具时，相关测试会按测试条件跳过，因此绿色结果不等价于真实媒体路径已被覆盖。
+
+## 构建与发布
 
 ### 本地构建
 
-```bash
-# 完整构建（exe + 安装程序；缺少 `epass_flasher/bin` 时仍可继续）
+```powershell
+# cx_Freeze 构建 + Inno Setup 安装包
 uv run python build.py
 
-# 清理构建目录
-uv run python build.py --clean
-
-# 跳过安装程序打包
+# 仅构建 cx_Freeze 目录，不生成安装程序
 uv run python build.py --no-installer
 
-# 即使本地存在 flasher 目录，也不把它打进安装包
+# 清理构建目录后再构建
+uv run python build.py --clean
+
+# 不将本地 epass_flasher/bin 打入产物
 uv run python build.py --skip-flasher
 
-# 使用 PyArmor 先混淆项目内 Python 源码，再交给 cx_Freeze 打包
+# 需要时先安装 PyArmor，再构建混淆版本
 uv pip install "pyarmor>=8,<9"
 uv run python build.py --obfuscate
-
-# 或使用批处理包装器（自动安装依赖）
-build.bat
 ```
 
-### 编译 Rust 模拟器
+`build.py` 的 cx_Freeze 输出目录是 `ArknightsPassMaker/`；Inno Setup 安装程序输出到 `dist/`。构建前需要先编译 Rust 模拟器：
 
-先确认本机已安装 Rust stable 工具链：
-
-```bash
-cd simulator && cargo build --release
+```powershell
+cd simulator
+cargo build --release
+cd ..
 ```
 
-### CI/CD
+### GitHub Actions
 
-GitHub Actions 工作流位于 `.github/workflows/`：
+- [`build.yml`](.github/workflows/build.yml)：push、Pull Request 或手动触发的 CI 入口。
+- [`build-app.yml`](.github/workflows/build-app.yml)：Windows 可复用构建流程，负责 Rust、Python、媒体工具、cx_Freeze、worker 自测与安装包。
+- [`release.yml`](.github/workflows/release.yml)：当 `docs/CHANGELOG.md` 顶部版本变化时创建发布；版本必须同时匹配 `pyproject.toml`、`config/constants.py`、`installer.iss` 与 `simulator/Cargo.toml`。
 
-- **build.yml** — push/PR 时触发 CI，并调用 `build-app.yml` 完成 Rust 编译、Python 打包和 Inno Setup 安装包构建
-- **release.yml** — `docs/CHANGELOG.md` 顶部版本号变更时自动创建 GitHub Release，并默认启用 PyArmor 混淆构建
+修改 `docs/CHANGELOG.md` 顶部版本后推送会触发自动 Release；未准备发布时不要这样做。
 
-构建环境：Windows Latest, Python 3.12, uv, Rust stable, optional media tools, Inno Setup
+## 相关文档
 
-### 媒体工具依赖
-
-应用程序需要以下媒体工具用于视频预览和导出：
-
-- **vapoursynth.pyd / vapoursynth.dll + `portable.vs` + `vs-plugins/`** — 预览与导出共用的渲染核心（进程内加载）
-- **VSPipe.exe** — VapourSynth 脚本处理器（导出用）
-- **x264-7mod.exe** — 视频编码器
-- **mp4box.exe / lsmash-muxer.exe** — MP4 复用器
-
-**CI 构建：** 媒体工具通过 GitHub Actions Cache 自动管理
-- 首次运行：从当前仓库的 release `media-tools-v1.0` 下载并缓存（~2-3 分钟）
-- 后续运行：从缓存恢复（~0.5 秒）
-- 缓存每 7 天无活动后过期，下次运行自动重新下载
-
-**设置 CI 构建（一次性操作）：**
-创建 release 并上传媒体工具压缩包：
-```bash
-gh release create media-tools-v1.0 media-tools-v1.0.7z \
-  --title "Media Tools v1.0" \
-  --notes "媒体工具包：VapourSynth, VSPipe, x264-7mod 等"
-```
-或通过网页：访问 `https://github.com/{你的用户名}/{你的仓库}/releases/new`，tag 填 `media-tools-v1.0`，上传 `media-tools-v1.0.7z` 文件。
-
-**本地开发：**
-1. 从本仓库 [Releases](../../releases/tag/media-tools-v1.0) 下载 `media-tools-v1.0.7z`（如已创建）
-2. 解压到项目根目录（会创建 `tools/media/` 目录）
-3. 验证安装：
-   ```bash
-   uv run python -c "from core.media_tools import MediaToolchain; print(MediaToolchain.discover())"
-   ```
-
-如果不需要视频功能，可以跳过此步骤。应用程序会在需要时提示缺少的工具。
-
-## 开发说明
-
-### 技术栈
-
-| 层级 | 技术 | 位置 |
-|------|------|------|
-| GUI | PyQt6 + QFluentWidgets (Fluent Design) | `gui/` |
-| 核心逻辑 | 服务模式、数据类模型 | `core/` |
-| 配置系统 | dataclass + Enum + JSON Schema | `config/` |
-| 扩展模块 | OAuth + PKCE、FIDO2、MTP | `_mext/` |
-| 模拟器 | Rust (egui) | `simulator/` |
-| IPC | Windows 命名管道 (JSON) | `simulator/src/ipc/` |
-| 视频处理 | VapourSynth（进程内预览 + VSPipe 导出）+ x264-7mod | `core/`, `gui/widgets/`, `simulator/` |
-| 打包 | cx_Freeze + Inno Setup + 可选 PyArmor 混淆 | `build.py` |
-| 依赖管理 | uv + pyproject.toml | `pyproject.toml` |
-| CI/CD | GitHub Actions | `.github/workflows/` |
-
-### 架构概览
-
-```
-用户输入 (config_panel) → EPConfig 数据模型 (epconfig.py)
-    → 验证器 (validator.py) → 错误处理 (error_handler.py)
-    → 导出服务 (export_service.py)
-        ├→ 图片处理 (image_processor.py)
-        ├→ 叠加 UI 渲染 (overlay_renderer.py)
-        └→ 视频处理 (video_processor.py)
-    → 模拟器 (simulator) ← IPC 命名管道
-```
-
-核心数据模型 `EPConfig`（`config/epconfig.py`）是贯穿整个应用的统一配置对象。
-
-### 代码规范
-
-- 类名：PascalCase（`EPConfig`、`MainWindow`）
-- 函数/方法：snake_case（`validate_config`、`setup_logger`）
-- 常量：UPPER_SNAKE_CASE（`APP_VERSION`、`SCREEN_WIDTH`）
-- 私有成员：`_leading_underscore`
-- 异步 UI：`QThread` + 信号/槽模式
-- 错误处理：集中式 `ErrorHandler`（`core/error_handler.py`）
-
-## 日志系统
-
-运行时在 `logs/` 目录下生成日志文件，格式为 `app_YYYYMMDD.log`。
-
-| 级别 | 说明 |
-|------|------|
-| DEBUG | 详细调试信息（仅写入文件） |
-| INFO | 一般信息（控制台 + 文件） |
-| WARNING | 警告信息 |
-| ERROR | 错误信息 |
-
-日志使用 `RotatingFileHandler`，自动清理 30 天前的日志文件。日志目录按优先级降级：应用目录 → AppData → 系统临时目录。
+- [用户手册](docs/USER_MANUAL.md)
+- [VapourSynth 知识库索引](docs/vapoursynth-kb/INDEX.md)
+- [VapourSynth 架构说明](docs/VS_DECOUPLING.md)
+- [更新日志](docs/CHANGELOG.md)
 
 ## 许可证
 
 本项目仅供学习和研究使用。
-
-## 更新日志
-
-详见 [CHANGELOG.md](docs/CHANGELOG.md)。
