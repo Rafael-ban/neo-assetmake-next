@@ -30,6 +30,8 @@ class RotationCropRemapTests(unittest.TestCase):
         from gui.widgets.video_preview import VideoPreviewWidget
 
         w = VideoPreviewWidget()
+        # 此组只验证 compatible 脚本下的旋转/裁剪几何。
+        w.supports_editor_capability = lambda _capability: True
         w.video_width, w.video_height = 240, 360
         w.set_target_resolution(*target)
         w.cropbox = list(crop)

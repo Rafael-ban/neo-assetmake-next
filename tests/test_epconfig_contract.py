@@ -52,6 +52,25 @@ class EPConfigContractTests(unittest.TestCase):
         self.assertEqual(normalized["icon"], "icon.png")
         self.assertEqual(normalized["loop"]["file"], "loop.mp4")
 
+    def test_export_shape_strips_project_only_vpy_selection(self):
+        config = EPConfig.from_dict(
+            {
+                "loop": {"file": "loop.mp4"},
+                "editor": {
+                    "vs_script": {
+                        "source": "project",
+                        "path": "vapoursynth/pipeline.vpy",
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(
+            config.to_dict()["editor"]["vs_script"],
+            {"source": "project", "path": "vapoursynth/pipeline.vpy"},
+        )
+        self.assertNotIn("editor", config.to_dict(normalize_paths=True))
+
 
 if __name__ == "__main__":
     unittest.main()

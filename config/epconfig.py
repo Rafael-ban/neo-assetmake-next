@@ -2,7 +2,7 @@
 EPConfig 统一数据模型 - 电子通行证素材配置文件
 """
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Literal
 from enum import Enum
 import uuid as uuid_lib
 import json
@@ -327,13 +327,51 @@ class EditorTrackState:
 
 
 @dataclass
+class VSScriptState:
+    """项目文件中仅保存的 VPY 来源；运行身份均从脚本 header 派生。"""
+
+    source: Literal["builtin", "global", "project"] = "builtin"
+    path: str = ""
+
+    def is_default(self) -> bool:
+        return self.source == "builtin" and not self.path
+
+    def to_dict(self) -> dict:
+        return {"source": self.source, "path": self.path}
+
+    @classmethod
+    def from_dict(cls, data: Optional[dict]) -> "VSScriptState":
+        if not isinstance(data, dict):
+            return cls()
+        source = data.get("source", "builtin")
+        path = data.get("path", "")
+        if source not in ("builtin", "global", "project") or not isinstance(path, str):
+            return cls()
+        if source in ("builtin", "global"):
+            return cls(source=source, path="")
+        if (
+            not path
+            or "\\" in path
+            or os.path.isabs(path)
+            or any(part in ("", ".", "..") for part in path.split("/"))
+        ):
+            return cls()
+        return cls(source="project", path=path)
+
+
+@dataclass
 class EditorState:
     """编辑器状态(裁剪框/旋转/入出点),挂在项目 epconfig.json 的 editor 键下。"""
     loop: EditorTrackState = field(default_factory=EditorTrackState)
     intro: EditorTrackState = field(default_factory=EditorTrackState)
+    vs_script: VSScriptState = field(default_factory=VSScriptState)
 
     def is_default(self) -> bool:
-        return self.loop.is_default() and self.intro.is_default()
+        return (
+            self.loop.is_default()
+            and self.intro.is_default()
+            and self.vs_script.is_default()
+        )
 
     def to_dict(self) -> dict:
         result: Dict[str, Any] = {}
@@ -341,6 +379,8 @@ class EditorState:
             result["loop"] = self.loop.to_dict()
         if not self.intro.is_default():
             result["intro"] = self.intro.to_dict()
+        if not self.vs_script.is_default():
+            result["vs_script"] = self.vs_script.to_dict()
         return result
 
     @classmethod
@@ -350,6 +390,7 @@ class EditorState:
         return cls(
             loop=EditorTrackState.from_dict(data.get("loop")),
             intro=EditorTrackState.from_dict(data.get("intro")),
+            vs_script=VSScriptState.from_dict(data.get("vs_script")),
         )
 
 

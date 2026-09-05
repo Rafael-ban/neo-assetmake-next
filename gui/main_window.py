@@ -13,6 +13,7 @@ from gui.widgets.json_preview import JsonPreviewWidget
 from gui.widgets.timeline import TimelineWidget
 from gui.widgets.transition_preview import TransitionPreviewWidget
 from gui.widgets.video_preview import PreviewRenderContext, VideoPreviewWidget
+from gui.widgets.vs_script_panel import VSScriptPanel
 from gui.widgets.config_panel import ConfigPanel
 from config.constants import (
     APP_NAME, APP_VERSION, APP_VERSION_LABEL, get_resolution_spec,
@@ -20,7 +21,24 @@ from config.constants import (
 )
 from gui.widgets.drop_overlay import DropOverlayWidget
 from gui.styles import COLOR_TEXT_PRIMARY, COLOR_BG_ELEVATED, COLOR_BORDER, hex_with_alpha
-from config.epconfig import EPConfig, EditorTrackState, CONFIG_FILENAME
+from config.epconfig import EPConfig, EditorTrackState, VSScriptState, CONFIG_FILENAME
+from config.vs_runtime import (
+    default_vs_runtime_user_path,
+    load_vs_runtime,
+    save_vs_runtime_override,
+)
+from core.vs_runtime.script_header import parse_script_header
+from core.vs_runtime.session import (
+    ScriptSelection,
+    compute_script_bundle_hash,
+    script_bundle_code_files,
+)
+from core.vs_runtime.trust import (
+    ProjectTrustStore,
+    ScriptReference,
+    ScriptTrustError,
+    resolve_script_reference,
+)
 from qfluentwidgets import (
     PushButton, PrimaryPushButton, ToolButton, TransparentToolButton,
     TabWidget, SegmentedWidget,
@@ -31,7 +49,7 @@ from qfluentwidgets import (
     ScrollArea, FluentIcon,
     setCustomStyleSheet, isDarkTheme, setThemeColor, themeColor
 )
-from PyQt6.QtGui import QAction, QKeySequence, QIcon, QShortcut
+from PyQt6.QtGui import QAction, QDesktopServices, QKeySequence, QIcon, QShortcut
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QMenuBar, QMenu, QStatusBar,
@@ -39,12 +57,13 @@ from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox,
     QSpinBox, QLineEdit, QTabWidget, QDialog, QApplication
 )
-from PyQt6.QtCore import Qt, QSettings, QTimer
+from PyQt6.QtCore import Qt, QSettings, QTimer, QUrl
 import os
 import sys
 import logging
 import tempfile
 import shutil
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -65,6 +84,9 @@ class MainWindow(QMainWindow):
         self._is_modified: bool = False
         self._temp_dir: Optional[str] = None  # 临时项目目录路径，None 表示非临时项目
         self._initializing: bool = True  # 初始化期间防护标志
+        self._script_ready = True
+        self._script_block_reason = ""
+        self._active_script_path = ""
 
         # 为每个视频存储独立的入点/出点
         self._loop_in_out: tuple[int, int] = (0, 0)   # 循环视频的(入点, 出点)
@@ -461,6 +483,8 @@ class MainWindow(QMainWindow):
 
         self.config_layout.addWidget(self.advanced_config_panel)
         self.config_layout.addWidget(self.basic_config_panel)
+        self.vs_script_panel = VSScriptPanel()
+        self.config_layout.addWidget(self.vs_script_panel)
         self.advanced_config_panel.setVisible(False)
         self.basic_config_panel.setVisible(True)
 
@@ -631,6 +655,13 @@ class MainWindow(QMainWindow):
 
     def _connect_signals(self):
         """连接信号"""
+        self.vs_script_panel.source_requested.connect(
+            self._on_script_source_requested
+        )
+        self.vs_script_panel.reload_requested.connect(self._on_script_reload)
+        self.vs_script_panel.open_directory_requested.connect(
+            self._on_script_open_directory
+        )
         self.action_new.triggered.connect(self._on_new_project)
         self.action_open.triggered.connect(self._on_open_project)
         self.action_save.triggered.connect(self._on_save_project)
@@ -1407,6 +1438,9 @@ class MainWindow(QMainWindow):
         if not self._config:
             QMessageBox.information(self, "提示", "请先创建或打开项目")
             return
+        if not self._script_ready:
+            QMessageBox.warning(self, "脚本未就绪", self._script_block_reason)
+            return
 
         from core.validator import EPConfigValidator
         validator = EPConfigValidator(self._base_dir)
@@ -1504,6 +1538,9 @@ class MainWindow(QMainWindow):
 
         if not self._config:
             QMessageBox.information(self, "提示", "请先创建或打开项目")
+            return
+        if not self._script_ready:
+            QMessageBox.warning(self, "脚本未就绪", self._script_block_reason)
             return
 
         if not self._config.loop.file:
@@ -3146,12 +3183,15 @@ class MainWindow(QMainWindow):
         except TypeError:
             pass
         preview.frame_changed.connect(self._on_video_frame_changed)
+        self._apply_timeline_capability_controls(preview)
 
     def _is_timeline_bound_to(self, preview: VideoPreviewWidget) -> bool:
         return self._timeline_preview is preview
 
     def _snapshot_active_timeline_state(self):
         if self._timeline_preview is self.intro_preview:
+            if not self._preview_supports(self.intro_preview, "trim"):
+                return
             self._intro_in_out = (
                 self.timeline.get_in_point(),
                 self.timeline.get_out_point(),
@@ -3159,6 +3199,8 @@ class MainWindow(QMainWindow):
             start, end = self._get_trim_bounds(self.intro_preview)
             self.intro_preview.set_timeline_range(start, end)
         elif self._timeline_preview is self.video_preview:
+            if not self._preview_supports(self.video_preview, "trim"):
+                return
             self._loop_in_out = (
                 self.timeline.get_in_point(),
                 self.timeline.get_out_point(),
@@ -3167,25 +3209,183 @@ class MainWindow(QMainWindow):
             self.video_preview.set_timeline_range(start, end)
 
     def _configure_preview_render_contexts(self) -> None:
-        """为 loop/intro 分配互不共享的 worker job/cache 上下文。"""
+        """在加载任何媒体前解析、核验并冻结本次脚本选择。"""
         if not self._base_dir:
             return
         project_root = str(os.path.abspath(self._base_dir))
         cache_root = os.path.join(project_root, ".assetmaker-vs", "preview")
+        reference = self._script_reference()
+        try:
+            runtime = load_vs_runtime()
+            script = resolve_script_reference(
+                reference,
+                project_root=project_root,
+                app_dir=self._app_dir,
+                global_script_path=runtime.scripts.global_script_path,
+            )
+            bundle_hash = compute_script_bundle_hash(script)
+            header = parse_script_header(script)
+            trusted = reference.source != "project"
+            if reference.source == "project":
+                store = ProjectTrustStore()
+                trusted = store.is_trusted(script.parent, bundle_hash)
+                if not trusted:
+                    from gui.dialogs.vs_script_trust_dialog import (
+                        VSScriptTrustDialog,
+                    )
+
+                    dialog = VSScriptTrustDialog(
+                        canonical_root=str(script.parent),
+                        main_script=str(script),
+                        code_files=script_bundle_code_files(script),
+                        bundle_hash=bundle_hash,
+                        parent=self,
+                    )
+                    if dialog.exec() == QDialog.DialogCode.Accepted:
+                        store.trust(script.parent, bundle_hash)
+                        trusted = True
+                    else:
+                        raise ScriptTrustError("脚本未获信任")
+            selection = ScriptSelection.from_header(script, header, bundle_hash)
+        except (OSError, RuntimeError, ScriptTrustError, ValueError) as exc:
+            self._block_script_execution(reference, str(exc))
+            return
+
+        self._script_ready = True
+        self._script_block_reason = ""
+        self._active_script_path = str(script)
         self.video_preview.set_render_context(
-            PreviewRenderContext.builtin(
+            PreviewRenderContext(
                 project_root=project_root,
                 track="loop",
+                selection=selection,
                 cache_dir=os.path.join(cache_root, "loop"),
+                header=header,
             )
         )
         self.intro_preview.set_render_context(
-            PreviewRenderContext.builtin(
+            PreviewRenderContext(
                 project_root=project_root,
                 track="intro",
+                selection=selection,
                 cache_dir=os.path.join(cache_root, "intro"),
+                header=header,
             )
         )
+        self.vs_script_panel.set_script_info(
+            reference=reference,
+            canonical_root=str(script.parent),
+            main_script=str(script),
+            header=header,
+            bundle_hash=bundle_hash,
+            trusted=trusted,
+        )
+        self._set_script_export_enabled(True)
+        self._apply_timeline_capability_controls(self._timeline_preview)
+
+    def _script_reference(self) -> ScriptReference:
+        if self._config is None:
+            return ScriptReference()
+        state = self._config.editor.vs_script
+        return ScriptReference(state.source, state.path)
+
+    def _block_script_execution(
+        self, reference: ScriptReference, reason: str
+    ) -> None:
+        self._script_ready = False
+        self._script_block_reason = reason
+        self._active_script_path = ""
+        for preview in (self.video_preview, self.intro_preview):
+            preview.set_execution_blocked(reason)
+        self.vs_script_panel.set_error(reference, reason)
+        self._set_script_export_enabled(False)
+        self._apply_timeline_capability_controls(self._timeline_preview)
+        self.status_bar.showMessage(reason)
+
+    def _set_script_export_enabled(self, enabled: bool) -> None:
+        for panel in (self.advanced_config_panel, self.basic_config_panel):
+            button = getattr(panel, "btn_export", None)
+            if button is not None:
+                button.setEnabled(enabled)
+
+    @staticmethod
+    def _preview_supports(preview, capability: str) -> bool:
+        checker = getattr(preview, "supports_editor_capability", None)
+        return bool(checker(capability)) if callable(checker) else True
+
+    def _apply_timeline_capability_controls(self, preview) -> None:
+        if preview is None:
+            return
+        controls = (
+            (
+                "trim",
+                ("btn_set_in", "btn_set_out"),
+                "当前脚本未声明 trim capability",
+            ),
+            (
+                "rotation",
+                ("btn_rotate_ccw", "spin_rotation", "btn_rotate_cw"),
+                "当前脚本未声明 rotation capability",
+            ),
+        )
+        for capability, names, tooltip in controls:
+            enabled = self._preview_supports(preview, capability)
+            for name in names:
+                control = getattr(self.timeline, name, None)
+                if control is not None:
+                    control.setEnabled(enabled)
+                    if not enabled:
+                        control.setToolTip(tooltip)
+        label = getattr(preview, "video_label", None)
+        if label is not None and not self._preview_supports(preview, "crop"):
+            label.setToolTip("当前脚本未声明 crop capability")
+
+    def _on_script_source_requested(self, source: str) -> None:
+        if self._config is None or not self._base_dir:
+            return
+        if source == "builtin":
+            state = VSScriptState("builtin", "")
+        else:
+            title = "选择全局 VPY 脚本" if source == "global" else "选择项目 VPY 脚本"
+            path, _ = QFileDialog.getOpenFileName(self, title, self._base_dir, "VPY 脚本 (*.vpy)")
+            if not path:
+                self.vs_script_panel.set_error(
+                    self._script_reference(), "未选择脚本；保留当前来源"
+                )
+                return
+            if source == "global":
+                try:
+                    save_vs_runtime_override(
+                        default_vs_runtime_user_path(),
+                        {"scripts": {"global_script_path": str(Path(path).resolve())}},
+                    )
+                except Exception as exc:
+                    QMessageBox.warning(self, "全局脚本", str(exc))
+                    return
+                state = VSScriptState("global", "")
+            else:
+                try:
+                    root = Path(self._base_dir).resolve(strict=True)
+                    relative = Path(path).resolve(strict=True).relative_to(root).as_posix()
+                    ScriptReference("project", relative)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    QMessageBox.warning(self, "项目脚本", f"脚本必须位于项目目录内：{exc}")
+                    return
+                state = VSScriptState("project", relative)
+        self._config.editor.vs_script = state
+        self._is_modified = True
+        self._update_title()
+        self._apply_project_config()
+
+    def _on_script_reload(self) -> None:
+        if self._config is not None:
+            self._apply_project_config()
+
+    def _on_script_open_directory(self) -> None:
+        if self._active_script_path:
+            QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(Path(self._active_script_path).parent))
+            )
 
     def _get_cached_in_out(
         self, preview: VideoPreviewWidget
@@ -3443,6 +3643,8 @@ class MainWindow(QMainWindow):
             preview = self.video_preview
         else:
             return  # 截取帧/过渡图片标签页无入点操作
+        if not self._preview_supports(preview, "trim"):
+            return
 
         current_frame = preview.current_frame_index
         self.timeline.set_in_point(current_frame)
@@ -3458,6 +3660,8 @@ class MainWindow(QMainWindow):
             preview = self.video_preview
         else:
             return  # 截取帧/过渡图片标签页无出点操作
+        if not self._preview_supports(preview, "trim"):
+            return
 
         current_frame = preview.current_frame_index
         self.timeline.set_out_point(current_frame)
@@ -3689,12 +3893,21 @@ class MainWindow(QMainWindow):
             if preview is self.video_preview
             else self._config.editor.intro
         )
-        track.crop = list(preview.get_cropbox_in_rotated_space())
-        track.rotation = preview.get_rotation()
-        if self._is_timeline_bound_to(preview):
+        changed = False
+        if self._preview_supports(preview, "crop"):
+            track.crop = list(preview.get_cropbox_in_rotated_space())
+            changed = True
+        if self._preview_supports(preview, "rotation"):
+            track.rotation = preview.get_rotation()
+            changed = True
+        if self._is_timeline_bound_to(preview) and self._preview_supports(preview, "trim"):
             self._snapshot_active_timeline_state()
-        in_out = self._get_cached_in_out(preview)
-        track.in_frame, track.out_frame = int(in_out[0]), int(in_out[1])
+        if self._preview_supports(preview, "trim"):
+            in_out = self._get_cached_in_out(preview)
+            track.in_frame, track.out_frame = int(in_out[0]), int(in_out[1])
+            changed = True
+        if not changed:
+            return
         if not self._is_modified:
             self._is_modified = True
             self._update_title()
@@ -3719,17 +3932,20 @@ class MainWindow(QMainWindow):
             return
         self._restoring_editor_state = True
         try:
-            if track.rotation:
+            if track.rotation and self._preview_supports(preview, "rotation"):
                 # 先旋转再设裁剪框:旋转会按目标比例重新适配裁剪框。
                 preview.set_rotation(track.rotation)
-            if track.crop:
+            if track.crop and self._preview_supports(preview, "crop"):
                 preview.set_cropbox(*track.crop)
                 # set_cropbox 会把框规整到当前屏幕比例。若被改动(旧工程存的
                 # 框比例不符、或来自其它分辨率),明确告知用户而非静默变更。
                 if list(preview.get_cropbox()) != [int(v) for v in track.crop]:
                     self.status_bar.showMessage(
                         "裁剪框已按当前屏幕比例修正", 5000)
-            if 0 <= track.in_frame <= track.out_frame:
+            if (
+                self._preview_supports(preview, "trim")
+                and 0 <= track.in_frame <= track.out_frame
+            ):
                 total = max(1, int(getattr(preview, "total_frames", 1)))
                 in_f = min(track.in_frame, total - 1)
                 out_f = min(track.out_frame, total - 1)
@@ -3991,6 +4207,13 @@ class MainWindow(QMainWindow):
         include_intro: bool = True,
     ) -> dict:
         """在 UI 线程冻结导出轨道的 preview RenderSession。"""
+        # 部分纯单元测试以 ``MainWindow.__new__`` 构造最小替身；避免 Qt
+        # 基类的缺失属性访问触发运行时错误。真实窗口在 __init__ 中总会设置
+        # 此标志，只有显式 False 才能越过 trust gate。
+        if not self.__dict__.get("_script_ready", True):
+            raise RuntimeError(
+                self.__dict__.get("_script_block_reason") or "脚本未获信任"
+            )
         sessions = {"loop_render_session": None, "intro_render_session": None}
         if include_loop:
             sessions["loop_render_session"] = self.video_preview.flush_render_job()

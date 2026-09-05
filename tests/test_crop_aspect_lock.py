@@ -47,6 +47,8 @@ def _widget(src, target):
     from gui.widgets.video_preview import VideoPreviewWidget
 
     w = VideoPreviewWidget()
+    # 此组只验证兼容脚本下的裁剪几何；M6 的脚本能力门由专属测试覆盖。
+    w.supports_editor_capability = lambda _capability: True
     w.video_width, w.video_height = src
     w.set_target_resolution(*target)
     w._init_cropbox()

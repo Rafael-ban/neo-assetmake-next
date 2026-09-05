@@ -303,25 +303,51 @@ def _read_script_bundle(
     script_path: str | Path,
 ) -> tuple[Path, list[tuple[str, bytes]]]:
     """一次性读取脚本根内参与 bundle 身份的全部代码。"""
-    script = Path(script_path).resolve(strict=True)
+    try:
+        script = Path(script_path).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"无法 canonicalize 脚本路径: {script_path}") from exc
+    if not script.is_file():
+        raise ValueError(f"脚本不是常规文件: {script}")
     root = script.parent
-    files = [
-        path.resolve(strict=True)
-        for path in root.rglob("*")
-        if path.is_file() and path.suffix.casefold() in {".vpy", ".py"}
-    ]
-    relative_files: list[tuple[str, Path]] = []
+    files: list[tuple[str, Path]] = []
     seen: set[str] = set()
-    for path in files:
+    for candidate in root.rglob("*"):
         try:
-            relative = path.relative_to(root).as_posix()
+            # 必须在 canonicalize 之前保留目录枚举返回的名称。某些 Windows
+            # API 会在 resolve() 后折叠大小写；若之后才比较，两个可导入的
+            # code 文件可能被误认成同一个路径而漏掉安全边界。
+            candidate_relative = candidate.relative_to(root).as_posix()
         except ValueError as exc:
-            raise ValueError(f"脚本 bundle 文件逃逸根目录: {path}") from exc
-        collision_key = relative.casefold()
-        if collision_key in seen:
-            raise ValueError(f"脚本 bundle 存在大小写碰撞: {relative}")
-        seen.add(collision_key)
-        relative_files.append((relative, path))
+            raise ValueError(f"脚本 bundle 文件逃逸根目录: {candidate}") from exc
+        is_code = candidate.suffix.casefold() in {".vpy", ".py"}
+        if is_code:
+            collision_key = candidate_relative.casefold()
+            if collision_key in seen:
+                raise ValueError(
+                    f"脚本 bundle 存在大小写碰撞: {candidate_relative}"
+                )
+            seen.add(collision_key)
+        try:
+            is_link = candidate.is_symlink()
+            attributes = getattr(candidate.lstat(), "st_file_attributes", 0)
+            is_reparse = bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+            resolved = candidate.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"无法 canonicalize 脚本 bundle 路径: {candidate}") from exc
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"脚本 bundle 文件逃逸根目录: {candidate}") from exc
+        # pathlib 不递归跟随目录链接；允许它会让可导入的 .py 不参与摘要。
+        # 因而目录链接以及所有会影响代码身份的链接一律拒绝。
+        if is_link or is_reparse:
+            if candidate.is_dir() or is_code:
+                raise ValueError(f"脚本 bundle 不允许链接或重解析点: {candidate}")
+            continue
+        if candidate.is_file() and is_code:
+            files.append((candidate_relative, resolved))
+    relative_files: list[tuple[str, Path]] = files
     relative_files.sort(key=lambda item: item[0].encode("utf-8"))
     return script, [
         (relative, path.read_bytes()) for relative, path in relative_files
@@ -342,6 +368,12 @@ def compute_script_bundle_hash(script_path: str | Path) -> str:
     """计算脚本根内 `.vpy/.py` 的稳定代码 bundle SHA-256。"""
     _script, relative_files = _read_script_bundle(script_path)
     return _bundle_digest(relative_files)
+
+
+def script_bundle_code_files(script_path: str | Path) -> tuple[str, ...]:
+    """返回与 bundle hash 完全相同的代码文件相对路径。"""
+    _script, relative_files = _read_script_bundle(script_path)
+    return tuple(relative for relative, _data in relative_files)
 
 
 @dataclass
@@ -540,5 +572,6 @@ __all__ = [
     "ScriptBundleSnapshot",
     "SessionMetadata",
     "compute_script_bundle_hash",
+    "script_bundle_code_files",
     "resolve_worker_command",
 ]

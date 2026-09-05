@@ -287,6 +287,27 @@ class PreviewWorkerContractTests(unittest.TestCase):
     def test_missing_compatible_editor_metadata_fails_loudly(self):
         failures = []
         self.widget.load_failed.connect(failures.append)
+        script = self.root / "editor-required.vpy"
+        script.write_text(
+            "# assetmaker-api: 1\n"
+            "# assetmaker-mode: compatible\n"
+            "# assetmaker-capabilities: source,trim,crop,rotation\n"
+            "# assetmaker-requires:\n"
+            "# assetmaker-editor-output: 1\n",
+            encoding="utf-8",
+        )
+        header = parse_script_header(script)
+        self.widget.set_render_context(
+            self.vp.PreviewRenderContext(
+                project_root=str(self.root),
+                track="loop",
+                selection=ScriptSelection.from_header(
+                    script, header, compute_script_bundle_hash(script)
+                ),
+                cache_dir=str(self.cache),
+                header=header,
+            )
+        )
         self.assertTrue(self.widget.load_video(str(self.media)))
         epoch = self.client.loads[-1].epoch
         metadata = self._metadata(epoch)

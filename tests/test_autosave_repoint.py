@@ -98,6 +98,9 @@ class AutoSaveRepointTests(unittest.TestCase):
             w._is_modified = True
             w._auto_save_service = _ServiceSpy()
             w._update_title = _null
+            # 此替身只验证另存为后的 AutoSaveService 重指向；脚本上下文
+            # 由 M6 专属测试覆盖，不能依赖未初始化的真实 MainWindow。
+            w._configure_preview_render_contexts = _null
             w.advanced_config_panel = types.SimpleNamespace(set_config=_null)
             w.basic_config_panel = types.SimpleNamespace(set_config=_null)
             w.json_preview = types.SimpleNamespace(set_config=_null)

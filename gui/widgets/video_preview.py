@@ -54,7 +54,7 @@ from core.vs_runtime.job import (
     TransformSpec,
     write_render_job,
 )
-from core.vs_runtime.script_header import parse_script_header
+from core.vs_runtime.script_header import ScriptHeader, parse_script_header
 from core.vs_runtime.session import (
     RenderSession,
     ScriptSelection,
@@ -89,6 +89,7 @@ class PreviewRenderContext:
     track: Literal["loop", "intro"]
     selection: ScriptSelection
     cache_dir: str
+    header: ScriptHeader | None = None
 
     def __post_init__(self) -> None:
         if self.track not in ("loop", "intro"):
@@ -100,6 +101,13 @@ class PreviewRenderContext:
             if not value.is_absolute():
                 raise ValueError(f"{name} 必须是绝对路径")
             object.__setattr__(self, name, str(value.resolve()))
+        header = self.header or parse_script_header(self.selection.script_path)
+        if (
+            header.api_version != self.selection.api_version
+            or header.mode != self.selection.mode
+        ):
+            raise ValueError("PreviewRenderContext 的 mode/API 必须与脚本 header 一致")
+        object.__setattr__(self, "header", header)
 
     @classmethod
     def builtin(
@@ -208,6 +216,7 @@ class VideoPreviewWidget(QWidget):
         self._worker_ready_for_frames = False
         self._restart_pending = False
         self._render_context: PreviewRenderContext | None = None
+        self._execution_blocked_reason = ""
         self._render_session: RenderSession | None = None
         self._selection: ScriptSelection | None = None
         self._session_metadata: SessionMetadata | None = None
@@ -371,11 +380,33 @@ class VideoPreviewWidget(QWidget):
         if context is not None and not isinstance(context, PreviewRenderContext):
             raise TypeError("context 必须是 PreviewRenderContext 或 None")
         self._render_context = context
+        if context is not None:
+            self._execution_blocked_reason = ""
+
+    def set_execution_blocked(self, reason: str) -> None:
+        """在 trust 或脚本解析失败时阻止任何新的 worker load。"""
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("执行阻断原因不能为空")
+        self._execution_blocked_reason = reason
+        self._render_context = None
+        self._teardown_media()
+        self.video_label.setText(reason)
+
+    def supports_editor_capability(self, capability: str) -> bool:
+        """只接受当前 header 明确声明的编辑能力；raw 永远不接受。"""
+        context = self._render_context
+        return bool(
+            context is not None
+            and context.selection.mode == "compatible"
+            and capability in context.header.capabilities
+        )
 
     def current_render_session(self) -> RenderSession | None:
         return self._render_session
 
     def _effective_context(self) -> PreviewRenderContext:
+        if self._execution_blocked_reason:
+            raise RuntimeError(self._execution_blocked_reason)
         if self._render_context is not None:
             return self._render_context
         root = Path(self.video_path).resolve().parent
@@ -427,22 +458,28 @@ class VideoPreviewWidget(QWidget):
         context = self._effective_context()
         epoch = self._next_epoch()
         is_image = self._is_image_source()
+        trim_enabled = self.supports_editor_capability("trim")
         if bootstrap and not is_image:
             timeline = TimelineSpec(start_frame=0, end_frame=None, fps=None)
         else:
             if self._fps_rational is None:
                 raise RuntimeError("视频元数据尚未解析，无法生成 resolved job")
-            end = self._timeline_end_exclusive
-            if end is None:
+            if trim_enabled:
+                end = self._timeline_end_exclusive
+                if end is None:
+                    end = max(1, self.total_frames)
+                start = max(0, min(self._timeline_start, end - 1))
+            else:
+                start = 0
                 end = max(1, self.total_frames)
-            start = max(0, min(self._timeline_start, end - 1))
             timeline = TimelineSpec(start_frame=start, end_frame=end, fps=self._fps_rational)
+        crop_enabled = self.supports_editor_capability("crop")
         crop = CropSpec(
             coordinate_space="post_rotation_source_pixels",
-            x=int(self.cropbox[0]),
-            y=int(self.cropbox[1]),
-            width=int(self.cropbox[2]),
-            height=int(self.cropbox[3]),
+            x=int(self.cropbox[0]) if crop_enabled else 0,
+            y=int(self.cropbox[1]) if crop_enabled else 0,
+            width=int(self.cropbox[2]) if crop_enabled else 0,
+            height=int(self.cropbox[3]) if crop_enabled else 0,
         )
         virtual_count = max(1, self.total_frames) if is_image else None
         job = RenderJob(
@@ -456,7 +493,14 @@ class VideoPreviewWidget(QWidget):
                 virtual_frame_count=virtual_count,
             ),
             timeline=timeline,
-            transform=TransformSpec(rotation=self._rotation, crop=crop),
+            transform=TransformSpec(
+                rotation=(
+                    self._rotation
+                    if self.supports_editor_capability("rotation")
+                    else 0
+                ),
+                crop=crop,
+            ),
             output=OutputSpec.from_profile(
                 f"{self.target_width}x{self.target_height}"
             ),
@@ -515,13 +559,17 @@ class VideoPreviewWidget(QWidget):
             self._fail_current_load(f"无法更新 VapourSynth 预览作业：{exc}")
 
     def flush_render_job(self) -> RenderSession:
+        if self._execution_blocked_reason:
+            raise RuntimeError(self._execution_blocked_reason)
         if not self._metadata_resolved or self._fps_rational is None:
             raise RuntimeError("视频元数据尚未解析")
         self._job_debounce.stop()
         self._job_dirty = False
         return self._load_render_job(bootstrap=False)
 
-    def set_timeline_range(self, start_frame: int, end_exclusive: int) -> None:
+    def set_timeline_range(self, start_frame: int, end_exclusive: int) -> bool:
+        if not self.supports_editor_capability("trim"):
+            return False
         if type(start_frame) is not int or type(end_exclusive) is not int:
             raise TypeError("timeline 边界必须是整数")
         if start_frame < 0 or end_exclusive <= start_frame:
@@ -537,6 +585,7 @@ class VideoPreviewWidget(QWidget):
         self._timeline_end_exclusive = end_exclusive
         if changed:
             self._schedule_render_job()
+        return True
 
     def _frame_request_target(self) -> tuple[str, int]:
         if self._selection is None or self._session_metadata is None:
@@ -550,7 +599,7 @@ class VideoPreviewWidget(QWidget):
         source_index = min(
             max(self._timeline_start, self.current_frame_index), end - 1
         )
-        if self._preview_mode:
+        if self._preview_mode or self._session_metadata.editor is None:
             return "final", source_index - self._timeline_start
         return "editor", source_index
 
@@ -631,15 +680,18 @@ class VideoPreviewWidget(QWidget):
         if metadata.mode != self._selection.mode:
             self._fail_current_load("worker 返回的脚本模式与冻结选择不一致")
             return
-        if metadata.mode == "compatible":
-            if metadata.editor is None:
-                self._fail_current_load(
-                    "compatible 脚本声明了 editor output 1，但未返回 output 1 元数据"
-                )
-                return
-            source_meta = metadata.editor
-        else:
-            source_meta = metadata.output0
+        if (
+            self._render_context is not None
+            and self._render_context.header.editor_output == 1
+            and metadata.editor is None
+        ):
+            self._fail_current_load("脚本声明 output 1，但 worker 未返回 editor metadata")
+            return
+        source_meta = (
+            metadata.editor
+            if metadata.mode == "compatible" and metadata.editor is not None
+            else metadata.output0
+        )
         first_metadata = not self._metadata_resolved
         self._session_metadata = metadata
         self._output0_frames = metadata.output0.num_frames
@@ -948,6 +1000,9 @@ class VideoPreviewWidget(QWidget):
     def load_video(self, path: str) -> bool:
         """写 bootstrap job 并异步交给独立 worker；本方法不加载 VS。"""
         logger.info("Loading video: %s", path)
+        if self._execution_blocked_reason:
+            self.video_label.setText(self._execution_blocked_reason)
+            return False
         if not os.path.exists(path):
             self.video_label.setText(f"File not found: {path}")
             return False
@@ -1005,6 +1060,9 @@ class VideoPreviewWidget(QWidget):
     def load_image_as_loop(
         self, path: str, fps: float = 30.0, duration: float = 5.0
     ) -> bool:
+        if self._execution_blocked_reason:
+            self.video_label.setText(self._execution_blocked_reason)
+            return False
         if not os.path.exists(path) or not HAS_CV2:
             return False
         data = np.fromfile(path, dtype=np.uint8)
@@ -1231,7 +1289,12 @@ class VideoPreviewWidget(QWidget):
         self.display_offset_y = (area.height() - shown_h) // 2
 
     def _paint_cropbox(self, widget: QWidget):
-        if self._preview_mode or self.video_width <= 0 or self.video_height <= 0:
+        if (
+            self._preview_mode
+            or not self.supports_editor_capability("crop")
+            or self.video_width <= 0
+            or self.video_height <= 0
+        ):
             return
         # Zoomed frames are a magnified VIEWPORT WINDOW of the source, not the
         # whole (scaled) source, so display_scale/offset no longer map source
@@ -1384,11 +1447,14 @@ class VideoPreviewWidget(QWidget):
     def get_cropbox_in_rotated_space(self) -> Tuple[int, int, int, int]:
         return tuple(self.cropbox)
 
-    def set_cropbox(self, x: int, y: int, w: int, h: int):
+    def set_cropbox(self, x: int, y: int, w: int, h: int) -> bool:
+        if not self.supports_editor_capability("crop"):
+            return False
         self.cropbox = [x, y, w, h]
         self._bound_cropbox()
         self._emit_cropbox_changed()
         self._refresh_display()
+        return True
 
     def get_video_info(self) -> Tuple[float, int, int, int]:
         return self.video_fps, self.total_frames, self.video_width, self.video_height
@@ -1417,13 +1483,15 @@ class VideoPreviewWidget(QWidget):
     def is_preview_mode(self) -> bool:
         return self._preview_mode
 
-    def set_rotation(self, degrees: int):
+    def set_rotation(self, degrees: int) -> bool:
+        if not self.supports_editor_capability("rotation"):
+            return False
         # Snap to a cardinal angle: the VapourSynth export graph only
         # support 0/90/180/270, so keep preview and export in lockstep and never let an
         # arbitrary angle through the UI (timeline SpinBox also steps by 90).
         degrees = (round(int(degrees) / 90) * 90) % 360
         if self._rotation == degrees:
-            return
+            return True
         has_video = self.video_width > 0 and self.video_height > 0
         # Remap the crop box through the rotation change instead of resetting it
         # to a default centred rectangle (which silently discarded the user's
@@ -1443,6 +1511,7 @@ class VideoPreviewWidget(QWidget):
         self.rotation_changed.emit(degrees)
         self._schedule_render_job()
         self._refresh_display()
+        return True
 
     def get_rotation(self) -> int:
         return self._rotation
@@ -1545,6 +1614,7 @@ class VideoPreviewWidget(QWidget):
 
     def _handle_mouse_press(self, widget: QWidget, event: QMouseEvent):
         if (event.button() != Qt.MouseButton.LeftButton or self._preview_mode
+                or not self.supports_editor_capability("crop")
                 or self._zoom_factor > 1.0):
             # 预览模式下画面是导出结果(已裁剪/缩放/补边),裁剪框不绘制,
             # 此时的拖拽会按导出几何去改框——无反馈且坐标系不对。
@@ -1559,7 +1629,7 @@ class VideoPreviewWidget(QWidget):
             self.setFocus()
 
     def _handle_mouse_move(self, widget: QWidget, event: QMouseEvent):
-        if self._preview_mode:
+        if self._preview_mode or not self.supports_editor_capability("crop"):
             widget.setCursor(Qt.CursorShape.ArrowCursor)
             return
         if self.drag_mode == self.DRAG_NONE or self.drag_start_pos is None:
@@ -1617,13 +1687,13 @@ class VideoPreviewWidget(QWidget):
             self.prev_frame()
         elif key == Qt.Key.Key_Right and not has_modifier and self._has_video:
             self.next_frame()
-        elif key == Qt.Key.Key_W and not has_modifier:
+        elif key == Qt.Key.Key_W and not has_modifier and self.supports_editor_capability("crop"):
             self.cropbox[1] -= 10
-        elif key == Qt.Key.Key_S and not has_modifier:
+        elif key == Qt.Key.Key_S and not has_modifier and self.supports_editor_capability("crop"):
             self.cropbox[1] += 10
-        elif key == Qt.Key.Key_A and not has_modifier:
+        elif key == Qt.Key.Key_A and not has_modifier and self.supports_editor_capability("crop"):
             self.cropbox[0] -= 10
-        elif key == Qt.Key.Key_D and not has_modifier:
+        elif key == Qt.Key.Key_D and not has_modifier and self.supports_editor_capability("crop"):
             self.cropbox[0] += 10
         elif key == Qt.Key.Key_Equal and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             # Ctrl+= (zoom in)
