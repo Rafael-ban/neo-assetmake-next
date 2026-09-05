@@ -95,13 +95,16 @@ class AsyncLoadTests(unittest.TestCase):
             ),
         )
 
-    def test_load_is_accepted_immediately_and_resolves_via_signal(self):
+    def test_load_is_accepted_without_waiting_for_metadata(self):
         loaded = {}
         self.w.video_loaded.connect(lambda n, fps: loaded.update(n=n, fps=fps))
-        t0 = time.perf_counter()
         self.assertTrue(self.w.load_video(self.file_a))
-        accept_ms = (time.perf_counter() - t0) * 1000
-        self.assertLess(accept_ms, 200, "load_video must not block on the probe")
+        # Async acceptance is a causal contract, not a benchmark tied to one
+        # runner's filesystem/antivirus latency.  FakeWorkerClient.load() only
+        # records the request and deliberately emits no metadata here: if
+        # load_video() waited for probing, this call could not have returned.
+        self.assertEqual(len(self.client.loads), 1)
+        self.assertEqual(loaded, {})
         self.assertEqual(self.w.video_label.text(), "正在加载视频元数据…")
         self.assertFalse(self.w._has_video)
 
@@ -193,10 +196,9 @@ class AsyncLoadRealMediaTests(unittest.TestCase):
         self.addCleanup(lambda: w.clear(sync_shutdown=True))
         loaded = {}
         w.video_loaded.connect(lambda n, fps: loaded.update(n=n, fps=fps))
-        t0 = time.perf_counter()
         self.assertTrue(w.load_video(str(self.mp4)))
-        accept_ms = (time.perf_counter() - t0) * 1000
-        self.assertLess(accept_ms, 500, "acceptance must return without probing")
+        self.assertEqual(loaded, {}, "metadata must arrive asynchronously")
+        self.assertFalse(w._has_video)
         self.assertTrue(self._pump_until(lambda: "n" in loaded, 20.0), "no video_loaded")
         self.assertGreater(loaded["n"], 0)
         self.assertTrue(
