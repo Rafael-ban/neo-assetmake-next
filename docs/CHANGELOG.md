@@ -24,6 +24,7 @@
 
 **构建、发布与文档**
 - GitHub Actions 现在可同时构建 Inno Setup 安装版和绿色免安装 ZIP；发布附件同时包含两种产物及 `SHA256SUMS` 校验文件。
+- CI 与 Release 不再启用需要付费许可证的 PyArmor 混淆，避免 GitHub Runner 使用 trial 处理大脚本时以 `out of license` 中断发布；本地 `--obfuscate` 参数继续保留。
 - 常规推送 CI 跳过 Inno Setup、绿色压缩包和制品上传，仅保留依赖缓存、cx_Freeze 与 worker 自检；手动构建或发布才执行完整打包，缩短日常构建时间。
 - 更新 README、用户手册、VapourSynth 架构说明与项目知识库，补充用户 `.vpy` ABI、worker 协议、输出契约、脚本信任边界及第三方实践的适用范围。
 

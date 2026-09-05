@@ -7,11 +7,6 @@ on:
     branches: [main, master, dev]
   workflow_dispatch:
     inputs:
-      obfuscate:
-        description: 'Use PyArmor obfuscation for this manual build'
-        required: false
-        type: boolean
-        default: false
       package_artifacts:
         description: '同时生成并上传安装版 EXE 与绿色免安装 ZIP'
         required: false
@@ -24,6 +19,6 @@ jobs:
     with:
       skip_flasher: true
       uv_sync_mode: "locked"
-      obfuscate: ${{ github.event_name == 'workflow_dispatch' && inputs.obfuscate }}
+      obfuscate: false
       build_installer: ${{ github.event_name == 'workflow_dispatch' && inputs.package_artifacts }}
       upload_artifact: ${{ github.event_name == 'workflow_dispatch' && inputs.package_artifacts }}

@@ -168,8 +168,9 @@ uv run python build.py --clean
 # 不将本地 epass_flasher/bin 打入产物
 uv run python build.py --skip-flasher
 
-# 需要时先安装 PyArmor，再构建混淆版本
+# 可选的本地混淆构建；大脚本需要已注册的 PyArmor 8 付费许可证
 uv pip install "pyarmor>=8,<9"
+pyarmor reg "C:\path\to\pyarmor-regfile-xxxx.zip"
 uv run python build.py --obfuscate
 ```
 
@@ -194,7 +195,7 @@ cd ..
 - [`build.yml`](.github/workflows/build.yml)：push、Pull Request 或手动触发的 CI 入口。常规 CI 仍执行 Rust、全量 Python、cx_Freeze 与 worker 自测，但跳过 Inno Setup、绿色 ZIP 和 artifact 上传，以缩短反馈时间。
 - 手动运行 `Build` 工作流时，默认会同时构建并上传**安装版 EXE 与绿色免安装 ZIP**；可取消“package artifacts”仅执行快速构建验证。
 - [`build-app.yml`](.github/workflows/build-app.yml)：Windows 可复用构建流程。Release/手动产物构建会校验绿色 ZIP 可解压且包含主程序、worker、运行时配置、`portable.vs` 和内置 `.vpy`。
-- [`release.yml`](.github/workflows/release.yml)：当 `docs/CHANGELOG.md` 顶部版本变化时创建发布，同时附加安装版、绿色免安装版和同时覆盖二者的 `SHA256SUMS`。版本必须同时匹配 `pyproject.toml`、`config/constants.py`、`installer.iss` 与 `simulator/Cargo.toml`。
+- [`release.yml`](.github/workflows/release.yml)：当 `docs/CHANGELOG.md` 顶部版本变化时创建发布，同时附加安装版、绿色免安装版和同时覆盖二者的 `SHA256SUMS`。CI 与 Release 不启用需要付费许可证的 PyArmor；`--obfuscate` 仅保留为本地可选构建参数。版本必须同时匹配 `pyproject.toml`、`config/constants.py`、`installer.iss` 与 `simulator/Cargo.toml`。
 
 修改 `docs/CHANGELOG.md` 顶部版本后推送会触发自动 Release；未准备发布时不要这样做。
 
