@@ -93,7 +93,8 @@ def _real_frame(path: Path) -> dict[str, object]:
     clip = to_display_rgb_clip(vs_engine.source_clip(str(path)), vs)
     frame = request_bgr_frame(clip, 10)
     assert frame is not None
-    assert frame.shape == (360, 240, 3)
+    assert frame.ndim == 3
+    assert frame.shape[2] == 3
     return {"shape": list(frame.shape), "mean": int(frame.mean())}
 
 

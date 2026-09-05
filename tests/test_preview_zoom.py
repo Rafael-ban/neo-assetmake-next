@@ -33,24 +33,24 @@ def setUpModule():
 class PreviewZoomTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from core.media_pipeline import MediaEncoder, _quote_vs_string
+        from tests.helpers.m5_render_fixture import (
+            build_default_render_session,
+            encode_render_session,
+        )
 
         cls.d = Path(tempfile.mkdtemp())
         png = cls.d / "src.png"
         # 一张 120x80 的简单图（便于验证放大后尺寸）
         img = np.full((80, 120, 3), 128, np.uint8)
         cv2.imwrite(str(png), img)
-        vpy = cls.d / "src.vpy"
-        vpy.write_text("\n".join([
-            "import vapoursynth as vs", "core = vs.core",
-            f"clip = core.imwri.Read({_quote_vs_string(str(png))})",
-            "clip = clip if clip.format.id == vs.RGB24 else core.resize.Bicubic(clip, format=vs.RGB24)",
-            "clip = core.std.Loop(clip, times=10)",
-            "clip = core.resize.Bicubic(clip, width=120, height=80, format=vs.YUV420P8, matrix_s='170m')",
-            "clip.set_output()",
-        ]) + "\n", encoding="utf-8")
         cls.mp4 = cls.d / "src.mp4"
-        MediaEncoder(TC).encode_vpy_to_mp4(str(vpy), str(cls.mp4), 30.0)
+        session = build_default_render_session(
+            cls.d / "src-session",
+            source_path=png,
+            source_kind="image",
+            end_frame=10,
+        )
+        encode_render_session(TC, session, cls.mp4)
 
         # 带内容的源:上半红、下半蓝 —— 放大错位会立刻暴露
         marker_png = cls.d / "marker.png"
@@ -58,17 +58,14 @@ class PreviewZoomTests(unittest.TestCase):
         marker[:320, :] = (0, 0, 255)   # BGR 红
         marker[320:, :] = (255, 0, 0)   # BGR 蓝
         cv2.imwrite(str(marker_png), marker)
-        marker_vpy = cls.d / "marker.vpy"
-        marker_vpy.write_text("\n".join([
-            "import vapoursynth as vs", "core = vs.core",
-            f"clip = core.imwri.Read({_quote_vs_string(str(marker_png))})",
-            "clip = clip if clip.format.id == vs.RGB24 else core.resize.Bicubic(clip, format=vs.RGB24)",
-            "clip = core.std.Loop(clip, times=10)",
-            "clip = core.resize.Bicubic(clip, width=384, height=640, format=vs.YUV420P8, matrix_s='170m')",
-            "clip.set_output()",
-        ]) + "\n", encoding="utf-8")
         cls.marker_mp4 = cls.d / "marker.mp4"
-        MediaEncoder(TC).encode_vpy_to_mp4(str(marker_vpy), str(cls.marker_mp4), 30.0)
+        marker_session = build_default_render_session(
+            cls.d / "marker-session",
+            source_path=marker_png,
+            source_kind="image",
+            end_frame=10,
+        )
+        encode_render_session(TC, marker_session, cls.marker_mp4)
 
     @staticmethod
     def _pump_until(condition, timeout=20.0):

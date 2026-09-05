@@ -562,6 +562,7 @@ class WorkerServer:
                 "epoch",
                 "script_path",
                 "job_path",
+                "job_sha256",
                 "bundle_hash",
                 "runtime_fingerprint",
                 "mode",
@@ -587,7 +588,7 @@ class WorkerServer:
                 raise ProtocolError(
                     f"{field} 必须是绝对路径", code="protocol.invalid_request"
                 )
-        for field in ("bundle_hash", "runtime_fingerprint"):
+        for field in ("job_sha256", "bundle_hash", "runtime_fingerprint"):
             value = message[field]
             if (
                 type(value) is not str
@@ -604,6 +605,7 @@ class WorkerServer:
             self.generation_staging,
         )
         try:
+            self._assert_snapshot_job_identity(snapshot, message["job_sha256"])
             actual_bundle = compute_script_bundle_hash(snapshot.script_path)
             if actual_bundle != message["bundle_hash"]:
                 raise ProtocolError(
@@ -623,7 +625,9 @@ class WorkerServer:
             # 后续还会在 VS 与全部执行 helper 就绪后做最终核验。
             self._assert_runtime_unchanged(message["runtime_fingerprint"])
 
+            self._assert_snapshot_job_identity(snapshot, message["job_sha256"])
             job = load_job(snapshot.job_path)
+            self._assert_snapshot_job_identity(snapshot, message["job_sha256"])
             header = parse_script_header(snapshot.script_path)
             comparisons = (
                 ("job.api_version", job["api_version"], api_version),
@@ -648,6 +652,16 @@ class WorkerServer:
         except BaseException:
             snapshot.close()
             raise
+
+    @staticmethod
+    def _assert_snapshot_job_identity(snapshot: Any, expected_sha256: str) -> None:
+        """拒绝同路径替换；worker 只执行 load message 冻结的 job 字节。"""
+        actual_sha256 = hashlib.sha256(snapshot.job_path.read_bytes()).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ProtocolError(
+                "冻结 job 内容在执行前发生变化",
+                code="worker.job_mismatch",
+            )
 
     @staticmethod
     def _close_snapshot(snapshot: Any, error: BaseException) -> bool:
@@ -746,6 +760,26 @@ class WorkerServer:
         except BaseException as error:
             self._close_snapshot(snapshot, error)
             raise
+        # C2: worker 与 VSPipe 都执行 canonical user script；因此不能再靠
+        # 私有代码副本抵御 retirement wait 中的改写。紧挨执行点重算整个
+        # script bundle，发现变化即拒绝这次 load，避免 __file__/资源根分叉。
+        try:
+            from core.vs_runtime.session import compute_script_bundle_hash
+
+            if (
+                compute_script_bundle_hash(script_path)
+                != message["bundle_hash"]
+            ):
+                raise ProtocolError(
+                    "脚本 bundle 在执行前发生变化",
+                    code="worker.bundle_mismatch",
+                )
+        except BaseException as error:
+            self._close_snapshot(snapshot, error)
+            self._send_error(
+                "request_error", request_id, error, epoch=job["epoch"]
+            )
+            return
         try:
             vs = self._ensure_vs()
         except BaseException as error:
@@ -770,6 +804,7 @@ class WorkerServer:
             # _retire_current() 可能等待旧图；_ensure_vs() 会加载受指纹保护
             # 的 pyd/DLL/plugin。用户代码执行前必须重新确认三方身份一致。
             self._assert_runtime_unchanged(message["runtime_fingerprint"])
+            self._assert_snapshot_job_identity(snapshot, message["job_sha256"])
         except ProtocolError as error:
             self._close_snapshot(snapshot, error)
             self._send_error(
@@ -801,6 +836,26 @@ class WorkerServer:
                 "script_error", request_id, error, epoch=job["epoch"]
             )
             if not clean or _has_retirement_failure(error):
+                raise _FatalWorkerExit(FATAL_RETIREMENT_EXIT) from error
+            return
+        try:
+            self._assert_snapshot_job_identity(snapshot, message["job_sha256"])
+        except BaseException as error:
+            try:
+                graph.close()
+            except BaseException as cleanup_error:
+                try:
+                    error.add_note(
+                        "脚本清理阶段另有异常："
+                        f"[{getattr(cleanup_error, 'code', type(cleanup_error).__name__)}]"
+                    )
+                except BaseException:
+                    pass
+            clean = self._close_snapshot(snapshot, error)
+            self._send_error(
+                "request_error", request_id, error, epoch=job["epoch"]
+            )
+            if not clean:
                 raise _FatalWorkerExit(FATAL_RETIREMENT_EXIT) from error
             return
         try:

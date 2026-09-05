@@ -35,6 +35,7 @@ from core.vs_runtime.session import (
     RenderSession,
     ScriptBundleSnapshot,
     ScriptSelection,
+    compute_job_sha256,
     compute_script_bundle_hash,
 )
 from core.vs_runtime.vs_loader import (
@@ -157,6 +158,7 @@ def _session(
             compute_script_bundle_hash(script),
         ),
         job_path=str(job.resolve()),
+        job_sha256=compute_job_sha256(job),
         runtime_fingerprint=compute_runtime_fingerprint(ROOT, runtime),
     )
 
@@ -273,6 +275,29 @@ class VSRuntimeFingerprintTests(unittest.TestCase):
         self.assertNotEqual(
             compute_runtime_fingerprint(self.root, runtime), before
         )
+
+    def test_fingerprint_ignores_generated_pycache_but_tracks_released_pyc(self):
+        """解释器缓存可再生，不是 runtime 发行契约；顶层发布字节码仍是。"""
+        runtime = VSRuntimeConfig()
+        before = compute_runtime_fingerprint(self.root, runtime)
+        cache_dir = self.helper / "__pycache__"
+        generated = cache_dir / "round2_generated.cpython-312.pyc"
+        cache_dir_created = not cache_dir.exists()
+        cache_dir.mkdir(exist_ok=True)
+        try:
+            generated.write_bytes(b"generated-by-interpreter-cache")
+            self.assertEqual(compute_runtime_fingerprint(self.root, runtime), before)
+        finally:
+            generated.unlink(missing_ok=True)
+            if cache_dir_created:
+                cache_dir.rmdir()
+
+        released_pyc = self.helper / "released_helper.pyc"
+        try:
+            released_pyc.write_bytes(b"released-bytecode-v1")
+            self.assertNotEqual(compute_runtime_fingerprint(self.root, runtime), before)
+        finally:
+            released_pyc.unlink(missing_ok=True)
 
     def test_missing_portable_core_file_fails_loudly(self):
         (self.media / "portable.vs").unlink()
@@ -2048,6 +2073,40 @@ class RetirementFailureDetectionTests(unittest.TestCase):
 
 
 class WorkerServerFrameTests(unittest.TestCase):
+    def test_load_binding_keeps_the_canonical_user_script_path(self):
+        """M5/C2: worker 与 VSPipe 必须以同一 ``__file__`` 执行用户脚本。
+
+        job 仍需是 generation staging 中的只读副本；脚本本身不能复制到
+        worker 私有根，否则相对资源和 ``__file__`` 会与 VSPipe 分叉。
+        """
+        from core.vs_runtime.session import (
+            GenerationStagingRoot,
+            ScriptBundleSnapshot,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            script = root / "pipeline.vpy"
+            helper = root / "relative_resource.txt"
+            job = root / "job.json"
+            script.write_text("# canonical script", encoding="utf-8")
+            helper.write_text("same script root", encoding="utf-8")
+            job.write_text("{}", encoding="utf-8")
+            staging = GenerationStagingRoot.create()
+            staging.initialize_marker()
+            self.addCleanup(staging.close)
+
+            binding = ScriptBundleSnapshot.create(script, job, staging)
+
+            self.assertEqual(binding.script_path, script.resolve())
+            self.assertEqual(
+                binding.script_path.with_name("relative_resource.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "same script root",
+            )
+            self.assertNotEqual(binding.job_path, job.resolve())
+
     def _server(self, writer):
         from core.vs_runtime.worker_main import WorkerServer
 
@@ -2072,7 +2131,7 @@ class WorkerServerFrameTests(unittest.TestCase):
             display_clip=None,
         )
 
-    def test_load_uses_bundle_snapshot_frozen_before_retirement_wait(self):
+    def test_load_rejects_canonical_script_change_during_retirement_wait(self):
         from core.vs_runtime.worker_main import WorkerServer
 
         messages = []
@@ -2169,18 +2228,12 @@ class WorkerServerFrameTests(unittest.TestCase):
             ):
                 server._handle_load(session.to_load_message(1))
 
-            self.assertNotEqual(consumed["script_path"], script)
-            self.assertIn("SAFE_SCRIPT", consumed["script"])
-            self.assertNotIn("CHANGED_SCRIPT", consumed["script"])
-            self.assertEqual(consumed["helper"], "VALUE = 'SAFE_HELPER'\n")
-            self.assertNotIn("mutation", consumed["job"])
-            snapshot_root = consumed["script_path"].parent.parent
-            self.assertTrue(snapshot_root.is_dir())
-
-            original_retire(99)
-
-            self.assertFalse(snapshot_root.exists())
-            self.assertEqual(messages[-1]["type"], "metadata")
+            # M5/C2 的资源策略是 canonical script + bundle hash，而非复制
+            # 代码树：退休期间任何脚本/helper 改写都必须在执行用户代码前
+            # 拒绝，不能悄悄让 preview/VSPipe 各跑一份不同的 __file__。
+            self.assertEqual(consumed, {})
+            self.assertEqual(messages[-1]["type"], "request_error")
+            self.assertIn("bundle", messages[-1]["message"])
 
     def test_early_contract_helper_import_failure_closes_load_snapshot(self):
         from core.vs_runtime.session import ScriptBundleSnapshot
@@ -2276,6 +2329,7 @@ class WorkerServerFrameTests(unittest.TestCase):
                 "epoch": 7,
                 "script_path": str(script.resolve()),
                 "job_path": str(job.resolve()),
+                "job_sha256": hashlib.sha256(job.read_bytes()).hexdigest(),
                 "bundle_hash": "c" * 64,
                 "runtime_fingerprint": "b" * 64,
                 "mode": "raw",
@@ -2334,6 +2388,7 @@ class WorkerServerFrameTests(unittest.TestCase):
                 "epoch": 7,
                 "script_path": str(script.resolve()),
                 "job_path": str(job.resolve()),
+                "job_sha256": hashlib.sha256(job.read_bytes()).hexdigest(),
                 "bundle_hash": "c" * 64,
                 "runtime_fingerprint": "a" * 64,
                 "mode": "raw",
@@ -2394,9 +2449,14 @@ class WorkerServerFrameTests(unittest.TestCase):
             "epoch": 7,
             "api_version": 1,
             "mode": "raw",
+            "bundle_hash": "c" * 64,
             "runtime_fingerprint": "a" * 64,
         }
         with (
+            mock.patch(
+                "core.vs_runtime.session.compute_script_bundle_hash",
+                return_value="c" * 64,
+            ),
             mock.patch(
                 "core.vs_runtime.vs_loader.compute_runtime_fingerprint",
                 return_value="b" * 64,

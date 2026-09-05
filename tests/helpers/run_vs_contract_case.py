@@ -14,6 +14,8 @@ import threading
 import types
 from pathlib import Path
 
+from core.vs_runtime.job import RationalFPS
+
 
 ROOT = Path(__file__).resolve().parents[2]
 HELPER_ROOT = ROOT / "resources" / "vapoursynth" / "python"
@@ -1431,24 +1433,38 @@ def _node_metadata(node) -> dict[str, object]:
 
 
 def _run_default_vspipe(job: Path) -> dict[str, object]:
-    from core.media_tools import (
-        MediaToolchain,
-        build_media_subprocess_env,
-    )
+    from config.vs_runtime import load_vs_runtime
+    from core.media_pipeline import VSPipeRenderRequest, build_vspipe_render_env
+    from core.media_tools import MediaToolchain
+    from core.vs_runtime.vs_loader import compute_runtime_fingerprint
 
     toolchain = MediaToolchain.discover(str(ROOT))
+    runtime = load_vs_runtime(ROOT / "config" / "vs_runtime.json")
+    request = VSPipeRenderRequest(
+        runner_path=str(RUNNER),
+        script_path=str(DEFAULT_PIPELINE),
+        job_path=str(job),
+        expected_job_sha256=hashlib.sha256(job.read_bytes()).hexdigest(),
+        api_version=1,
+        mode="compatible",
+        app_dir=str(ROOT),
+        runtime=runtime,
+        runtime_fingerprint=compute_runtime_fingerprint(ROOT, runtime),
+    )
     command = [
         toolchain.vspipe_path,
         "--info",
         "--arg",
-        f"assetmaker_job={job}",
+        f"assetmaker_job={request.job_path}",
         "--arg",
-        f"assetmaker_script={DEFAULT_PIPELINE}",
+        f"expected_job_sha256={request.expected_job_sha256}",
+        "--arg",
+        f"assetmaker_script={request.script_path}",
         "--arg",
         "assetmaker_api=1",
         "--arg",
-        "assetmaker_mode=compatible",
-        str(RUNNER),
+        f"assetmaker_mode={request.mode}",
+        request.runner_path,
         "-",
     ]
     kwargs: dict[str, object] = {
@@ -1459,7 +1475,12 @@ def _run_default_vspipe(job: Path) -> dict[str, object]:
         "errors": "replace",
         "timeout": 60,
         "check": False,
-        "env": build_media_subprocess_env(toolchain.vspipe_path),
+        "env": build_vspipe_render_env(
+            toolchain.vspipe_path,
+            app_dir=request.app_dir,
+            runtime=request.runtime,
+            expected_fingerprint=request.runtime_fingerprint,
+        ),
     }
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -1576,22 +1597,28 @@ def _encode_vspipe_output(
     vspipe_arguments: list[str],
     path: Path,
     *,
-    fps: float,
+    fps: RationalFPS,
     colormatrix: str,
     colorprim: str,
     transfer: str,
+    vspipe_env: dict[str, str] | None = None,
 ) -> None:
     from core.media_pipeline import build_mux_command, build_x264_command
     from core.media_tools import (
         MediaToolchain,
         build_media_subprocess_env,
     )
+    from core.vs_runtime.output_contract import X264Vui
 
     toolchain = MediaToolchain.discover(str(ROOT))
     raw = path.with_suffix(".264")
     popen_kwargs: dict[str, object] = {
         "cwd": ROOT,
-        "env": build_media_subprocess_env(toolchain.vspipe_path),
+        "env": (
+            build_media_subprocess_env(toolchain.vspipe_path)
+            if vspipe_env is None
+            else vspipe_env
+        ),
     }
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -1607,10 +1634,12 @@ def _encode_vspipe_output(
             str(raw),
             crf=10,
             preset="ultrafast",
-            colormatrix=colormatrix,
-            colorprim=colorprim,
-            transfer=transfer,
-            range_="tv",
+            vui=X264Vui(
+                colormatrix=colormatrix,
+                colorprim=colorprim,
+                transfer=transfer,
+                range_="tv",
+            ),
         ),
         stdin=vspipe.stdout,
         stdout=subprocess.DEVNULL,
@@ -1659,7 +1688,7 @@ def _encode_source_script(
     _encode_vspipe_output(
         ["-c", "y4m", str(script), "-"],
         path,
-        fps=30000 / 1001,
+        fps=RationalFPS(30_000, 1_001),
         colormatrix=colormatrix,
         colorprim=colorprim,
         transfer=transfer,
@@ -1667,26 +1696,42 @@ def _encode_source_script(
 
 
 def _encode_default_runner(job: Path, path: Path) -> None:
+    from config.vs_runtime import load_vs_runtime
+    from core.media_pipeline import (
+        VSPipeRenderRequest,
+        build_vspipe_command,
+        build_vspipe_render_env,
+    )
+    from core.media_tools import MediaToolchain
+    from core.vs_runtime.vs_loader import compute_runtime_fingerprint
+
+    toolchain = MediaToolchain.discover(str(ROOT))
+    runtime = load_vs_runtime(ROOT / "config" / "vs_runtime.json")
+    request = VSPipeRenderRequest(
+        runner_path=str(RUNNER),
+        script_path=str(DEFAULT_PIPELINE),
+        job_path=str(job),
+        expected_job_sha256=hashlib.sha256(job.read_bytes()).hexdigest(),
+        api_version=1,
+        mode="compatible",
+        app_dir=str(ROOT),
+        runtime=runtime,
+        runtime_fingerprint=compute_runtime_fingerprint(ROOT, runtime),
+    )
+    command = build_vspipe_command(toolchain.vspipe_path, request)
     _encode_vspipe_output(
-        [
-            "-c",
-            "y4m",
-            "--arg",
-            f"assetmaker_job={job}",
-            "--arg",
-            f"assetmaker_script={DEFAULT_PIPELINE}",
-            "--arg",
-            "assetmaker_api=1",
-            "--arg",
-            "assetmaker_mode=compatible",
-            str(RUNNER),
-            "-",
-        ],
+        command[1:],
         path,
-        fps=30.0,
+        fps=RationalFPS(30, 1),
         colormatrix="smpte170m",
         colorprim="smpte170m",
         transfer="smpte170m",
+        vspipe_env=build_vspipe_render_env(
+            toolchain.vspipe_path,
+            app_dir=request.app_dir,
+            runtime=request.runtime,
+            expected_fingerprint=request.runtime_fingerprint,
+        ),
     )
 
 

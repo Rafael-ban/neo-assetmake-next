@@ -2,6 +2,7 @@
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -127,8 +128,9 @@ class IntroDurationReconcileTests(unittest.TestCase):
         w._update_title = lambda: None
         w.status_bar = type("S", (), {"showMessage": lambda *a: None})()
         w._snapshot_active_timeline_state = lambda: None
-        w.video_preview = object()
-        w.intro_preview = object()
+        w.video_preview = mock.Mock()
+        w.intro_preview = mock.Mock()
+        w.intro_preview.flush_render_job.return_value = object()
         w._collect_arknights_custom_images = lambda: []
 
         def fake_state(preview, path, **k):
@@ -143,7 +145,7 @@ class IntroDurationReconcileTests(unittest.TestCase):
         w._collect_preview_media_state = fake_state
 
         data = MainWindow._collect_export_data(w)
-        self.assertIn("intro_video_params", data)
+        self.assertIn("intro_render_session", data)
         # 60 frames / 30 fps = 2.0s -> 2_000_000 µs, not the stale 5_000_000.
         self.assertEqual(w._config.intro.duration, 2_000_000)
         self.assertTrue(w._is_modified)

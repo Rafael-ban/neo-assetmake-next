@@ -49,22 +49,21 @@ class ParentProcessIsolationTests(IsolatedVSCase):
 
 def _export_image_loop(png_path: Path, out_mp4: Path, *, cropbox, rotation=0,
                        frames=12, resolution="360x640"):
-    from core.export_service import VideoExportParams
-    from core.media_pipeline import MediaEncoder, write_vpy_script
-
-    params = VideoExportParams(
-        video_path=str(png_path),
-        cropbox=cropbox,
-        start_frame=0,
+    from tests.helpers.m5_render_fixture import (
+        build_default_render_session,
+        encode_render_session,
+    )
+    if resolution != "360x640":
+        raise ValueError(f"unsupported test profile: {resolution}")
+    session = build_default_render_session(
+        out_mp4.parent / f"{out_mp4.stem}-session",
+        source_path=png_path,
+        source_kind="image",
         end_frame=frames,
-        fps=30.0,
-        resolution=resolution,
-        is_image=True,
+        crop=cropbox,
         rotation=rotation,
     )
-    vpy = out_mp4.with_suffix(".vpy")
-    write_vpy_script(vpy, params)
-    MediaEncoder(TC).encode_vpy_to_mp4(str(vpy), str(out_mp4), 30.0)
+    encode_render_session(TC, session, out_mp4)
     return out_mp4
 
 

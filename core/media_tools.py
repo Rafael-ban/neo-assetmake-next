@@ -4,25 +4,15 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
-import tempfile
-from functools import lru_cache
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional
 
 from utils.file_utils import get_app_dir
-from config.vsconfig import load_vsconfig
 from config.vs_runtime import load_vs_runtime
 from core.vs_runtime.session import resolve_worker_command
-
-
-# Single source of truth for the required VS plugin set + plugin dir + output
-# format is config/vsconfig.json (via config.vsconfig.VSConfig). This
-# module-level tuple is a backward-compat snapshot for anything still importing
-# it; live reads go through load_vsconfig(). Adding a plugin = edit the JSON.
-REQUIRED_VAPOURSYNTH_PLUGINS = tuple(load_vsconfig().required_plugins)
 
 
 def _exe_names(base_name: str) -> tuple[str, ...]:
@@ -75,101 +65,14 @@ def _prepend_env_value(env: dict[str, str], name: str, value: Path) -> None:
 
 
 def build_media_subprocess_env(tool_path: str) -> dict[str, str]:
-    """Build an environment suitable for bundled media subprocesses."""
+    """为 x264/muxer 构建媒体工具环境，不承担 VSPipe runtime 配置。"""
     env = os.environ.copy()
     resolved = _resolve_tool_path(tool_path)
     media_dir = resolved.parent if resolved else Path(get_app_dir()) / "tools" / "media"
 
     _prepend_env_value(env, "PATH", media_dir)
     _prepend_env_value(env, "PYTHONPATH", media_dir / "Lib" / "site-packages")
-    # Plugin autoload dir(s) come from VSConfig (default ("vs-plugins",) → env
-    # byte-identical). PATH/PYTHONPATH locate the tool + bundled Python runtime
-    # (discovery), so they stay here, not in VSConfig.
-    for plugin_dir in load_vsconfig().extra_plugin_dirs:
-        _prepend_env_value(
-            env, "VAPOURSYNTH_EXTRA_PLUGIN_PATH", media_dir / plugin_dir
-        )
     return env
-
-
-def _plugin_probe_script(cfg) -> str:
-    """Build the VSPipe probe script that verifies the required plugins load.
-
-    hasattr(core, name) is the correct presence probe: VS R73 exposes each
-    plugin as a namespace property on Core (vapoursynth-stubs/__init__.pyi
-    :1505-1534). Required set + output format come from VSConfig (single SoT).
-    """
-    return "\n".join(
-        [
-            "import vapoursynth as vs",
-            "core = vs.core",
-            f"required = {tuple(cfg.required_plugins)!r}",
-            "missing = [name for name in required if not hasattr(core, name)]",
-            "if missing:",
-            "    raise RuntimeError(",
-            "        'missing VapourSynth plugin namespace(s): '",
-            "        + ', '.join(missing)",
-            "    )",
-            "clip = core.std.BlankClip(",
-            f"    width=16, height=16, length=1, format=vs.{cfg.output_format}",
-            ")",
-            "clip.set_output()",
-            "",
-        ]
-    )
-
-
-@lru_cache(maxsize=16)
-def _missing_vapoursynth_plugins(vspipe_path: str) -> tuple[str, ...]:
-    resolved = _resolve_tool_path(vspipe_path)
-    if resolved is None:
-        return ()
-
-    cfg = load_vsconfig()
-    script_path = None
-    script = _plugin_probe_script(cfg)
-
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            suffix=".vpy",
-            delete=False,
-        ) as handle:
-            script_path = handle.name
-            handle.write(script)
-
-        run_kwargs = {
-            "capture_output": True,
-            "text": True,
-            "timeout": 10,
-            "env": build_media_subprocess_env(str(resolved)),
-        }
-        if sys.platform == "win32":
-            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-        result = subprocess.run(
-            [str(resolved), "--info", script_path, "-"],
-            **run_kwargs,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return (f"VapourSynth plugin check failed: {exc}",)
-    finally:
-        if script_path:
-            try:
-                os.remove(script_path)
-            except OSError:
-                pass
-
-    if result.returncode == 0:
-        return ()
-
-    output = f"{result.stdout}\n{result.stderr}"
-    missing = [name for name in cfg.required_plugins if name in output]
-    if not missing:
-        details = output.strip().splitlines()
-        tail = details[-1] if details else f"VSPipe exited {result.returncode}"
-        return (f"VapourSynth plugin check failed: {tail}",)
-    return tuple(f"VapourSynth plugin {name}" for name in missing)
 
 
 @dataclass(frozen=True)
@@ -190,10 +93,8 @@ class MediaToolchain:
 
     @staticmethod
     def refresh() -> None:
-        """Clear the discovery + VapourSynth-plugin + VSConfig caches (e.g. after install)."""
+        """清理媒体可执行文件发现缓存（例如运行时安装工具后）。"""
         _discover_cached.cache_clear()
-        _missing_vapoursynth_plugins.cache_clear()
-        load_vsconfig.cache_clear()
 
     def missing_for_export(self) -> list[str]:
         missing = []
@@ -203,8 +104,6 @@ class MediaToolchain:
             missing.append("x264-7mod")
         if not self.muxer_path:
             missing.append("MP4Box or lsmash-muxer")
-        if self.vspipe_path:
-            missing.extend(_missing_vapoursynth_plugins(self.vspipe_path))
         return missing
 
     def missing_for_preview(self) -> list[str]:

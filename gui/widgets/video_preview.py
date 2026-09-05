@@ -59,6 +59,7 @@ from core.vs_runtime.session import (
     RenderSession,
     ScriptSelection,
     SessionMetadata,
+    compute_job_sha256,
     compute_script_bundle_hash,
 )
 from core.vs_runtime.vs_loader import compute_runtime_fingerprint
@@ -480,6 +481,7 @@ class VideoPreviewWidget(QWidget):
             track=context.track,
             selection=context.selection,
             job_path=str(job_path),
+            job_sha256=compute_job_sha256(job_path),
             runtime_fingerprint=_runtime_fingerprint_for_app(
                 str(Path(get_app_dir()).resolve())
             ),

@@ -1,10 +1,42 @@
 import os
+import io
+import subprocess
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
 from core.export_service import VideoExportParams
+
+
+def _render_request():
+    from config.vs_runtime import VSRuntimeConfig
+    from core.media_pipeline import VSPipeRenderRequest
+
+    return VSPipeRenderRequest(
+        runner_path="runner.vpy",
+        script_path="script.vpy",
+        job_path="job.json",
+        expected_job_sha256="b" * 64,
+        api_version=1,
+        mode="compatible",
+        app_dir="D:/AssetMaker",
+        runtime=VSRuntimeConfig(),
+        runtime_fingerprint="a" * 64,
+    )
+
+
+def _vui():
+    from core.vs_runtime.output_contract import X264Vui
+
+    return X264Vui(
+        colormatrix="smpte170m",
+        colorprim="smpte170m",
+        transfer="smpte170m",
+        range_="tv",
+    )
 
 
 class MediaToolchainTests(unittest.TestCase):
@@ -29,13 +61,61 @@ class MediaToolchainTests(unittest.TestCase):
         self.assertNotIn("ffprobe", toolchain.describe().lower())
 
     def test_encoder_commands_use_vspipe_y4m_and_x264_stdin(self):
-        from core.media_pipeline import build_vspipe_command, build_x264_command
+        from config.vs_runtime import VSRuntimeConfig
+        from core.media_pipeline import (
+            VSPipeRenderRequest,
+            build_vspipe_command,
+            build_x264_command,
+        )
+        from core.vs_runtime.output_contract import X264Vui
 
-        vspipe = build_vspipe_command("VSPipe.exe", "script.vpy")
-        x264 = build_x264_command("x264-7mod.exe", "out.mp4", crf=26, preset="veryslow")
+        request = VSPipeRenderRequest(
+            runner_path="runner.vpy",
+            script_path="script.vpy",
+            job_path="job.json",
+            expected_job_sha256="b" * 64,
+            api_version=1,
+            mode="compatible",
+            app_dir="D:/AssetMaker",
+            runtime=VSRuntimeConfig(),
+            runtime_fingerprint="a" * 64,
+        )
+        vspipe = build_vspipe_command("VSPipe.exe", request)
+        x264 = build_x264_command(
+            "x264-7mod.exe",
+            "out.mp4",
+            crf=26,
+            preset="veryslow",
+            vui=X264Vui(
+                colormatrix="smpte170m",
+                colorprim="smpte170m",
+                transfer="smpte170m",
+                range_="tv",
+            ),
+        )
 
         # -p enables VSPipe per-frame progress on stderr (drives the dialog).
-        self.assertEqual(vspipe, ["VSPipe.exe", "-c", "y4m", "-p", "script.vpy", "-"])
+        self.assertEqual(
+            vspipe,
+            [
+                "VSPipe.exe",
+                "-c",
+                "y4m",
+                "-p",
+                "--arg",
+                "assetmaker_job=job.json",
+                "--arg",
+                "expected_job_sha256=" + "b" * 64,
+                "--arg",
+                "assetmaker_script=script.vpy",
+                "--arg",
+                "assetmaker_api=1",
+                "--arg",
+                "assetmaker_mode=compatible",
+                "runner.vpy",
+                "-",
+            ],
+        )
         self.assertIn("--demuxer", x264)
         self.assertIn("y4m", x264)
         self.assertIn("--output", x264)
@@ -51,8 +131,18 @@ class MediaToolchainTests(unittest.TestCase):
         # decoded as BT.601 by convention (H.273), so the pipeline must tag what
         # it actually converted to.
         from core.media_pipeline import build_x264_command
+        from core.vs_runtime.output_contract import X264Vui
 
-        x264 = build_x264_command("x264-7mod.exe", "out.264")
+        x264 = build_x264_command(
+            "x264-7mod.exe",
+            "out.264",
+            vui=X264Vui(
+                colormatrix="smpte170m",
+                colorprim="smpte170m",
+                transfer="smpte170m",
+                range_="tv",
+            ),
+        )
         for flag, value in (
             ("--colormatrix", "smpte170m"),
             ("--colorprim", "smpte170m"),
@@ -86,56 +176,118 @@ class MediaToolchainTests(unittest.TestCase):
 
         self.assertEqual(["MP4Box or lsmash-muxer"], toolchain.missing_for_export())
 
-    def test_export_requires_vapoursynth_source_plugins(self):
+    def test_export_eligibility_checks_only_the_three_executables(self):
         from core import media_tools
         from core.media_tools import MediaToolchain
 
-        toolchain = MediaToolchain(
-            vspipe_path="VSPipe.exe",
-            x264_path="x264-7mod.exe",
-            muxer_path="MP4Box.exe",
-        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            vspipe = Path(temp_dir) / "VSPipe.exe"
+            vspipe.touch()
+            toolchain = MediaToolchain(
+                vspipe_path=str(vspipe),
+                x264_path="x264-7mod.exe",
+                muxer_path="MP4Box.exe",
+            )
 
-        with mock.patch.object(
-            media_tools,
-            "_missing_vapoursynth_plugins",
-            return_value=("VapourSynth plugin lsmas", "VapourSynth plugin imwri"),
-        ):
-            missing = toolchain.missing_for_export()
+            # M5/C1: 插件和脚本 callable 的资格只由同一 frozen RenderSession 的
+            # worker preflight + runner contract 判断；export gate 不得重新读取
+            # legacy vsconfig，也不得为 VSPipe 调用 legacy subprocess env。
+            with mock.patch(
+                "config.vsconfig.load_vsconfig",
+                side_effect=AssertionError("legacy VSConfig must not be read"),
+            ), mock.patch.object(
+                media_tools,
+                "build_media_subprocess_env",
+                side_effect=AssertionError("legacy VSPipe env must not be built"),
+            ):
+                missing = toolchain.missing_for_export()
 
-        self.assertEqual(
-            ["VapourSynth plugin lsmas", "VapourSynth plugin imwri"],
-            missing,
+        self.assertEqual([], missing)
+
+    def test_export_eligibility_reports_each_missing_executable(self):
+        from core.media_tools import MediaToolchain
+
+        cases = (
+            (MediaToolchain(), ["VSPipe", "x264-7mod", "MP4Box or lsmash-muxer"]),
+            (
+                MediaToolchain(vspipe_path="VSPipe.exe", muxer_path="MP4Box.exe"),
+                ["x264-7mod"],
+            ),
+            (
+                MediaToolchain(vspipe_path="VSPipe.exe", x264_path="x264-7mod.exe"),
+                ["MP4Box or lsmash-muxer"],
+            ),
         )
+        for toolchain, expected in cases:
+            with self.subTest(toolchain=toolchain):
+                self.assertEqual(toolchain.missing_for_export(), expected)
 
     def test_muxer_commands_use_rational_fps(self):
-        # A probed 29.97 float is really 30000/1001 (NTSC). Re-stamping the
-        # muxer with the lossy float made every frame duration slightly wrong;
         # MP4Box accepts "num/den" (mp4box -h import: "-fps ... as TS/inc").
+        # The muxer boundary accepts only the frozen job ratio, never a float
+        # captured from metadata and reconstructed heuristically later.
         from core.media_pipeline import (
             build_lsmash_mux_command,
             build_mp4box_mux_command,
-            _fps_to_fraction,
         )
+        from core.vs_runtime.job import RationalFPS
 
         self.assertEqual(
-            build_mp4box_mux_command("MP4Box.exe", "video.264", "out.mp4", 29.97),
+            build_mp4box_mux_command(
+                "MP4Box.exe", "video.264", "out.mp4", RationalFPS(30_000, 1_001)
+            ),
             ["MP4Box.exe", "-add", "video.264:fps=30000/1001", "-new", "out.mp4"],
         )
         # Whole rates stay bare integers, not "30/1".
         self.assertEqual(
             build_lsmash_mux_command(
-                "lsmash-muxer.exe", "video.264", "out.mp4", 30.0
+                "lsmash-muxer.exe", "video.264", "out.mp4", RationalFPS(30, 1)
             ),
             ["lsmash-muxer.exe", "-i", "video.264", "--fps", "30", "-o", "out.mp4"],
         )
-        self.assertEqual(_fps_to_fraction(23.976).as_integer_ratio(), (24000, 1001))
-        self.assertEqual(_fps_to_fraction(59.94).as_integer_ratio(), (60000, 1001))
+
+    def test_muxer_commands_preserve_non_common_rational_fps_exactly(self):
+        """Muxer must receive the frozen job ratio, never a float reconstruction."""
+        from core.media_pipeline import build_mux_command
+        from core.vs_runtime.job import RationalFPS
+
+        fps = RationalFPS(123_457, 4_003)
+        expected = {
+            "MP4Box.exe": [
+                "MP4Box.exe",
+                "-add",
+                "video.264:fps=123457/4003",
+                "-new",
+                "out.mp4",
+            ],
+            "lsmash-muxer.exe": [
+                "lsmash-muxer.exe",
+                "-i",
+                "video.264",
+                "--fps",
+                "123457/4003",
+                "-o",
+                "out.mp4",
+            ],
+        }
+
+        for muxer_path, command in expected.items():
+            with self.subTest(muxer_path=muxer_path):
+                try:
+                    actual = build_mux_command(
+                        muxer_path, "video.264", "out.mp4", fps
+                    )
+                except TypeError as exc:
+                    self.fail(
+                        "mux command must accept RationalFPS without converting it "
+                        f"to float: {exc}"
+                    )
+                self.assertEqual(actual, command)
 
 
 class VapourSynthScriptTests(unittest.TestCase):
     def test_writes_video_script_with_trim_crop_resize_and_padding(self):
-        from core.media_pipeline import write_vpy_script
+        from core.vs_script import write_vpy_script
 
         params = VideoExportParams(
             video_path=r"C:\media\loop.mp4",
@@ -165,7 +317,7 @@ class VapourSynthScriptTests(unittest.TestCase):
         self.assertNotIn("ffmpeg", script.lower())
 
     def test_video_script_never_emits_empty_trim(self):
-        from core.media_pipeline import write_vpy_script
+        from core.vs_script import write_vpy_script
 
         params = VideoExportParams(
             video_path=r"C:\media\loop.mp4",
@@ -183,7 +335,7 @@ class VapourSynthScriptTests(unittest.TestCase):
         self.assertIn("clip = clip[5:6]", script)
 
     def test_writes_image_loop_script(self):
-        from core.media_pipeline import write_vpy_script
+        from core.vs_script import write_vpy_script
 
         params = VideoExportParams(
             video_path=r"C:\media\logo.png",
@@ -214,7 +366,7 @@ class VapourSynthScriptTests(unittest.TestCase):
     def test_image_loop_script_applies_crop_and_rotation(self):
         # The crop/rotation blocks used to live only in the video branch, so an
         # image loop silently ignored the user's framing. They are shared now.
-        from core.media_pipeline import write_vpy_script
+        from core.vs_script import write_vpy_script
 
         params = VideoExportParams(
             video_path=r"C:\media\bg.png",
@@ -239,8 +391,165 @@ class VapourSynthScriptTests(unittest.TestCase):
 
 
 class EncoderRunTests(unittest.TestCase):
+    def test_muxer_failure_decodes_utf8_and_invalid_stderr_without_reader_thread_error(self):
+        """muxer 非零退出必须保留 UTF-8 原因，不能由 Windows locale 覆盖。"""
+        from core.media_pipeline import MediaEncoder, MediaToolchain
+
+        toolchain = MediaToolchain(
+            vspipe_path="VSPipe.exe",
+            x264_path="x264-7mod.exe",
+            muxer_path="MP4Box.exe",
+        )
+        encoder = MediaEncoder(toolchain)
+        stderr = io.StringIO()
+        program = (
+            "import sys; "
+            "sys.stderr.buffer.write('编码失败：中文'.encode('utf-8') + b'\\xff'); "
+            "raise SystemExit(7)"
+        )
+
+        with redirect_stderr(stderr), mock.patch(
+            "core.media_pipeline.build_mux_command",
+            return_value=[sys.executable, "-c", program],
+        ), self.assertRaisesRegex(RuntimeError, "MP4 muxer failed: 编码失败：中文\\ufffd"):
+            from core.vs_runtime.job import RationalFPS
+
+            encoder._run_muxer("input.264", "output.mp4", RationalFPS(30, 1))
+
+        self.assertNotIn("UnicodeDecodeError", stderr.getvalue())
+
+    def test_x264_start_failure_releases_registered_vspipe_and_its_pipes(self):
+        """A failed x264 launch must not orphan the already-started VSPipe."""
+        from core.media_pipeline import MediaEncoder, MediaToolchain
+
+        class FakePipe:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class FakeVSPipe:
+            def __init__(self):
+                self.stdout = FakePipe()
+                self.stderr = FakePipe()
+                self.returncode = None
+                self.terminate_calls = 0
+                self.wait_timeouts = []
+                self.kill_calls = 0
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminate_calls += 1
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                self.returncode = -15
+                return self.returncode
+
+            def kill(self):
+                self.kill_calls += 1
+                self.returncode = -9
+
+        vspipe = FakeVSPipe()
+        launches = 0
+
+        def fake_popen(cmd, **kwargs):
+            nonlocal launches
+            launches += 1
+            if launches == 1:
+                return vspipe
+            raise OSError("x264 launch failed")
+
+        encoder = MediaEncoder(
+            MediaToolchain(
+                vspipe_path="VSPipe.exe",
+                x264_path="x264-7mod.exe",
+                muxer_path="MP4Box.exe",
+            )
+        )
+
+        with mock.patch("core.media_pipeline.subprocess.Popen", fake_popen), mock.patch(
+            "core.media_pipeline.build_vspipe_render_env", return_value={}
+        ), self.assertRaisesRegex(OSError, "x264 launch failed"):
+            encoder._run_encode_pipeline(_render_request(), "out.tmp.264", _vui())
+
+        self.assertEqual(launches, 2)
+        self.assertEqual(vspipe.terminate_calls, 1)
+        self.assertEqual(vspipe.wait_timeouts, [2])
+        self.assertEqual(vspipe.kill_calls, 0)
+        self.assertTrue(vspipe.stdout.closed)
+        self.assertTrue(vspipe.stderr.closed)
+        self.assertEqual(encoder.active_processes, [])
+
+    def test_x264_start_failure_survives_vspipe_poll_cleanup_error(self):
+        """Cleanup must not replace x264's launch error when VSPipe poll fails."""
+        from core.media_pipeline import MediaEncoder, MediaToolchain
+
+        class FakePipe:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class FakeVSPipe:
+            def __init__(self):
+                self.stdout = FakePipe()
+                self.stderr = FakePipe()
+                self.terminate_calls = 0
+                self.wait_timeouts = []
+                self.kill_calls = 0
+
+            def poll(self):
+                raise RuntimeError("cleanup poll failed")
+
+            def terminate(self):
+                self.terminate_calls += 1
+
+            def wait(self, timeout=None):
+                self.wait_timeouts.append(timeout)
+                raise subprocess.TimeoutExpired("VSPipe.exe", timeout)
+
+            def kill(self):
+                self.kill_calls += 1
+
+        vspipe = FakeVSPipe()
+        launches = 0
+
+        def fake_popen(cmd, **kwargs):
+            nonlocal launches
+            launches += 1
+            if launches == 1:
+                return vspipe
+            raise OSError("x264 launch failed")
+
+        encoder = MediaEncoder(
+            MediaToolchain(
+                vspipe_path="VSPipe.exe",
+                x264_path="x264-7mod.exe",
+                muxer_path="MP4Box.exe",
+            )
+        )
+
+        with mock.patch("core.media_pipeline.subprocess.Popen", fake_popen), mock.patch(
+            "core.media_pipeline.build_vspipe_render_env", return_value={}
+        ), self.assertRaisesRegex(OSError, "x264 launch failed"):
+            encoder._run_encode_pipeline(_render_request(), "out.tmp.264", _vui())
+
+        self.assertEqual(launches, 2)
+        self.assertEqual(vspipe.terminate_calls, 1)
+        self.assertEqual(vspipe.wait_timeouts, [2])
+        self.assertEqual(vspipe.kill_calls, 1)
+        self.assertTrue(vspipe.stdout.closed)
+        self.assertTrue(vspipe.stderr.closed)
+        self.assertEqual(encoder.active_processes, [])
+
     def test_run_encoder_terminates_pipeline_on_cancellation(self):
         from core.media_pipeline import MediaEncoder, MediaToolchain
+        from core.vs_runtime.job import RationalFPS
 
         toolchain = MediaToolchain(
             vspipe_path="VSPipe.exe",
@@ -251,12 +560,19 @@ class EncoderRunTests(unittest.TestCase):
         cancelled = mock.Mock(return_value=True)
 
         with self.assertRaises(InterruptedError):
-            encoder.encode_vpy_to_mp4("script.vpy", "out.mp4", 30.0, is_cancelled=cancelled)
+            encoder.encode_vpy_to_mp4(
+                _render_request(),
+                "out.mp4",
+                RationalFPS(30, 1),
+                vui=_vui(),
+                is_cancelled=cancelled,
+            )
 
         self.assertEqual(encoder.active_processes, [])
 
     def test_encoder_uses_external_muxer_without_trying_x264_mp4_output(self):
         from core.media_pipeline import MediaEncoder, MediaToolchain
+        from core.vs_runtime.job import RationalFPS
 
         class FakePipe:
             def close(self):
@@ -272,7 +588,7 @@ class EncoderRunTests(unittest.TestCase):
                 self.returncode = 0
                 self.stderr_bytes = b""
                 FakePopen.calls.append(cmd)
-                if cmd[0] == "x264-7mod.exe":
+                if Path(cmd[0]).name == "x264-7mod.exe":
                     output_path = cmd[cmd.index("--output") + 1]
                     if output_path.endswith(".mp4"):
                         raise AssertionError("x264 must not write MP4 directly")
@@ -310,15 +626,22 @@ class EncoderRunTests(unittest.TestCase):
             encoder = MediaEncoder(toolchain)
 
             with mock.patch("core.media_pipeline.subprocess.Popen", FakePopen):
-                with mock.patch("core.media_pipeline.subprocess.run", fake_run):
-                    encoder.encode_vpy_to_mp4("script.vpy", str(output_path), 30.0)
+                with mock.patch("core.media_pipeline.subprocess.run", fake_run), mock.patch(
+                    "core.media_pipeline.build_vspipe_render_env", return_value={}
+                ):
+                    encoder.encode_vpy_to_mp4(
+                        _render_request(),
+                        str(output_path),
+                        RationalFPS(30, 1),
+                        vui=_vui(),
+                    )
 
             self.assertTrue(output_path.exists())
 
         x264_outputs = [
             call[call.index("--output") + 1]
             for call in FakePopen.calls
-            if call[0] == "x264-7mod.exe"
+            if Path(call[0]).name == "x264-7mod.exe"
         ]
         self.assertEqual(1, len(x264_outputs))
         self.assertTrue(x264_outputs[0].endswith(".tmp.264"))
@@ -329,6 +652,7 @@ class EncoderRunTests(unittest.TestCase):
 
     def test_vspipe_failure_includes_stderr_details(self):
         from core.media_pipeline import MediaEncoder, MediaToolchain
+        from core.vs_runtime.job import RationalFPS
 
         class FakePipe:
             def close(self):
@@ -343,7 +667,7 @@ class EncoderRunTests(unittest.TestCase):
                 self.kwargs = kwargs
                 self.stdout = FakePipe()
                 self.stderr = FakePipe()
-                self.returncode = 1 if cmd[0] == "VSPipe.exe" else 0
+                self.returncode = 1 if Path(cmd[0]).name == "VSPipe.exe" else 0
 
             def poll(self):
                 return self.returncode
@@ -368,8 +692,15 @@ class EncoderRunTests(unittest.TestCase):
         encoder = MediaEncoder(toolchain)
 
         with mock.patch("core.media_pipeline.subprocess.Popen", FakePopen):
-            with self.assertRaisesRegex(RuntimeError, "missing lsmas plugin"):
-                encoder.encode_vpy_to_mp4("script.vpy", "out.mp4", 30.0)
+            with mock.patch(
+                "core.media_pipeline.build_vspipe_render_env", return_value={}
+            ), self.assertRaisesRegex(RuntimeError, "missing lsmas plugin"):
+                encoder.encode_vpy_to_mp4(
+                    _render_request(),
+                    "out.mp4",
+                    RationalFPS(30, 1),
+                    vui=_vui(),
+                )
 
 
 if __name__ == "__main__":

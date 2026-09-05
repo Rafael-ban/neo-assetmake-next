@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import json
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -21,6 +23,7 @@ from tests.qt_harness import ensure_app
 
 
 REPO = Path(__file__).resolve().parents[1]
+M5_CHILD_PROBE = REPO / "tests" / "helpers" / "run_m5_render_case.py"
 TOOLCHAIN = MediaToolchain.discover(str(REPO))
 VS_OK = (
     (REPO / "tools" / "media" / "vapoursynth.pyd").is_file()
@@ -82,10 +85,26 @@ class PreviewWidgetStateTests(IsolatedVSCase):
     VS_OK and ENCODE_OK, "VapourSynth / encode toolchain unavailable"
 )
 class PreviewMatchesEncodedOutputTests(IsolatedVSCase):
-    def test_display_graph_matches_encoded_output(self):
-        self.assertEqual(
-            self.run_vs_child("preview_export_contract")["status"], "ok"
+    def test_worker_final_bgr_matches_fixed_runner_encoded_output(self):
+        """同一 RenderSession 的 worker final 与 production runner 编码只容许有界色差。"""
+        self.assert_parent_has_no_vs()
+        completed = subprocess.run(
+            [sys.executable, str(M5_CHILD_PROBE), "preview_export_contract"],
+            cwd=str(REPO),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+            check=False,
         )
+        detail = (
+            f"M5 child failed (exit {completed.returncode})\n"
+            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+        )
+        self.assertEqual(completed.returncode, 0, detail)
+        self.assertEqual(json.loads(completed.stdout.splitlines()[-1])["status"], "ok")
+        self.assert_parent_has_no_vs()
 
 
 if __name__ == "__main__":

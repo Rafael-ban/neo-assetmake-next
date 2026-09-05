@@ -136,6 +136,7 @@ class MediaPackagingTests(unittest.TestCase):
                         "executor.py",
                         "contract.py",
                         "display.py",
+                        "runtime_fingerprint.py",
                     )
                 ],
             ],
@@ -149,13 +150,18 @@ class MediaPackagingTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            for relative in VS_WORKER_SUPPORT_FILES[:-1]:
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("# test", encoding="utf-8")
+            for index, missing_relative in enumerate(VS_WORKER_SUPPORT_FILES):
+                case_root = root / str(index)
+                for relative in VS_WORKER_SUPPORT_FILES:
+                    if relative == missing_relative:
+                        continue
+                    path = case_root / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("# test", encoding="utf-8")
 
-            with self.assertRaisesRegex(FileNotFoundError, "display.py"):
-                _collect_vs_worker_support_files(root)
+                with self.assertRaises(FileNotFoundError) as raised:
+                    _collect_vs_worker_support_files(case_root)
+                self.assertIn(Path(missing_relative).name, str(raised.exception))
 
     def test_ci_extracts_media_before_tests_and_self_tests_frozen_worker(self):
         workflow = Path(".github/workflows/build-app.yml").read_text(
@@ -177,6 +183,7 @@ class MediaPackagingTests(unittest.TestCase):
             "ArknightsPassMaker/tools/media/vs-plugins/libimwri.dll",
             "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/job_api.py",
             "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/display.py",
+            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/runtime_fingerprint.py",
         ):
             with self.subTest(artifact=artifact):
                 self.assertIn(artifact, workflow)

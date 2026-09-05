@@ -1,4 +1,5 @@
 import json
+import hashlib
 import io
 import struct
 import sys
@@ -320,6 +321,7 @@ class VSWorkerSessionWireTests(unittest.TestCase):
             track="loop",
             selection=selection,
             job_path=str(script),
+            job_sha256=hashlib.sha256(script.read_bytes()).hexdigest(),
             runtime_fingerprint="b" * 64,
         )
 
@@ -333,6 +335,7 @@ class VSWorkerSessionWireTests(unittest.TestCase):
                 "epoch": 7,
                 "script_path": str(script),
                 "job_path": str(script),
+                "job_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
                 "bundle_hash": "a" * 64,
                 "runtime_fingerprint": "b" * 64,
                 "mode": "compatible",
@@ -346,9 +349,10 @@ class VSWorkerSessionWireTests(unittest.TestCase):
             ScriptSelection.from_header(script, header, "not-a-sha256")
         selection = ScriptSelection.from_header(script, header, "a" * 64)
         for kwargs in (
-            {"epoch": True, "track": "loop", "runtime_fingerprint": "b" * 64},
-            {"epoch": 1, "track": "bad", "runtime_fingerprint": "b" * 64},
-            {"epoch": 1, "track": "loop", "runtime_fingerprint": "bad"},
+            {"epoch": True, "track": "loop", "job_sha256": "c" * 64, "runtime_fingerprint": "b" * 64},
+            {"epoch": 1, "track": "bad", "job_sha256": "c" * 64, "runtime_fingerprint": "b" * 64},
+            {"epoch": 1, "track": "loop", "job_sha256": "c" * 64, "runtime_fingerprint": "bad"},
+            {"epoch": 1, "track": "loop", "job_sha256": "bad", "runtime_fingerprint": "b" * 64},
         ):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValueError):

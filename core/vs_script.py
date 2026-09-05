@@ -12,9 +12,9 @@ the plugin dirs (VS R73: tools/media/vapoursynth-stubs/__init__.pyi Core
 properties ~:1505-1534; ``core.std.LoadPlugin`` exists at ~:1116 but is never
 called), so the emitted script contains no explicit load lines.
 
-``core/media_pipeline.py`` re-exports ``write_vpy_script`` / ``_quote_vs_string``
-/ ``_vs_path`` from here for backward compatibility (production callers and
-tests import them from ``core.media_pipeline``).
+M5 起，生产导出通过固定 runner 消费冻结的用户脚本与 job。为 M7 的
+兼容性迁移保留，``core.media_pipeline`` 暂时 re-export 本模块的 writer，
+但 M5 的 ExportWorker/MainWindow 生产调用点不得使用它。
 """
 from __future__ import annotations
 

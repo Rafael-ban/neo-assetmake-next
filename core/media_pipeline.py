@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -9,28 +10,138 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from fractions import Fraction
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Literal, Optional
 
+from config.vs_runtime import VSRuntimeConfig
 from core.media_tools import MediaToolchain, build_media_subprocess_env
 from core.video_processor import X264_CLI_ARGS
-# VS script authoring lives in core.vs_script now; re-exported here so the two
-# production callers and the test suite keep importing them from core.media_pipeline.
-from core.vs_script import write_vpy_script, _quote_vs_string, _vs_path
+from core.vs_runtime.output_contract import X264Vui
+from core.vs_runtime.job import RationalFPS
+from resources.vapoursynth.python.assetmaker_vs.runtime_fingerprint import (
+    RUNTIME_MEDIA_ROOT_ENV,
+    canonical_runtime_json_bytes,
+)
+# M5 禁止生产调用点使用旧 writer；兼容 re-export 留至 M7 移除，供历史
+# 夹具与兼容性测试使用，不能作为 ExportWorker/MainWindow 的新入口。
+from core.vs_script import write_vpy_script
 
 # VSPipe -p prints "Frame: <done>/<total>" lines (\r-refreshed) to stderr.
 _VSPIPE_PROGRESS_RE = re.compile(rb"Frame:\s*(\d+)\s*/\s*(\d+)")
 
 
-def build_vspipe_command(vspipe_path: str, script_path: str) -> list[str]:
+@dataclass(frozen=True)
+class VSPipeRenderRequest:
+    """固定 runner 执行一次已冻结用户脚本的参数数组。"""
+
+    runner_path: str
+    script_path: str
+    job_path: str
+    expected_job_sha256: str
+    api_version: int
+    mode: Literal["compatible", "raw"]
+    app_dir: str
+    runtime: VSRuntimeConfig
+    runtime_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if type(self.api_version) is not int or self.api_version != 1:
+            raise ValueError("api_version 必须是严格整数 1")
+        if self.mode not in ("compatible", "raw"):
+            raise ValueError("mode 必须是 compatible/raw")
+        if not isinstance(self.runtime, VSRuntimeConfig):
+            raise TypeError("runtime 必须是 VSRuntimeConfig")
+        for field in ("expected_job_sha256", "runtime_fingerprint"):
+            value = getattr(self, field)
+            if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"{field} 必须是小写 SHA-256")
+
+
+def _prepend_env_path(env: dict[str, str], name: str, value: Path) -> None:
+    if not value.exists():
+        return
+    current = env.get(name, "")
+    env[name] = str(value) + (os.pathsep + current if current else "")
+
+
+def build_vspipe_render_env(
+    vspipe_path: str,
+    *,
+    app_dir: str,
+    runtime: VSRuntimeConfig,
+    expected_fingerprint: str,
+) -> dict[str, str]:
+    """构建唯一由冻结 VSRuntimeConfig 派生的 VSPipe 环境。
+
+    不能复用 legacy ``build_media_subprocess_env``：它服务 x264/muxer 的
+    PATH/PYTHONPATH，不能表达 VSPipe 的 frozen runtime 身份。
+    """
+    if not isinstance(runtime, VSRuntimeConfig):
+        raise TypeError("runtime 必须是 VSRuntimeConfig")
+    if len(expected_fingerprint) != 64:
+        raise ValueError("expected_fingerprint 必须是 SHA-256")
+    env = os.environ.copy()
+    root = Path(app_dir).resolve()
+    media_dir = root / "tools" / "media"
+    expected_vspipe = media_dir / "VSPipe.exe"
+    actual_vspipe = Path(vspipe_path).resolve()
+    if actual_vspipe != expected_vspipe.resolve():
+        raise ValueError(
+            "VSPipe 必须是 app_dir/tools/media/VSPipe.exe，"
+            f"实际为: {actual_vspipe}"
+        )
+    _prepend_env_path(env, "PATH", media_dir)
+    _prepend_env_path(env, "PYTHONPATH", media_dir / "Lib" / "site-packages")
+    native_dirs = [str(Path(path)) for path in runtime.plugins.native_plugin_dirs]
+    python_dirs = [str(Path(path)) for path in runtime.plugins.python_module_dirs]
+    env["VAPOURSYNTH_EXTRA_PLUGIN_PATH"] = os.pathsep.join(native_dirs)
+    env["ASSETMAKER_VS_PYTHON_DIRS_JSON"] = json.dumps(
+        python_dirs, ensure_ascii=False, separators=(",", ":")
+    )
+    env["ASSETMAKER_VS_APP_DIR"] = str(root)
+    env["ASSETMAKER_VS_RUNTIME_CONFIG_JSON"] = canonical_runtime_json_bytes(
+        runtime.to_dict()
+    ).decode("utf-8")
+    env["ASSETMAKER_VS_RUNTIME_FINGERPRINT"] = expected_fingerprint
+    env[RUNTIME_MEDIA_ROOT_ENV] = str(media_dir)
+    # clean install 只携带源码时，runner import helper 生成的 __pycache__ 不得
+    # 反过来改变本次预检已固定的 runtime fingerprint。
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
+
+
+def build_vspipe_command(
+    vspipe_path: str, request: VSPipeRenderRequest
+) -> list[str]:
     """Build a VSPipe command that emits Y4M to stdout.
 
     ``-p`` enables per-frame progress on stderr (VSPipe R73 --help:
     "-p, --progress   Print progress to stderr") so the export dialog can
-    show real progress instead of freezing at a fixed percentage.
+    show real progress instead of freezing at a fixed percentage.  VSPipe's
+    ``--arg key=value`` ABI receives every path as one argv element, rather
+    than through a shell-quoted command string.
     """
-    return [vspipe_path, "-c", "y4m", "-p", script_path, "-"]
+    if not isinstance(request, VSPipeRenderRequest):
+        raise TypeError("request 必须是 VSPipeRenderRequest")
+    return [
+        vspipe_path,
+        "-c",
+        "y4m",
+        "-p",
+        "--arg",
+        f"assetmaker_job={request.job_path}",
+        "--arg",
+        f"expected_job_sha256={request.expected_job_sha256}",
+        "--arg",
+        f"assetmaker_script={request.script_path}",
+        "--arg",
+        f"assetmaker_api={request.api_version}",
+        "--arg",
+        f"assetmaker_mode={request.mode}",
+        request.runner_path,
+        "-",
+    ]
 
 
 def build_x264_command(
@@ -39,20 +150,16 @@ def build_x264_command(
     *,
     crf: int = 26,
     preset: str = "veryslow",
-    colormatrix: str = "smpte170m",
-    colorprim: str = "smpte170m",
-    transfer: str = "smpte170m",
-    range_: str = "tv",
+    vui: X264Vui,
 ) -> list[str]:
     """Build an x264-7mod command that consumes Y4M from stdin.
 
-    Colour signalling is written into the H.264 VUI explicitly: x264-7mod's
-    defaults are --colorprim/--transfer/--colormatrix "undef" and --range
-    "auto" (verified via `x264-7mod --fullhelp`), and an untagged sub-HD
-    stream gets decoded with BT.601 by convention (H.273) — every target
-    resolution here is sub-HD, and the pipeline converts to SMPTE 170M, so
-    the stream must say so or players guess and shift the colours.
+    ``vui`` is deliberately mandatory. x264-7mod defaults to undefined
+    matrix/primaries/transfer and automatic range; the values must instead
+    come from the same worker-validated output 0 that VSPipe consumes.
     """
+    if not isinstance(vui, X264Vui):
+        raise TypeError("vui 必须是 output 0 派生的 X264Vui")
     return [
         x264_path,
         "--demuxer",
@@ -66,13 +173,13 @@ def build_x264_command(
         "--output-csp",
         "i420",
         "--colormatrix",
-        colormatrix,
+        vui.colormatrix,
         "--colorprim",
-        colorprim,
+        vui.colorprim,
         "--transfer",
-        transfer,
+        vui.transfer,
         "--range",
-        range_,
+        vui.range_,
         *X264_CLI_ARGS,
         "--output",
         output_path,
@@ -80,48 +187,26 @@ def build_x264_command(
     ]
 
 
-# Exact broadcast rates: the NTSC family MUST stay rational — 29.97 is not
-# 30000/1001, and a float re-stamp makes every frame duration slightly wrong,
-# which accumulates as timing drift over a looping asset.
-_COMMON_FPS = (
-    Fraction(24000, 1001),
-    Fraction(30000, 1001),
-    Fraction(60000, 1001),
-    Fraction(24),
-    Fraction(25),
-    Fraction(30),
-    Fraction(50),
-    Fraction(60),
-)
-
-
-def _fps_to_fraction(fps: float) -> Fraction:
-    """Snap a probed float fps to the nearest common broadcast rational."""
-    value = float(fps)
-    for candidate in _COMMON_FPS:
-        if abs(value - float(candidate)) < 1e-3:
-            return candidate
-    return Fraction(value).limit_denominator(1001)
-
-
-def _format_fps(fps: float) -> str:
-    """Format fps for the muxers: integers stay bare, others become num/den.
+def _format_fps(fps: RationalFPS) -> str:
+    """Format a frozen job frame rate for the muxers without reconstruction.
 
     MP4Box documents ``-fps`` as "expressed as a number, as TS-inc or TS/inc"
-    (mp4box -h import), so ``30000/1001`` is valid; the old ``%g`` float form
-    (``29.97``) silently discarded the exact rational.
+    (mp4box -h import), so ``30000/1001`` is valid. The export boundary must
+    carry the worker-approved numerator and denominator directly: converting to
+    float and guessing a fraction again can change valid non-common rates.
     """
-    frac = _fps_to_fraction(fps)
-    if frac.denominator == 1:
-        return str(frac.numerator)
-    return f"{frac.numerator}/{frac.denominator}"
+    if not isinstance(fps, RationalFPS):
+        raise TypeError("fps 必须是冻结 RenderJob 的 RationalFPS")
+    if fps.denominator == 1:
+        return str(fps.numerator)
+    return f"{fps.numerator}/{fps.denominator}"
 
 
 def build_mp4box_mux_command(
     muxer_path: str,
     raw_h264_path: str,
     output_path: str,
-    fps: float,
+    fps: RationalFPS,
 ) -> list[str]:
     """Build an MP4Box command for wrapping raw H.264 into MP4."""
     return [
@@ -137,7 +222,7 @@ def build_lsmash_mux_command(
     muxer_path: str,
     raw_h264_path: str,
     output_path: str,
-    fps: float,
+    fps: RationalFPS,
 ) -> list[str]:
     """Build an lsmash-muxer command for wrapping raw H.264 into MP4."""
     return [
@@ -155,7 +240,7 @@ def build_mux_command(
     muxer_path: str,
     raw_h264_path: str,
     output_path: str,
-    fps: float,
+    fps: RationalFPS,
 ) -> list[str]:
     """Build the configured MP4 muxer command."""
     muxer_name = Path(muxer_path).name.lower()
@@ -174,13 +259,23 @@ class MediaEncoder:
     def terminate_active_processes(self) -> None:
         processes = list(self.active_processes)
         for process in processes:
-            if process.poll() is None:
+            try:
+                is_running = process.poll() is None
+            except Exception:
+                # A partially started child can fail even while its Popen state is
+                # queried. Its state is unknown, so still attempt bounded cleanup.
+                is_running = True
+            if is_running:
                 try:
                     process.terminate()
                 except Exception:
                     pass
         for process in processes:
-            if process.poll() is None:
+            try:
+                is_running = process.poll() is None
+            except Exception:
+                is_running = True
+            if is_running:
                 try:
                     process.wait(timeout=2)
                 except Exception:
@@ -192,13 +287,16 @@ class MediaEncoder:
 
     def encode_vpy_to_mp4(
         self,
-        script_path: str,
+        request: VSPipeRenderRequest,
         output_path: str,
-        fps: float,
+        fps: RationalFPS,
         *,
+        vui: X264Vui,
         is_cancelled: Optional[Callable[[], bool]] = None,
         progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> None:
+        if not isinstance(fps, RationalFPS):
+            raise TypeError("fps 必须是冻结 RenderJob 的 RationalFPS")
         if is_cancelled and is_cancelled():
             self.terminate_active_processes()
             raise InterruptedError("Export cancelled")
@@ -222,7 +320,7 @@ class MediaEncoder:
 
         try:
             result = self._run_encode_pipeline(
-                script_path, temp_raw, is_cancelled, progress_cb
+                request, temp_raw, vui, is_cancelled, progress_cb
             )
             if result["vspipe_returncode"] != 0:
                 details = str(result["stderr"])[-1000:].strip()
@@ -250,14 +348,22 @@ class MediaEncoder:
 
     def _run_encode_pipeline(
         self,
-        script_path: str,
+        request: VSPipeRenderRequest,
         output_path: str,
+        vui: X264Vui,
         is_cancelled: Optional[Callable[[], bool]] = None,
         progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> dict[str, object]:
-        vspipe_cmd = build_vspipe_command(self.toolchain.vspipe_path, script_path)
-        x264_cmd = build_x264_command(self.toolchain.x264_path, output_path)
-        env = build_media_subprocess_env(self.toolchain.vspipe_path)
+        vspipe_cmd = build_vspipe_command(self.toolchain.vspipe_path, request)
+        x264_cmd = build_x264_command(
+            self.toolchain.x264_path, output_path, vui=vui
+        )
+        env = build_vspipe_render_env(
+            self.toolchain.vspipe_path,
+            app_dir=request.app_dir,
+            runtime=request.runtime,
+            expected_fingerprint=request.runtime_fingerprint,
+        )
         popen_kwargs = {
             "env": env,
             "creationflags": subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
@@ -269,15 +375,31 @@ class MediaEncoder:
             vspipe = subprocess.Popen(
                 vspipe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **popen_kwargs
             )
-            x264 = subprocess.Popen(
-                x264_cmd,
-                stdin=vspipe.stdout,
-                # x264 writes the H.264 bitstream to its --output file; its stdout is
-                # unused. Piping it to an unread PIPE was pure deadlock surface -> DEVNULL.
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                **popen_kwargs,
-            )
+        # Register VSPipe before attempting x264: its startup can fail after
+        # VSPipe owns both pipe handles, and the exception path must use the
+        # same bounded terminate -> wait -> kill cleanup as cancellation.
+        self.active_processes = [vspipe]
+        x264: subprocess.Popen | None = None
+        try:
+            with _suppress_windows_error_dialogs():
+                x264 = subprocess.Popen(
+                    x264_cmd,
+                    stdin=vspipe.stdout,
+                    # x264 writes the H.264 bitstream to its --output file; its stdout is
+                    # unused. Piping it to an unread PIPE was pure deadlock surface -> DEVNULL.
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    **popen_kwargs,
+                )
+        finally:
+            if x264 is None:
+                for stream in (vspipe.stdout, vspipe.stderr):
+                    try:
+                        if stream is not None:
+                            stream.close()
+                    except Exception:
+                        pass
+                self.terminate_active_processes()
         if vspipe.stdout is not None:
             vspipe.stdout.close()
         self.active_processes = [vspipe, x264]
@@ -374,12 +496,16 @@ class MediaEncoder:
             ),
         }
 
-    def _run_muxer(self, raw_h264_path: str, output_path: str, fps: float) -> None:
+    def _run_muxer(
+        self, raw_h264_path: str, output_path: str, fps: RationalFPS
+    ) -> None:
         cmd = build_mux_command(self.toolchain.muxer_path, raw_h264_path, output_path, fps)
         run_kwargs = {
             "capture_output": True,
             "env": build_media_subprocess_env(self.toolchain.muxer_path),
             "text": True,
+            "encoding": "utf-8",
+            "errors": "replace",
             "timeout": 120,
         }
         if sys.platform == "win32":
@@ -410,6 +536,8 @@ def _suppress_windows_error_dialogs():
 __all__ = [
     "MediaEncoder",
     "MediaToolchain",
+    "VSPipeRenderRequest",
+    "X264Vui",
     "build_vspipe_command",
     "build_x264_command",
     "build_mp4box_mux_command",

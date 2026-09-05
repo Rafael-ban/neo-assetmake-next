@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core.media_pipeline import write_vpy_script  # re-exported from core.vs_script
+from core.vs_script import write_vpy_script
 from core.export_service import VideoExportParams
 
 

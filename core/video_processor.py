@@ -23,6 +23,7 @@ from core.vs_runtime.script_header import parse_script_header
 from core.vs_runtime.session import (
     RenderSession,
     ScriptSelection,
+    compute_job_sha256,
     compute_script_bundle_hash,
 )
 from core.vs_runtime.vs_loader import compute_runtime_fingerprint
@@ -135,6 +136,7 @@ def probe_video_info(input_path: str) -> VideoInfo:
             track="loop",
             selection=selection,
             job_path=str(job_path),
+            job_sha256=compute_job_sha256(job_path),
             runtime_fingerprint=fingerprint,
         )
         worker = SyncVSWorkerProcess(app_dir=app_dir)

@@ -59,33 +59,20 @@ def _write_source_mp4(directory: Path) -> Path:
     import numpy as np
 
     assert cv2 is not None
-    from core.media_pipeline import MediaEncoder, _quote_vs_string
-
-    toolchain = _toolchain()
     image = np.zeros((360, 240, 3), np.uint8)
     image[:120, :] = (0, 0, 255)
     image[120:240, :80] = (0, 255, 0)
     image[240:, 160:] = (255, 0, 0)
-    png = directory / "source.png"
-    assert cv2.imwrite(str(png), image)
-    script = directory / "source.vpy"
-    script.write_text(
-        "\n".join(
-            (
-                "import vapoursynth as vs",
-                "core = vs.core",
-                f"clip = core.imwri.Read({_quote_vs_string(str(png))})",
-                "clip = clip if clip.format.id == vs.RGB24 else core.resize.Bicubic(clip, format=vs.RGB24)",
-                "clip = core.std.Loop(clip, times=40)",
-                "clip = core.resize.Bicubic(clip, width=240, height=360, format=vs.YUV420P8, matrix_s='170m')",
-                "clip.set_output()",
-            )
-        )
-        + "\n",
-        encoding="utf-8",
-    )
     mp4 = directory / "source.mp4"
-    MediaEncoder(toolchain).encode_vpy_to_mp4(str(script), str(mp4), 30.0)
+    writer = cv2.VideoWriter(
+        str(mp4), cv2.VideoWriter_fourcc(*"mp4v"), 30, (240, 360)
+    )
+    assert writer.isOpened()
+    try:
+        for _ in range(40):
+            writer.write(image)
+    finally:
+        writer.release()
     return mp4
 
 
@@ -267,89 +254,16 @@ def _frame_requester_contract() -> dict[str, object]:
     return {"status": "ok"}
 
 
-def _preview_export_contract() -> dict[str, object]:
-    _vs, vs_engine = _load_vs()
-    assert cv2 is not None
-    import numpy as np
-    from core.media_pipeline import MediaEncoder
-    from core.vs_frame import request_bgr_frame
-    from core.vs_graph import build_display_graph
-    from core.vs_script import write_vpy_script
-
-    def quadrants(width: int = 320, height: int = 480) -> np.ndarray:
-        image = np.zeros((height, width, 3), np.uint8)
-        image[: height // 2, : width // 2] = (255, 0, 0)
-        image[: height // 2, width // 2 :] = (0, 255, 0)
-        image[height // 2 :, : width // 2] = (0, 0, 255)
-        image[height // 2 :, width // 2 :] = (255, 255, 0)
-        return image
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        try:
-            directory = Path(temp_dir)
-            source = directory / "source.png"
-            assert cv2.imwrite(str(source), quadrants())
-
-            def render(params: Any, name: str) -> tuple[np.ndarray, np.ndarray]:
-                clip = None
-                try:
-                    clip = build_display_graph(params)
-                    preview = request_bgr_frame(clip, 0)
-                    assert preview is not None
-                finally:
-                    del clip
-                script = directory / f"{name}.vpy"
-                output = directory / f"{name}.mp4"
-                write_vpy_script(script, params)
-                MediaEncoder(_toolchain()).encode_vpy_to_mp4(str(script), str(output), params.fps)
-                capture = cv2.VideoCapture(str(output))
-                try:
-                    ok, encoded = capture.read()
-                finally:
-                    capture.release()
-                assert ok and encoded is not None
-                return preview, encoded
-
-            def params(path: Path = source, **changes: Any) -> Any:
-                fields = {
-                    "cropbox": (20, 40, 180, 320),
-                    "start_frame": 0,
-                    "end_frame": 10,
-                    "fps": 30.0,
-                    "resolution": "360x640",
-                    "is_image": True,
-                    "rotation": 90,
-                }
-                fields.update(changes)
-                return _params(path, **fields)
-
-            preview, encoded = render(params(), "rot90")
-            assert preview.shape == encoded.shape
-            difference = np.abs(preview.astype(int) - encoded.astype(int))
-            assert difference.mean() < 2.0
-            assert (difference.max(axis=2) > 30).mean() < 0.01
-
-            flat = directory / "flat.png"
-            assert cv2.imwrite(str(flat), np.full((480, 320, 3), 128, np.uint8))
-            preview, encoded = render(params(flat), "flat")
-            np.testing.assert_array_equal(preview, encoded)
-
-            preview, encoded = render(params(rotation=0), "rot0")
-            assert preview.shape[:2] == (640, 384)
-            assert encoded.shape[:2] == (640, 384)
-        finally:
-            vs_engine.clear_caches()
-            gc.collect()
-    return {"status": "ok"}
-
-
 def _vui_contract() -> dict[str, object]:
     _load_vs()
     assert cv2 is not None
     import numpy as np
     from core.media_pipeline import MediaEncoder
-    from core.vs_script import write_vpy_script
     from core import vs_engine
+    from tests.helpers.m5_render_fixture import (
+        build_default_render_session,
+        preflight_encode_request,
+    )
 
     with tempfile.TemporaryDirectory() as temp_dir:
         clip = None
@@ -358,19 +272,18 @@ def _vui_contract() -> dict[str, object]:
             directory = Path(temp_dir)
             png = directory / "tag.png"
             assert cv2.imwrite(str(png), np.full((640, 360, 3), (60, 120, 180), np.uint8))
-            params = _params(
-                png,
-                cropbox=(0, 0, 360, 640),
-                start_frame=0,
+            session = build_default_render_session(
+                directory / "m5-session",
+                source_path=png,
+                source_kind="image",
                 end_frame=12,
-                fps=30.0,
-                resolution="360x640",
-                is_image=True,
+                crop=(0, 0, 360, 640),
             )
-            script = directory / "tag.vpy"
             output = directory / "tag.mp4"
-            write_vpy_script(script, params)
-            MediaEncoder(_toolchain()).encode_vpy_to_mp4(str(script), str(output), 30.0)
+            request, fps, vui = preflight_encode_request(session)
+            MediaEncoder(_toolchain()).encode_vpy_to_mp4(
+                request, str(output), fps, vui=vui
+            )
             clip = vs_engine.source_clip(str(output))
             frame = clip.get_frame(0)
             props = dict(frame.props)
@@ -392,7 +305,6 @@ CASES = {
     "engine_contract": _engine_contract,
     "graph_contract": _graph_contract,
     "frame_requester_contract": _frame_requester_contract,
-    "preview_export_contract": _preview_export_contract,
     "vui_contract": _vui_contract,
 }
 

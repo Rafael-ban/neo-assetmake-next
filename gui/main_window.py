@@ -1485,10 +1485,8 @@ class MainWindow(QMainWindow):
             epconfig=self._config,
             logo_mat=export_data.get('logo_mat'),
             overlay_mat=export_data.get('overlay_mat'),
-            loop_video_params=export_data.get('loop_video_params'),
-            intro_video_params=export_data.get('intro_video_params'),
-            loop_image_path=export_data.get('loop_image_path'),
-            loop_image_params=export_data.get('loop_image_params'),
+            loop_render_session=export_data.get('loop_render_session'),
+            intro_render_session=export_data.get('intro_render_session'),
             aux_images=aux_images,
         )
 
@@ -3315,74 +3313,20 @@ class MainWindow(QMainWindow):
         }
 
     def _bake_loop_image_for_simulator(self, loop_state: dict) -> tuple[str, dict]:
-        import cv2
-        import numpy as np
-        from core.export_service import VideoExportParams
-        from core.media_pipeline import MediaEncoder, write_vpy_script
-        from core.media_tools import MediaToolchain
+        from core.export_service import ExportWorker
+        from core.vs_runtime.job import load_render_job
 
-        image_path = loop_state["path"]
-        img_data = np.fromfile(image_path, dtype=np.uint8)
-        frame_bgr = cv2.imdecode(img_data, cv2.IMREAD_COLOR)
-        if frame_bgr is None:
-            raise RuntimeError(f"无法读取图片: {image_path}")
-
-        rotation = int(loop_state["rotation"])
-        if rotation:
-            frame_bgr = VideoPreviewWidget.apply_rotation_to_frame(
-                frame_bgr, rotation
-            )
-
-        frame_h, frame_w = frame_bgr.shape[:2]
-        x, y, w, h = loop_state["cropbox"]
-        x = max(0, min(int(x), frame_w - 1))
-        y = max(0, min(int(y), frame_h - 1))
-        w = max(1, min(int(w), frame_w - x))
-        h = max(1, min(int(h), frame_h - y))
-        cropped = frame_bgr[y:y + h, x:x + w]
-        if cropped.size == 0:
-            raise RuntimeError("循环图片裁切区域无效")
-
-        target_w, target_h = self._get_target_resolution()
-        baked_frame = cv2.resize(cropped, (target_w, target_h))
-
-        stream_fps = max(
-            1, int(round(float(loop_state.get("fps", 30.0) or 30.0))))
-        total_frames = max(
-            1, int(loop_state.get("total_frames", stream_fps) or stream_fps)
-        )
-
-        temp_image = os.path.join(self._base_dir, "_sim_temp_source.png")
-        temp_script = os.path.join(self._base_dir, "_sim_temp.vpy")
+        # 模拟器不能再用 cv2 另行裁剪、旋转和缩放图片。直接冻结循环预览的
+        # RenderSession，令同一 runner/script/job 生成它将播放的 loop.mp4。
+        session = self.video_preview.flush_render_job()
+        job = load_render_job(session.job_path)
         temp_video = os.path.join(self._base_dir, "_sim_temp.mp4")
-        success, encoded = cv2.imencode(".png", baked_frame)
-        if not success:
-            raise RuntimeError("Unable to encode simulator preview image")
-        with open(temp_image, "wb") as fh:
-            fh.write(encoded.tobytes())
-
-        resolution = self._config.screen.value if self._config else "360x640"
-        params = VideoExportParams(
-            video_path=temp_image,
-            cropbox=(0, 0, target_w, target_h),
-            start_frame=0,
-            end_frame=total_frames,
-            fps=float(stream_fps),
-            resolution=resolution,
-            is_image=True,
-            rotation=0,
-        )
-        write_vpy_script(temp_script, params)
+        worker = ExportWorker()
+        worker._staging_dir = self._base_dir
         try:
-            MediaEncoder(MediaToolchain.discover()).encode_vpy_to_mp4(
-                temp_script,
-                temp_video,
-                float(stream_fps),
-            )
+            worker._export_video(temp_video, session, 0)
         finally:
-            for temp_path in (temp_script, temp_image):
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+            worker._media_encoder = None
 
         temp_config = self._config.copy()
         temp_config.loop.file = os.path.basename(temp_video)
@@ -3394,12 +3338,12 @@ class MainWindow(QMainWindow):
         baked_state = dict(loop_state)
         baked_state.update(
             path=temp_video,
-            cropbox=(0, 0, target_w, target_h),
+            cropbox=(0, 0, job.output.display_width, job.output.display_height),
             rotation=0,
-            width=target_w,
-            height=target_h,
-            fps=float(stream_fps),
-            total_frames=total_frames,
+            width=job.output.display_width,
+            height=job.output.display_height,
+            fps=job.timeline.fps.numerator / job.timeline.fps.denominator,
+            total_frames=job.timeline.end_frame - job.timeline.start_frame,
         )
         return temp_config_path, baked_state
 
@@ -3964,11 +3908,18 @@ class MainWindow(QMainWindow):
 
     def _collect_export_data(self) -> dict:
         """收集导出所需的数据"""
-        from core.export_service import VideoExportParams
         from core.image_processor import ImageProcessor
 
         self._snapshot_active_timeline_state()
         data = {}
+
+        # 导出先冻结预览已解析的 job。后续 worker/VSPipe 必须消费同一份
+        # RenderSession，不能在后台从可变 UI/config 重建另一条滤镜链。
+        sessions = self._flush_export_render_jobs(
+            include_loop=bool(self._config.loop.file),
+            include_intro=bool(self._config.intro.enabled and self._config.intro.file),
+        )
+        data.update({key: value for key, value in sessions.items() if value is not None})
 
         icon_path = self._config.icon
         if icon_path:
@@ -3985,27 +3936,6 @@ class MainWindow(QMainWindow):
                 self._resolve_media_path(self._config.loop.file)
             if loop_image_path and os.path.exists(loop_image_path):
                 data['is_loop_image'] = True
-                # 带上预览的裁剪框(旋转后空间)/旋转/时长——旧路径只传裸路径,
-                # 导出服务硬编码 cropbox=(0,0,0,0),图片循环的取景被静默丢弃。
-                loop_state = self._collect_preview_media_state(
-                    self.video_preview,
-                    self._config.loop.file,
-                    default_to_full=True,
-                    is_image=True,
-                )
-                if loop_state:
-                    data['loop_image_params'] = VideoExportParams(
-                        video_path=loop_state['path'],
-                        cropbox=loop_state['cropbox'],
-                        start_frame=loop_state['start_frame'],
-                        end_frame=loop_state['end_frame'],
-                        fps=loop_state['fps'],
-                        resolution=self._config.screen.value,
-                        is_image=True,
-                        rotation=loop_state['rotation'],
-                    )
-                else:
-                    data['loop_image_path'] = loop_image_path
             else:
                 # The loop asset is required. Fail loudly (caught by _on_export's
                 # try/except -> show_error + return) instead of silently dropping it and
@@ -4013,23 +3943,6 @@ class MainWindow(QMainWindow):
                 raise FileNotFoundError(
                     f"循环素材(图片)缺失或不存在: {loop_image_path or self._config.loop.file!r}"
                 )
-        elif self._config.loop.file:
-            loop_state = self._collect_preview_media_state(
-                self.video_preview,
-                self._config.loop.file,
-                default_to_full=True,
-            )
-            if loop_state:
-                data['loop_video_params'] = VideoExportParams(
-                    video_path=loop_state['path'],
-                    cropbox=loop_state['cropbox'],
-                    start_frame=loop_state['start_frame'],
-                    end_frame=loop_state['end_frame'],
-                    fps=loop_state['fps'],
-                    resolution=self._config.screen.value,
-                    rotation=loop_state['rotation']
-                )
-
         if self._config.intro.enabled and self._config.intro.file:
             intro_state = self._collect_preview_media_state(
                 self.intro_preview,
@@ -4037,15 +3950,6 @@ class MainWindow(QMainWindow):
                 default_to_full=True,
             )
             if intro_state:
-                data['intro_video_params'] = VideoExportParams(
-                    video_path=intro_state['path'],
-                    cropbox=intro_state['cropbox'],
-                    start_frame=intro_state['start_frame'],
-                    end_frame=intro_state['end_frame'],
-                    fps=intro_state['fps'],
-                    resolution=self._config.screen.value,
-                    rotation=intro_state['rotation']
-                )
                 # 把 intro.duration(µs)校准到实际编码时长:trim 与用户手填的
                 # duration 各自独立,设备按 duration 计时,不一致会导致入场
                 # 卡顿/截断。以修剪后的真实帧数为准写回。
@@ -4079,6 +3983,20 @@ class MainWindow(QMainWindow):
                         data['overlay_mat'] = overlay_img
 
         return data
+
+    def _flush_export_render_jobs(
+        self,
+        *,
+        include_loop: bool = True,
+        include_intro: bool = True,
+    ) -> dict:
+        """在 UI 线程冻结导出轨道的 preview RenderSession。"""
+        sessions = {"loop_render_session": None, "intro_render_session": None}
+        if include_loop:
+            sessions["loop_render_session"] = self.video_preview.flush_render_job()
+        if include_intro:
+            sessions["intro_render_session"] = self.intro_preview.flush_render_job()
+        return sessions
 
     def _collect_arknights_custom_images(self) -> list:
         """收集 arknights 叠加的自定义图片(职业图标 / logo),缩放后返回。

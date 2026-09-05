@@ -155,22 +155,22 @@ class AsyncLoadTests(unittest.TestCase):
 class AsyncLoadRealMediaTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from core.media_pipeline import MediaEncoder, _quote_vs_string
+        from tests.helpers.m5_render_fixture import (
+            build_default_render_session,
+            encode_render_session,
+        )
 
         cls.d = Path(tempfile.mkdtemp())
         png = cls.d / "m.png"
         cv2.imwrite(str(png), np.full((360, 240, 3), 128, np.uint8))
-        vpy = cls.d / "src.vpy"
-        vpy.write_text("\n".join([
-            "import vapoursynth as vs", "core = vs.core",
-            f"clip = core.imwri.Read({_quote_vs_string(str(png))})",
-            "clip = clip if clip.format.id == vs.RGB24 else core.resize.Bicubic(clip, format=vs.RGB24)",
-            "clip = core.std.Loop(clip, times=30)",
-            "clip = core.resize.Bicubic(clip, width=240, height=360, format=vs.YUV420P8, matrix_s='709')",
-            "clip.set_output()",
-        ]) + "\n", encoding="utf-8")
         cls.mp4 = cls.d / "src.mp4"
-        MediaEncoder(TC).encode_vpy_to_mp4(str(vpy), str(cls.mp4), 30.0)
+        session = build_default_render_session(
+            cls.d / "render-session",
+            source_path=png,
+            source_kind="image",
+            end_frame=30,
+        )
+        encode_render_session(TC, session, cls.mp4)
 
     def _pump_until(self, condition, timeout_s):
         deadline = time.monotonic() + timeout_s

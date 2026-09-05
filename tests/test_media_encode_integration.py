@@ -20,8 +20,11 @@ except ImportError:
     HAS_CV2 = False
 
 from core.media_tools import MediaToolchain
-from core.media_pipeline import MediaEncoder, write_vpy_script, _quote_vs_string
-from core.export_service import VideoExportParams
+from core.media_pipeline import MediaEncoder
+from tests.helpers.m5_render_fixture import (
+    build_default_render_session,
+    preflight_encode_request,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 TC = MediaToolchain.discover(str(REPO))
@@ -36,16 +39,17 @@ def _marker(path, w=240, h=360):
 
 
 def _source(marker, out, frames=20, w=240, h=360):
-    vpy = Path(out).with_suffix(".src.vpy")
-    vpy.write_text("\n".join([
-        "import vapoursynth as vs", "core = vs.core",
-        f"clip = core.imwri.Read({_quote_vs_string(str(marker))})",
-        "clip = clip if clip.format.id == vs.RGB24 else core.resize.Bicubic(clip, format=vs.RGB24)",
-        f"clip = core.std.Loop(clip, times={frames})",
-        f"clip = core.resize.Bicubic(clip, width={w}, height={h}, format=vs.YUV420P8, matrix_s='709')",
-        "clip.set_output()",
-    ]) + "\n", encoding="utf-8")
-    MediaEncoder(TC).encode_vpy_to_mp4(str(vpy), str(out), 30.0)
+    image = cv2.imread(str(marker))
+    writer = cv2.VideoWriter(
+        str(out), cv2.VideoWriter_fourcc(*"mp4v"), 30, (w, h)
+    )
+    if not writer.isOpened():
+        raise RuntimeError("OpenCV cannot create the real-video source fixture")
+    try:
+        for _ in range(frames):
+            writer.write(image)
+    finally:
+        writer.release()
     return Path(out)
 
 
@@ -59,14 +63,16 @@ def _decode0(mp4):
 
 
 def _export(src, out, **kw):
-    params = VideoExportParams(
-        video_path=str(src), cropbox=kw.get("cropbox", (0, 0, 0, 0)), start_frame=0,
-        end_frame=kw.get("end", 15), fps=30.0, resolution=kw.get("resolution", "360x640"),
-        is_image=kw.get("is_image", False), rotation=kw.get("rotation", 0),
+    session = build_default_render_session(
+        Path(out).with_suffix(""),
+        source_path=Path(src),
+        source_kind="image" if kw.get("is_image", False) else "video",
+        end_frame=kw.get("end", 15),
+        crop=kw.get("cropbox", (0, 0, 0, 0)),
+        rotation=kw.get("rotation", 0),
     )
-    vpy = Path(out).with_suffix(".exp.vpy")
-    write_vpy_script(str(vpy), params)
-    MediaEncoder(TC).encode_vpy_to_mp4(str(vpy), str(out), 30.0)
+    request, fps, vui = preflight_encode_request(session)
+    MediaEncoder(TC).encode_vpy_to_mp4(request, str(out), fps, vui=vui)
     return Path(out)
 
 
@@ -115,14 +121,17 @@ class MediaEncodeIntegrationTests(unittest.TestCase):
         """M1d: a long encode completes (stderr drained) instead of dead-locking."""
         src = _source(_marker(self.d / "lm.png"), self.d / "lsrc.mp4", frames=180)
         enc = MediaEncoder(TC)
-        params = VideoExportParams(video_path=str(src), cropbox=(0, 0, 0, 0), start_frame=0,
-                                   end_frame=160, fps=30.0, resolution="360x640",
-                                   is_image=False, rotation=0)
-        vpy = self.d / "long.vpy"
-        write_vpy_script(str(vpy), params)
+        session = build_default_render_session(
+            self.d / "long-session", source_path=src, end_frame=160
+        )
+        request, _fps, vui = preflight_encode_request(session)
         res = {}
         t = threading.Thread(
-            target=lambda: res.update(r=enc._run_encode_pipeline(str(vpy), str(self.d / "long.264"), None))
+            target=lambda: res.update(
+                r=enc._run_encode_pipeline(
+                    request, str(self.d / "long.264"), vui
+                )
+            )
         )
         t.start()
         t.join(timeout=180)

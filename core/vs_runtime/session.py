@@ -83,6 +83,16 @@ def _absolute_path(value: Any, field: str) -> str:
     return str(path.resolve())
 
 
+def compute_job_sha256(job_path: str | Path) -> str:
+    """返回一个 RenderJob 文件当前字节内容的 SHA-256。
+
+    路径不是 job 的身份：同一路径可以在预检与 VSPipe 启动之间被替换。
+    因而所有跨进程 RenderSession 都携带这份内容摘要，并在每个消费边界
+    复核它。
+    """
+    return hashlib.sha256(Path(job_path).read_bytes()).hexdigest()
+
+
 @dataclass(frozen=True)
 class NodeMetadata:
     width: int
@@ -243,6 +253,7 @@ class RenderSession:
     track: Literal["loop", "intro"]
     selection: ScriptSelection
     job_path: str
+    job_sha256: str
     runtime_fingerprint: str
 
     def __post_init__(self) -> None:
@@ -255,6 +266,7 @@ class RenderSession:
         object.__setattr__(
             self, "job_path", _absolute_path(self.job_path, "job_path")
         )
+        _sha256(self.job_sha256, "job_sha256")
         _sha256(self.runtime_fingerprint, "runtime_fingerprint")
 
     def to_load_message(self, request_id: int) -> dict[str, Any]:
@@ -268,6 +280,7 @@ class RenderSession:
             "epoch": self.epoch,
             "script_path": self.selection.script_path,
             "job_path": self.job_path,
+            "job_sha256": self.job_sha256,
             "bundle_hash": self.selection.bundle_hash,
             "runtime_fingerprint": self.runtime_fingerprint,
             "mode": self.selection.mode,
@@ -462,11 +475,18 @@ class GenerationStagingRoot:
 
 @dataclass
 class ScriptBundleSnapshot:
-    """供一次 worker load 独占的代码与 job 磁盘快照。"""
+    """供一次 worker load 独占的 job 快照与规范脚本绑定。
+
+    M5 不再把用户 ``.vpy`` 复制到 worker 私有目录。VSPipe 必须以同一个
+    canonical script path 执行，才能保证 ``__file__``、相对资源与 preview
+    完全一致。代码 bundle 通过 hash 在执行前后核验；本对象只冻结会变动的
+    job payload，并负责删除自己的 staging 根。
+    """
 
     root_path: Path
     script_path: Path
     job_path: Path
+    job_sha256: str
     _closed: bool = False
 
     @classmethod
@@ -476,28 +496,20 @@ class ScriptBundleSnapshot:
         job_path: str | Path,
         generation_staging: GenerationStagingRoot,
     ) -> "ScriptBundleSnapshot":
-        script, relative_files = _read_script_bundle(script_path)
+        script = Path(script_path).resolve(strict=True)
         job = Path(job_path).resolve(strict=True)
         job_bytes = job.read_bytes()
+        job_sha256 = hashlib.sha256(job_bytes).hexdigest()
         root = generation_staging.create_snapshot_root()
         try:
-            bundle_root = root / "bundle"
-            for relative, data in relative_files:
-                target = bundle_root / Path(relative)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
             snapshot_job = root / "job.json"
             snapshot_job.write_bytes(job_bytes)
-            snapshot_script = bundle_root / script.name
-            if not snapshot_script.is_file():
-                raise FileNotFoundError(f"bundle 缺少入口脚本: {script.name}")
-            for path in (*bundle_root.rglob("*"), snapshot_job):
-                if path.is_file():
-                    path.chmod(stat.S_IREAD)
+            snapshot_job.chmod(stat.S_IREAD)
             return cls(
                 root_path=root,
-                script_path=snapshot_script,
+                script_path=script,
                 job_path=snapshot_job,
+                job_sha256=job_sha256,
             )
         except BaseException:
             cls._remove_tree(root)

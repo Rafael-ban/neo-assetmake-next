@@ -76,32 +76,26 @@ class RealPreviewWorkerAcceptanceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """生成 30000/1001 的非黑色视频，再改名到中文路径。"""
-        from core.media_pipeline import MediaEncoder
+        from tests.helpers.m5_render_fixture import (
+            build_default_render_session,
+            encode_render_session,
+        )
 
         cls.temp = tempfile.TemporaryDirectory()
         cls.root = Path(cls.temp.name)
-
-        source_vpy = cls.root / "make_source.vpy"
-        source_vpy.write_text(
-            "\n".join(
-                [
-                    "import vapoursynth as vs",
-                    "core = vs.core",
-                    "base = core.std.BlankClip(width=240, height=360, length=90, format=vs.YUV420P8)",
-                    "def make_frame(n):",
-                    "    return core.std.BlankClip(width=240, height=360, length=1, format=vs.YUV420P8, color=[96 + n, 90, 220])",
-                    "clip = core.std.FrameEval(base, eval=make_frame)",
-                    "clip = core.std.AssumeFPS(clip, fpsnum=30000, fpsden=1001)",
-                    "clip.set_output()",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
+        source_png = cls.root / "source.png"
+        image = np.zeros((360, 240, 3), np.uint8)
+        image[:, :] = (24, 64, 224)
+        cv2.imwrite(str(source_png), image)
         encoded = cls.root / "source.mp4"
-        MediaEncoder(TC).encode_vpy_to_mp4(
-            str(source_vpy), str(encoded), _FPS.numerator / _FPS.denominator
+        session = build_default_render_session(
+            cls.root / "render-session",
+            source_path=source_png,
+            source_kind="image",
+            end_frame=_SOURCE_FRAME_COUNT,
+            fps=_FPS,
         )
+        encode_render_session(TC, session, encoded)
         chinese_dir = cls.root / "中文目录"
         chinese_dir.mkdir()
         cls.media = chinese_dir / "验收素材.mp4"
@@ -199,12 +193,12 @@ class RealPreviewWorkerAcceptanceTests(unittest.TestCase):
         self.assertEqual(widget._session_metadata.mode, "compatible")
         self.assertIsNotNone(widget._session_metadata.editor)
         editor = widget._session_metadata.editor
-        self.assertEqual((editor.width, editor.height), (240, 360))
+        self.assertEqual((editor.width, editor.height), (384, 640))
         self.assertEqual(editor.num_frames, _SOURCE_FRAME_COUNT)
         # 此断言故意读取私有有理数；若实现先转 float 再反推，分母会丢失。
         self.assertEqual(widget._fps_rational, _FPS)
         self.assertEqual((editor.fps_num, editor.fps_den), (30_000, 1_001))
-        self.assertEqual((widget.video_width, widget.video_height), (240, 360))
+        self.assertEqual((widget.video_width, widget.video_height), (384, 640))
 
         first = widget.current_frame
         self.assertEqual(first.ndim, 3)

@@ -83,36 +83,29 @@ class FrameConversionTests(_IsolatedVSCase):
 class WorkerProbeTests(_IsolatedVSCase):
     @classmethod
     def setUpClass(cls):
-        from core.media_pipeline import MediaEncoder, _quote_vs_string
+        from tests.helpers.m5_render_fixture import (
+            build_default_render_session,
+            encode_render_session,
+        )
 
         cls.d = Path(tempfile.mkdtemp())
         png = cls.d / "m.png"
         cv2.imwrite(str(png), np.full((360, 240, 3), 128, np.uint8))
-        vpy = cls.d / "s.vpy"
-        vpy.write_text(
-            "\n".join(
-                [
-                    "import vapoursynth as vs",
-                    "core = vs.core",
-                    f"clip = core.imwri.Read({_quote_vs_string(str(png))})",
-                    "clip = clip if clip.format.id == vs.RGB24 else core.resize.Bicubic(clip, format=vs.RGB24)",
-                    "clip = core.std.Loop(clip, times=45)",
-                    "clip = core.resize.Bicubic(clip, width=240, height=360, format=vs.YUV420P8, matrix_s='170m')",
-                    "clip.set_output()",
-                ]
-            )
-            + "\n",
-            encoding="utf-8",
-        )
         cls.mp4 = cls.d / "probe.mp4"
-        MediaEncoder(TC).encode_vpy_to_mp4(str(vpy), str(cls.mp4), 30.0)
+        session = build_default_render_session(
+            cls.d / "render-session",
+            source_path=png,
+            source_kind="image",
+            end_frame=45,
+        )
+        encode_render_session(TC, session, cls.mp4)
 
     def test_probe_reports_exact_geometry_and_frame_count(self):
         from core.video_processor import probe_video_info
 
         info = probe_video_info(str(self.mp4))
-        self.assertEqual(info.width, 240)
-        self.assertEqual(info.height, 360)
+        self.assertEqual(info.width, 384)
+        self.assertEqual(info.height, 640)
         self.assertEqual(info.total_frames, 45)
         self.assertAlmostEqual(info.fps, 30.0, places=6)
         self.assertAlmostEqual(info.duration, 1.5, places=3)
@@ -123,7 +116,7 @@ class WorkerProbeTests(_IsolatedVSCase):
 
         info = VideoProcessor().get_video_info(str(self.mp4))
         self.assertIsNotNone(info)
-        self.assertEqual((info.width, info.height, info.total_frames), (240, 360, 45))
+        self.assertEqual((info.width, info.height, info.total_frames), (384, 640, 45))
         self.assertNotIn("vapoursynth", sys.modules)
 
     def test_source_node_cache_is_owned_by_the_isolated_vs_process(self):
@@ -132,7 +125,7 @@ class WorkerProbeTests(_IsolatedVSCase):
 
     def test_real_frame_round_trips_to_bgr_in_isolated_vs_process(self):
         result = self._run_vs_child("real_frame", str(self.mp4))
-        self.assertEqual(result["shape"], [360, 240, 3])
+        self.assertEqual(result["shape"], [640, 384, 3])
         self.assertGreater(result["mean"], 100)
 
     def test_missing_file_returns_none(self):

@@ -230,7 +230,8 @@ jobs:
             "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/script_header.py",
             "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/executor.py",
             "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/contract.py",
-            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/display.py"
+            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/display.py",
+            "ArknightsPassMaker/resources/vapoursynth/python/assetmaker_vs/runtime_fingerprint.py"
           )
           foreach ($artifact in $requiredArtifacts) {
             if (-not (Test-Path $artifact)) {

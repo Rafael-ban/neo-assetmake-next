@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import os
@@ -12,10 +11,12 @@ from pathlib import Path
 from typing import Any
 
 from config.vs_runtime import VSRuntimeConfig
+from resources.vapoursynth.python.assetmaker_vs.runtime_fingerprint import (
+    RuntimeFingerprintError,
+    compute_runtime_fingerprint as _compute_portable_runtime_fingerprint,
+)
 
 
-_CODE_SUFFIXES = frozenset({".py", ".pyc", ".pyd", ".dll", ".zip", ".whl"})
-_PORTABLE_CORE_FILES = ("vapoursynth.pyd", "vapoursynth.dll", "portable.vs")
 _load_lock = threading.Lock()
 _loaded_module: Any | None = None
 _dll_directory_handle: Any | None = None
@@ -31,89 +32,16 @@ def _validated_runtime(runtime: VSRuntimeConfig | dict[str, Any]) -> VSRuntimeCo
     return VSRuntimeConfig.from_dict(runtime)
 
 
-def _digest_record(digest: Any, label: str, data: bytes) -> None:
-    label_bytes = label.encode("utf-8")
-    digest.update(len(label_bytes).to_bytes(4, "big"))
-    digest.update(label_bytes)
-    digest.update(len(data).to_bytes(8, "big"))
-    digest.update(data)
-
-
-def _digest_file(digest: Any, label: str, path: Path) -> None:
-    try:
-        size = path.stat().st_size
-        label_bytes = label.encode("utf-8")
-        digest.update(len(label_bytes).to_bytes(4, "big"))
-        digest.update(label_bytes)
-        digest.update(size.to_bytes(8, "big"))
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except OSError as exc:
-        raise VSLoaderError(f"无法读取 runtime 文件 {path}: {exc}") from exc
-
-
-def _code_files(root: Path) -> list[Path]:
-    try:
-        if not root.is_dir():
-            raise VSLoaderError(f"runtime 代码目录不存在: {root}")
-        files = [
-            path
-            for path in root.rglob("*")
-            if path.is_file() and path.suffix.casefold() in _CODE_SUFFIXES
-        ]
-    except OSError as exc:
-        raise VSLoaderError(f"无法遍历 runtime 代码目录 {root}: {exc}") from exc
-    return sorted(
-        files,
-        key=lambda path: path.relative_to(root).as_posix().casefold(),
-    )
-
-
 def compute_runtime_fingerprint(
     app_dir: str | os.PathLike[str],
     runtime: VSRuntimeConfig | dict[str, Any],
 ) -> str:
     """哈希规范指定的 runtime JSON、portable core 与代码/插件文件。"""
-    root = Path(app_dir).resolve()
     config = _validated_runtime(runtime)
-    media_dir = root / "tools" / "media"
-    digest = hashlib.sha256()
-    canonical_runtime = json.dumps(
-        config.to_dict(),
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
-    _digest_record(digest, "runtime.json", canonical_runtime)
-
-    for filename in _PORTABLE_CORE_FILES:
-        path = media_dir / filename
-        if not path.is_file():
-            raise VSLoaderError(f"portable VapourSynth 文件不存在: {path}")
-        _digest_file(digest, f"portable/{filename.casefold()}", path)
-
-    directories: list[tuple[str, Path]] = [
-        ("default-plugins", media_dir / "vs-plugins"),
-        (
-            "assetmaker-vs",
-            root / "resources" / "vapoursynth" / "python" / "assetmaker_vs",
-        ),
-    ]
-    directories.extend(
-        (f"native-{index}", Path(path).resolve())
-        for index, path in enumerate(config.plugins.native_plugin_dirs)
-    )
-    directories.extend(
-        (f"python-{index}", Path(path).resolve())
-        for index, path in enumerate(config.plugins.python_module_dirs)
-    )
-    for category, directory in directories:
-        for path in _code_files(directory):
-            relative = path.relative_to(directory).as_posix()
-            _digest_file(digest, f"{category}/{relative}", path)
-    return digest.hexdigest()
+    try:
+        return _compute_portable_runtime_fingerprint(app_dir, config.to_dict())
+    except RuntimeFingerprintError as exc:
+        raise VSLoaderError(str(exc)) from exc
 
 
 def load_vapoursynth(

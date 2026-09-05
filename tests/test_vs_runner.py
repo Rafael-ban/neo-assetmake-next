@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import os
 import shutil
@@ -15,9 +16,16 @@ import uuid
 from pathlib import Path
 from unittest import mock
 
-from core.media_tools import MediaToolchain, build_media_subprocess_env
+from config.vs_runtime import load_vs_runtime
+from core.media_pipeline import (
+    VSPipeRenderRequest,
+    build_vspipe_command,
+    build_vspipe_render_env,
+)
+from core.media_tools import MediaToolchain
 from core.vs_runtime.job import RenderJobError, load_render_job
 from core.vs_runtime.script_header import ScriptHeaderError, parse_script_header
+from core.vs_runtime.vs_loader import compute_runtime_fingerprint
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -126,21 +134,50 @@ def _run_child(case: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _runner_request(
+    *, script: Path, job: Path, mode: str, expected_job_sha256: str | None = None
+) -> VSPipeRenderRequest:
+    runtime = load_vs_runtime(ROOT / "config" / "vs_runtime.json")
+    return VSPipeRenderRequest(
+        runner_path=str(RUNNER),
+        script_path=str(script),
+        job_path=str(job),
+        expected_job_sha256=(
+            hashlib.sha256(job.read_bytes()).hexdigest()
+            if expected_job_sha256 is None
+            else expected_job_sha256
+        ),
+        api_version=1,
+        mode=mode,
+        app_dir=str(ROOT),
+        runtime=runtime,
+        runtime_fingerprint=compute_runtime_fingerprint(ROOT, runtime),
+    )
+
+
 def _run_vspipe(
-    *, script: Path, job: Path, mode: str
+    *, script: Path, job: Path, mode: str, expected_job_sha256: str | None = None
 ) -> subprocess.CompletedProcess[str]:
+    request = _runner_request(
+        script=script,
+        job=job,
+        mode=mode,
+        expected_job_sha256=expected_job_sha256,
+    )
     args = [
         TOOLCHAIN.vspipe_path,
         "--info",
         "--arg",
-        f"assetmaker_job={job}",
+        f"assetmaker_job={request.job_path}",
         "--arg",
-        f"assetmaker_script={script}",
+        f"expected_job_sha256={request.expected_job_sha256}",
+        "--arg",
+        f"assetmaker_script={request.script_path}",
         "--arg",
         "assetmaker_api=1",
         "--arg",
-        f"assetmaker_mode={mode}",
-        str(RUNNER),
+        f"assetmaker_mode={request.mode}",
+        request.runner_path,
         "-",
     ]
     kwargs: dict[str, object] = {
@@ -151,7 +188,12 @@ def _run_vspipe(
         "errors": "replace",
         "timeout": 30,
         "check": False,
-        "env": build_media_subprocess_env(TOOLCHAIN.vspipe_path),
+        "env": build_vspipe_render_env(
+            TOOLCHAIN.vspipe_path,
+            app_dir=request.app_dir,
+            runtime=request.runtime,
+            expected_fingerprint=request.runtime_fingerprint,
+        ),
     }
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -161,27 +203,19 @@ def _run_vspipe(
 def _run_vspipe_y4m(
     *, script: Path, job: Path, mode: str
 ) -> subprocess.CompletedProcess[bytes]:
-    args = [
-        TOOLCHAIN.vspipe_path,
-        "-c",
-        "y4m",
-        "--arg",
-        f"assetmaker_job={job}",
-        "--arg",
-        f"assetmaker_script={script}",
-        "--arg",
-        "assetmaker_api=1",
-        "--arg",
-        f"assetmaker_mode={mode}",
-        str(RUNNER),
-        "-",
-    ]
+    request = _runner_request(script=script, job=job, mode=mode)
+    args = build_vspipe_command(TOOLCHAIN.vspipe_path, request)
     kwargs: dict[str, object] = {
         "cwd": ROOT,
         "capture_output": True,
         "timeout": 30,
         "check": False,
-        "env": build_media_subprocess_env(TOOLCHAIN.vspipe_path),
+        "env": build_vspipe_render_env(
+            TOOLCHAIN.vspipe_path,
+            app_dir=request.app_dir,
+            runtime=request.runtime,
+            expected_fingerprint=request.runtime_fingerprint,
+        ),
     }
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
@@ -1028,6 +1062,43 @@ class TrustedRunnerTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invocation.mode", result.stderr)
+
+    def test_wrong_job_hash_fails_before_user_script_side_effect(self):
+        """runner 必须先验证冻结 job 内容，不能先执行用户 Python。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = Path(temp_dir).resolve() / "素材" / "黍"
+            project.mkdir(parents=True)
+            sentinel = project / "user-script-ran.txt"
+            script = project / "pipeline.vpy"
+            script.write_text(
+                "# assetmaker-api: 1\n"
+                "# assetmaker-mode: raw\n"
+                "# assetmaker-capabilities: source\n"
+                "# assetmaker-requires:\n"
+                "# assetmaker-editor-output: 0\n\n"
+                "from pathlib import Path\n"
+                "import vapoursynth as vs\n"
+                f"Path({str(sentinel)!r}).write_text('ran', encoding='utf-8')\n"
+                "clip = vs.core.std.BlankClip(width=384, height=640, length=3, "
+                "fpsnum=30, fpsden=1, format=vs.YUV420P8, color=[16, 128, 128])\n"
+                "clip = vs.core.std.SetFrameProps(clip, _Matrix=6, _Transfer=6, "
+                "_Primaries=6, _ColorRange=1)\n"
+                "clip.set_output(0)\n",
+                encoding="utf-8",
+            )
+            job = project / "job.json"
+            _write_job(job)
+
+            result = _run_vspipe(
+                script=script,
+                job=job,
+                mode="raw",
+                expected_job_sha256="0" * 64,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("job", result.stderr.lower())
+        self.assertFalse(sentinel.exists())
 
     def test_bad_output_contract_makes_real_vspipe_fail(self):
         with tempfile.TemporaryDirectory() as temp_dir:
