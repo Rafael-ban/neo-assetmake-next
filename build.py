@@ -8,6 +8,8 @@ import subprocess
 import argparse
 import shutil
 import urllib.request
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 sys.setrecursionlimit(10000)
 
@@ -82,6 +84,11 @@ def parse_args(argv=None):
         "--obfuscate",
         action="store_true",
         help="Obfuscate first-party Python sources with PyArmor before packaging",
+    )
+    parser.add_argument(
+        "--no-portable",
+        action="store_true",
+        help="Skip the portable ZIP archive after cx_Freeze finishes",
     )
     return parser.parse_args(argv)
 
@@ -762,6 +769,55 @@ def generate_install_manifest():
     print(f"  Generated manifest: {manifest_path} ({len(entries)} entries)")
 
 
+def portable_archive_name(version: str = VERSION) -> str:
+    """Return the stable filename used for the Windows portable package."""
+    return f"{PROJECT_NAME}-v{version}-windows-portable.zip"
+
+
+def create_portable_archive(
+    build_dir=BUILD_DIR,
+    dist_dir=DIST_DIR,
+    version: str = VERSION,
+) -> Path:
+    """Archive the complete cx_Freeze tree as a directly runnable ZIP package.
+
+    The archive retains the top-level build directory.  Extracting it therefore
+    never scatters DLLs and resources into the caller's current directory.
+    A temporary sibling is atomically replaced only after ZipFile closes.
+    """
+    source_root = Path(build_dir)
+    if not source_root.is_dir():
+        raise FileNotFoundError(f"Portable build directory not found: {source_root}")
+
+    output_dir = Path(dist_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = output_dir / portable_archive_name(version)
+    temporary_path = archive_path.with_suffix(".zip.tmp")
+    temporary_path.unlink(missing_ok=True)
+
+    try:
+        with ZipFile(
+            temporary_path,
+            mode="w",
+            compression=ZIP_DEFLATED,
+            compresslevel=6,
+        ) as archive:
+            for source_path in sorted(source_root.rglob("*")):
+                if source_path.is_file():
+                    archive.write(
+                        source_path,
+                        source_path.relative_to(source_root.parent).as_posix(),
+                    )
+        temporary_path.replace(archive_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+    size_mb = archive_path.stat().st_size / 1024 / 1024
+    print(f"  Created portable archive: {archive_path} ({size_mb:.2f} MB)")
+    return archive_path
+
+
 def create_installer():
     """创建安装包"""
     print("\n" + "=" * 50)
@@ -832,6 +888,15 @@ def main():
 
     print(f"\ncx_Freeze done: {BUILD_DIR}/")
     generate_install_manifest()
+
+    if args.no_portable:
+        print("Portable archive skipped")
+    else:
+        try:
+            create_portable_archive()
+        except OSError as exc:
+            print(f"Portable archive creation failed: {exc}")
+            sys.exit(1)
 
     if not args.no_installer:
         if create_installer():

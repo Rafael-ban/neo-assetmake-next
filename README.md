@@ -153,11 +153,14 @@ uv run python -m unittest `
 ### 本地构建
 
 ```powershell
-# cx_Freeze 构建 + Inno Setup 安装包
+# 完整构建：cx_Freeze 目录 + 绿色免安装 ZIP + Inno Setup 安装包
 uv run python build.py
 
-# 仅构建 cx_Freeze 目录，不生成安装程序
+# 不生成安装程序，但仍生成可分发的绿色 ZIP
 uv run python build.py --no-installer
+
+# 仅供 CI 快速验证：只保留 cx_Freeze 目录，不生成 ZIP 或安装程序
+uv run python build.py --no-installer --no-portable
 
 # 清理构建目录后再构建
 uv run python build.py --clean
@@ -170,7 +173,15 @@ uv pip install "pyarmor>=8,<9"
 uv run python build.py --obfuscate
 ```
 
-`build.py` 的 cx_Freeze 输出目录是 `ArknightsPassMaker/`；Inno Setup 安装程序输出到 `dist/`。构建前需要先编译 Rust 模拟器：
+构建结果：
+
+| 产物 | 位置 | 使用方式 |
+|---|---|---|
+| 冻结目录 | `ArknightsPassMaker/` | 开发期检查 cx_Freeze 实际分发内容，不直接当作 Release 文件上传 |
+| 绿色免安装包 | `dist/ArknightsPassMaker-v<版本>-windows-portable.zip` | 解压后保留 `ArknightsPassMaker/` 整个目录，运行其中的 `ArknightsPassMaker.exe`；不能只取出单个 EXE |
+| 安装包 | `dist/*.exe` | 运行 Inno Setup 安装程序并按向导安装 |
+
+绿色包与安装包使用相同的 cx_Freeze 内容，因此均包含 `vs_worker.exe`、`resources/`、`tools/media/` 与运行时配置。构建前需要先编译 Rust 模拟器：
 
 ```powershell
 cd simulator
@@ -180,9 +191,10 @@ cd ..
 
 ### GitHub Actions
 
-- [`build.yml`](.github/workflows/build.yml)：push、Pull Request 或手动触发的 CI 入口。
-- [`build-app.yml`](.github/workflows/build-app.yml)：Windows 可复用构建流程，负责 Rust、Python、媒体工具、cx_Freeze、worker 自测与安装包。
-- [`release.yml`](.github/workflows/release.yml)：当 `docs/CHANGELOG.md` 顶部版本变化时创建发布；版本必须同时匹配 `pyproject.toml`、`config/constants.py`、`installer.iss` 与 `simulator/Cargo.toml`。
+- [`build.yml`](.github/workflows/build.yml)：push、Pull Request 或手动触发的 CI 入口。常规 CI 仍执行 Rust、全量 Python、cx_Freeze 与 worker 自测，但跳过 Inno Setup、绿色 ZIP 和 artifact 上传，以缩短反馈时间。
+- 手动运行 `Build` 工作流时，默认会同时构建并上传**安装版 EXE 与绿色免安装 ZIP**；可取消“package artifacts”仅执行快速构建验证。
+- [`build-app.yml`](.github/workflows/build-app.yml)：Windows 可复用构建流程。Release/手动产物构建会校验绿色 ZIP 可解压且包含主程序、worker、运行时配置、`portable.vs` 和内置 `.vpy`。
+- [`release.yml`](.github/workflows/release.yml)：当 `docs/CHANGELOG.md` 顶部版本变化时创建发布，同时附加安装版、绿色免安装版和同时覆盖二者的 `SHA256SUMS`。版本必须同时匹配 `pyproject.toml`、`config/constants.py`、`installer.iss` 与 `simulator/Cargo.toml`。
 
 修改 `docs/CHANGELOG.md` 顶部版本后推送会触发自动 Release；未准备发布时不要这样做。
 

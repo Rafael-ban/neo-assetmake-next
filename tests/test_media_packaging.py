@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from zipfile import ZipFile
 
 
 def _read_inno_files_entries(path):
@@ -189,6 +190,63 @@ class MediaPackagingTests(unittest.TestCase):
         self.assertIn("len(message) > 65_536", workflow)
         self.assertIn("$retiredArtifacts", workflow)
         self.assertIn("旧 VS 文件被分发", workflow)
+
+    def test_portable_archive_contains_the_complete_frozen_tree(self):
+        from build import create_portable_archive
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            frozen = root / "ArknightsPassMaker"
+            (frozen / "config").mkdir(parents=True)
+            (frozen / "nested").mkdir()
+            (frozen / "ArknightsPassMaker.exe").write_bytes(b"main")
+            (frozen / "config" / "vs_runtime.json").write_text(
+                '{"schema_version": 1}', encoding="utf-8"
+            )
+            (frozen / "nested" / "vs_worker.exe").write_bytes(b"worker")
+
+            archive = create_portable_archive(
+                build_dir=frozen,
+                dist_dir=root / "dist",
+                version="9.9.9-test",
+            )
+
+            self.assertEqual(
+                archive.name,
+                "ArknightsPassMaker-v9.9.9-test-windows-portable.zip",
+            )
+            self.assertFalse(archive.with_suffix(".zip.tmp").exists())
+            with ZipFile(archive) as package:
+                self.assertEqual(
+                    set(package.namelist()),
+                    {
+                        "ArknightsPassMaker/ArknightsPassMaker.exe",
+                        "ArknightsPassMaker/config/vs_runtime.json",
+                        "ArknightsPassMaker/nested/vs_worker.exe",
+                    },
+                )
+
+    def test_ci_publishes_installer_and_portable_only_for_artifact_builds(self):
+        workflow = Path(".github/workflows/build-app.yml").read_text(
+            encoding="utf-8"
+        )
+        release = Path(".github/workflows/release.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("build_installer:", workflow)
+        self.assertIn("upload_artifact:", workflow)
+        self.assertIn("inputs.build_installer == true", workflow)
+        self.assertIn("inputs.upload_artifact == true", workflow)
+        self.assertIn("--no-installer", workflow)
+        self.assertIn("--no-portable", workflow)
+        self.assertIn("*-windows-portable.zip", workflow)
+        self.assertIn("compression-level: 0", workflow)
+        self.assertIn("Expand-Archive", workflow)
+        self.assertIn("build_installer: true", release)
+        self.assertIn("upload_artifact: true", release)
+        self.assertIn("*-windows-portable.zip", release)
+        self.assertIn("sha256sum *.exe *-windows-portable.zip", release)
 
     def test_installer_upgrade_preserves_legacy_until_migration(self):
         from core.vs_runtime.migration import migrate_legacy_vsconfig_once

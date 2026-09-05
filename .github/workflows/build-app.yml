@@ -11,6 +11,14 @@ on:
         type: boolean
         default: false
         description: '跳过 epass_flasher/bin 检查'
+      build_installer:
+        type: boolean
+        default: false
+        description: '生成 Inno Setup 安装程序（Release 与手动产物构建时启用）'
+      upload_artifact:
+        type: boolean
+        default: false
+        description: '上传安装版与绿色免安装版产物（Release 与手动产物构建时启用）'
       obfuscate:
         type: boolean
         default: false
@@ -38,7 +46,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          submodules: true
+          # 常规 CI 使用 --skip-flasher，不需要拉取体积较大的 flasher 子模块。
+          # Release 会显式传入 false，因此仍会取得完整发布内容。
+          submodules: ${{ inputs.skip_flasher == false }}
 
       # ========== 可选：版本同步（仅 release 时传入） ==========
 
@@ -109,6 +119,10 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           version: "0.10.10"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
 
       - name: Install dependencies
         shell: bash
@@ -197,16 +211,19 @@ jobs:
           uv run --no-sync python -m unittest discover -s tests -p "test_*.py"
 
       - name: Install Inno Setup
+        if: inputs.build_installer == true
         shell: pwsh
         run: |
           choco install innosetup -y
 
-      - name: Build with cx_Freeze and Inno Setup
+      - name: Build with cx_Freeze
         shell: pwsh
         run: |
           $buildArgs = @()
           if ("${{ inputs.skip_flasher }}" -eq "true") { $buildArgs += "--skip-flasher" }
           if ("${{ inputs.obfuscate }}" -eq "true") { $buildArgs += "--obfuscate" }
+          if ("${{ inputs.build_installer }}" -ne "true") { $buildArgs += "--no-installer" }
+          if ("${{ inputs.upload_artifact }}" -ne "true") { $buildArgs += "--no-portable" }
           uv run --no-sync python build.py @buildArgs
         env:
           # qfluentwidgets 等第三方库触发的 SyntaxWarning
@@ -282,6 +299,32 @@ jobs:
           '@
           uv run --no-sync python -c $code
 
+      - name: Verify portable archive
+        if: inputs.upload_artifact == true
+        shell: pwsh
+        run: |
+          $archives = @(Get-ChildItem "dist" -Filter "*-windows-portable.zip" -File)
+          if ($archives.Count -ne 1) {
+            Write-Error "Expected exactly one portable archive, found $($archives.Count)"
+            exit 1
+          }
+          $portableSmoke = Join-Path $env:RUNNER_TEMP "portable-smoke-$([guid]::NewGuid())"
+          Expand-Archive -LiteralPath $archives[0].FullName -DestinationPath $portableSmoke
+          $requiredPortableArtifacts = @(
+            "ArknightsPassMaker/ArknightsPassMaker.exe",
+            "ArknightsPassMaker/vs_worker.exe",
+            "ArknightsPassMaker/config/vs_runtime.json",
+            "ArknightsPassMaker/tools/media/portable.vs",
+            "ArknightsPassMaker/resources/vapoursynth/default_pipeline.vpy"
+          )
+          foreach ($artifact in $requiredPortableArtifacts) {
+            if (-not (Test-Path (Join-Path $portableSmoke $artifact))) {
+              Write-Error "Required portable artifact not found: $artifact"
+              exit 1
+            }
+          }
+          Write-Host "Portable archive extraction smoke test OK"
+
       - name: Debug exe outputs
         shell: pwsh
         run: |
@@ -299,14 +342,19 @@ jobs:
           }
       
       - name: Upload build artifact
+        if: inputs.upload_artifact == true
         uses: actions/upload-artifact@v4
         with:
           name: ArknightsPassMaker-Build
           path: |
             dist/*.exe
+            dist/*-windows-portable.zip
           if-no-files-found: error
+          # EXE 与 ZIP 已分别压缩；再次进行 zlib 压缩只会拖慢上传。
+          compression-level: 0
 
       - name: Expose artifact run ID
+        if: inputs.upload_artifact == true
         id: expose-run-id
         shell: pwsh
         run: |

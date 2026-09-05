@@ -103,6 +103,8 @@ jobs:
       skip_flasher: false
       uv_sync_mode: "locked"
       obfuscate: true
+      build_installer: true
+      upload_artifact: true
       version_override: ${{ needs.check-version.outputs.version }}
 
   release:
@@ -125,7 +127,7 @@ jobs:
         shell: bash
         run: |
           cd dist
-          sha256sum *.exe > SHA256SUMS
+          sha256sum *.exe *-windows-portable.zip > SHA256SUMS
           cat SHA256SUMS
 
       - name: Extract changelog for current version
@@ -176,6 +178,7 @@ jobs:
           body: ${{ steps.changelog.outputs.CHANGELOG }}
           files: |
             dist/*.exe
+            dist/*-windows-portable.zip
             dist/SHA256SUMS
           draft: false
           prerelease: ${{ steps.changelog.outputs.PRERELEASE }}
