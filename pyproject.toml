@@ -1,6 +1,6 @@
 [project]
 name = "neo-assetmaker"
-version = "2.1.6"
+version = "2.2.0"
 description = "明日方舟通行证素材工具箱"
 readme = "README.md"
 # VapourSynth 进程内渲染要求 3.12+：捆绑的 vapoursynth wheel 是 cp312-abi3
