@@ -24,7 +24,12 @@ RUNNER = ROOT / "resources" / "vapoursynth" / "assetmaker_runner.vpy"
 
 
 def _emit(payload: dict[str, object], *, exit_code: int = 0) -> None:
-    sys.__stdout__.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    # This child speaks a JSON protocol to its parent.  GitHub's Windows
+    # Git-Bash worker can expose sys.__stdout__ as cp1252, which cannot encode
+    # our Chinese diagnostics.  ASCII-escaped JSON is valid JSON on every text
+    # stream and json.loads() in the parent restores the original Unicode.
+    sys.__stdout__.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    sys.__stdout__.flush()
     raise SystemExit(exit_code)
 
 

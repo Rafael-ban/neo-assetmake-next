@@ -994,7 +994,7 @@ class LegacyVSConfigMigrationTests(unittest.TestCase):
         payload = json.loads(user_path.read_text(encoding="utf-8"))
         self.assertEqual(
             payload["plugins"]["native_plugin_dirs"],
-            [str(install_root / "tools" / "media" / "vs-plugins")],
+            [str((install_root / "tools" / "media" / "vs-plugins").resolve())],
         )
 
     def test_relative_legacy_source_uses_resolved_install_root(self):
@@ -1024,7 +1024,7 @@ class LegacyVSConfigMigrationTests(unittest.TestCase):
         payload = json.loads(user_path.read_text(encoding="utf-8"))
         self.assertEqual(
             payload["plugins"]["native_plugin_dirs"],
-            [str(install_root / "tools" / "media" / "vs-plugins")],
+            [str((install_root / "tools" / "media" / "vs-plugins").resolve())],
         )
 
     def test_legacy_source_path_errors_are_wrapped(self):

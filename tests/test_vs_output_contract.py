@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -199,6 +200,35 @@ def _run_child(case: str) -> subprocess.CompletedProcess[str]:
         timeout=30,
         check=False,
     )
+
+
+class OutputContractChildProtocolTests(unittest.TestCase):
+    def test_emit_uses_ascii_json_on_a_cp1252_stdout(self):
+        """The child protocol remains readable on GitHub Windows Git-Bash."""
+        environment = os.environ.copy()
+        environment["PYTHONIOENCODING"] = "cp1252"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from tests.helpers.run_vs_contract_case import _emit; "
+                    "_emit({'message': '\\u4e2d\\u6587'})"
+                ),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            timeout=30,
+            check=False,
+            env=environment,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(r"\u4e2d\u6587", result.stdout)
+        self.assertEqual(json.loads(result.stdout), {"message": "中文"})
 
 
 class OutputContractPureTests(unittest.TestCase):

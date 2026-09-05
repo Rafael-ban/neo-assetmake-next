@@ -32,6 +32,11 @@ TC = MediaToolchain.discover(str(REPO))
 ENCODE_OK = HAS_CV2 and not TC.missing_for_export()
 
 
+def _resolved_path(path: str | Path) -> str:
+    """Match the widget's deliberate canonical media-path representation."""
+    return str(Path(path).resolve())
+
+
 def setUpModule():
     ensure_app()
 
@@ -105,7 +110,7 @@ class AsyncLoadTests(unittest.TestCase):
         QCoreApplication.processEvents()
         self.assertEqual(loaded.get("n"), 90)
         self.assertTrue(self.w._has_video)
-        self.assertEqual(self.w.video_path, self.file_a)
+        self.assertEqual(self.w.video_path, _resolved_path(self.file_a))
         self.assertEqual((self.w.video_width, self.w.video_height), (240, 360))
 
     def test_probe_failure_emits_load_failed(self):
@@ -137,8 +142,8 @@ class AsyncLoadTests(unittest.TestCase):
 
         self.client.emit_metadata(request_b, self._metadata(epoch_b))
         QCoreApplication.processEvents()
-        self.assertEqual(loaded, [self.file_b])
-        self.assertEqual(self.w.video_path, self.file_b)
+        self.assertEqual(loaded, [_resolved_path(self.file_b)])
+        self.assertEqual(self.w.video_path, _resolved_path(self.file_b))
 
     def test_stale_probe_failure_is_discarded_after_clear(self):
         failures = []
@@ -213,7 +218,7 @@ class AsyncLoadRealMediaTests(unittest.TestCase):
         time.sleep(0.3)
         QCoreApplication.processEvents()
         self.assertEqual(len(events), 1, "stale probe must not double-fire video_loaded")
-        self.assertEqual(w.video_path, str(self.mp4))
+        self.assertEqual(w.video_path, _resolved_path(self.mp4))
         self.assertTrue(w._has_video)
 
 

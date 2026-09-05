@@ -280,6 +280,65 @@ class TempCleanupTests(unittest.TestCase):
             self.assertEqual(leftovers, [], f"temp files left behind: {leftovers}")
 
 
+class ExportPathIdentityTests(unittest.TestCase):
+    """Windows path spelling must not weaken sealed-package checks."""
+
+    def test_non_reparse_directory_identity_accepts_short_long_aliases(self):
+        from core.export_service import (
+            _FilesystemIdentity,
+            _is_same_non_reparse_directory,
+        )
+
+        short_parent = Path(r"C:\Users\RUNNER~1\AppData\Local\Temp")
+        long_parent = Path(r"C:\Users\runneradmin\AppData\Local\Temp")
+        identity = _FilesystemIdentity(1, 2, 0, 0)
+        with mock.patch(
+            "core.export_service._is_reparse_or_symlink", return_value=False
+        ), mock.patch.object(Path, "is_dir", return_value=True), mock.patch(
+            "core.export_service._filesystem_identity",
+            side_effect=(identity, identity),
+        ):
+            self.assertTrue(
+                _is_same_non_reparse_directory(short_parent, long_parent)
+            )
+
+    def test_package_path_accepts_transaction_parent_alias(self):
+        from core.export_service import (
+            ExportWorker,
+            _PreparedExportPackage,
+        )
+
+        short_parent = Path(r"C:\Users\RUNNER~1\AppData\Local\Temp")
+        long_parent = Path(r"C:\Users\runneradmin\AppData\Local\Temp")
+        staging_dir = long_parent / ".package.staging-token"
+        package = _PreparedExportPackage(
+            final_dir=short_parent / "package",
+            staging_dir=staging_dir,
+            backup_dir=short_parent / ".package.backup-token",
+            work_dir=staging_dir / ".assetmaker-work",
+            tasks=(),
+            manifest=(),
+            epconfig_bytes=b"{}",
+        )
+        with mock.patch(
+            "core.export_service._is_same_non_reparse_directory",
+            return_value=True,
+        ) as same_parent, mock.patch.object(
+            ExportWorker, "_assert_directory_identity"
+        ) as assert_identity:
+            ExportWorker._assert_package_path(
+                package,
+                staging_dir,
+                ".package.staging-",
+                None,
+            )
+
+        same_parent.assert_called_once_with(staging_dir.parent, short_parent)
+        assert_identity.assert_called_once_with(
+            staging_dir, None, "清理或移动"
+        )
+
+
 @unittest.skipUnless(HAS_CV2, "opencv-python required for PNG artifact tasks")
 class AtomicPackageTests(unittest.TestCase):
     def _worker(self, tasks, root: Path):

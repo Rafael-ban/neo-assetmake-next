@@ -218,6 +218,29 @@ def _is_same_filesystem_object(
     return (expected.device, expected.inode) == (actual.device, actual.inode)
 
 
+def _is_same_non_reparse_directory(left: Path, right: Path) -> bool:
+    """Compare existing transaction parents without trusting their spelling.
+
+    Windows can expose one directory through both a legacy 8.3 path and its
+    long-name path.  ``tempfile.mkdtemp()`` is free to return either spelling,
+    so lexical ``Path`` equality cannot prove that its result escaped the
+    export parent.  Compare the non-reparse directory identities instead.
+
+    Do not use ``Path.resolve()`` here: resolving links before this check would
+    weaken the transaction's deliberate no-links/no-junctions boundary.
+    """
+    try:
+        if _is_reparse_or_symlink(left) or _is_reparse_or_symlink(right):
+            return False
+        if not left.is_dir() or not right.is_dir():
+            return False
+        return _is_same_filesystem_object(
+            _filesystem_identity(left), _filesystem_identity(right)
+        )
+    except OSError:
+        return False
+
+
 def _capture_final_generation(final_dir: Path) -> _FinalGeneration:
     """Capture the exact replaceable package generation, never following links."""
     if not os.path.lexists(final_dir):
@@ -655,7 +678,9 @@ class ExportWorker(QThread):
         expected_identity: _FilesystemIdentity | None,
     ) -> None:
         if (
-            path.parent != package.final_dir.parent
+            not _is_same_non_reparse_directory(
+                path.parent, package.final_dir.parent
+            )
             or not path.name.startswith(prefix)
         ):
             raise RuntimeError(f"拒绝清理或移动非本次导出路径: {path}")
@@ -1028,7 +1053,9 @@ class ExportService(QObject):
                 )
             )
             if (
-                staging_dir.parent != final_parent
+                not _is_same_non_reparse_directory(
+                    staging_dir.parent, final_parent
+                )
                 or _is_reparse_or_symlink(staging_dir)
             ):
                 raise RuntimeError(f"导出 staging 路径无效: {staging_dir}")
