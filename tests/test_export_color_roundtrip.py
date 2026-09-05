@@ -31,7 +31,6 @@ except ImportError:
 from tests.qt_harness import ensure_app
 
 from core.media_tools import MediaToolchain
-from tests.helpers.vs_isolation import IsolatedVSCase
 
 REPO = Path(__file__).resolve().parent.parent
 TC = MediaToolchain.discover(str(REPO))
@@ -40,11 +39,6 @@ ENCODE_OK = HAS_CV2 and not TC.missing_for_export()
 
 def setUpModule():
     ensure_app()
-
-
-class ParentProcessIsolationTests(IsolatedVSCase):
-    def test_parent_does_not_import_vapoursynth_or_vs_engine(self):
-        self.assert_parent_has_no_vs()
 
 
 def _export_image_loop(png_path: Path, out_mp4: Path, *, cropbox, rotation=0,
@@ -79,7 +73,7 @@ def _decode_first_frame(mp4: Path) -> np.ndarray:
 
 
 @unittest.skipUnless(ENCODE_OK, "encode toolchain (tools/media) unavailable")
-class ExportColorRoundTripTests(IsolatedVSCase):
+class ExportColorRoundTripTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.d = Path(tempfile.mkdtemp())
@@ -121,10 +115,6 @@ class ExportColorRoundTripTests(IsolatedVSCase):
                 f"{name}: expected≈{expected.round(1)} got≈{got.round(1)} "
                 f"(Δmax={delta:.1f}) — colour matrix mismatch",
             )
-
-    def test_stream_is_tagged_smpte170m(self):
-        """The prop read needs a VS core, so it belongs to a clean child."""
-        self.assertEqual(self.run_vs_child("vui_contract")["status"], "ok")
 
     def test_image_loop_honours_offcenter_crop(self):
         # Left half red, right half blue; crop selects the LEFT half.

@@ -29,9 +29,14 @@ def _emit(payload: dict[str, object], *, exit_code: int = 0) -> None:
 
 
 def _load_vs():
-    from core import vs_engine
+    from config.vs_runtime import load_vs_runtime
+    from core.vs_runtime.vs_loader import load_vapoursynth
 
-    return vs_engine.load_vapoursynth()
+    runtime = load_vs_runtime(
+        ROOT / "config" / "vs_runtime.json",
+        ROOT / "tests" / "fixtures" / ".vs_runtime.user.json",
+    )
+    return load_vapoursynth(ROOT, runtime)
 
 
 def _executor_deferred_case() -> dict[str, object]:
@@ -1816,6 +1821,20 @@ def _default_p7_case() -> dict[str, object]:
     }
 
 
+def _encoded_vui_case() -> dict[str, int]:
+    if len(sys.argv) != 3:
+        raise ValueError("encoded_vui requires an MP4 path")
+    clip = _load_vs().core.lsmas.LWLibavSource(str(Path(sys.argv[2]).resolve()))
+    frame = clip.get_frame(0)
+    try:
+        return {
+            name: int(frame.props[name])
+            for name in ("_Matrix", "_Transfer", "_Primaries", "_ColorRange")
+        }
+    finally:
+        frame.close()
+
+
 CASES = {
     "contract_bytes_late": _contract_bytes_late_case,
     "contract_bytes_sentinel": _contract_bytes_sentinel_case,
@@ -1827,6 +1846,7 @@ CASES = {
     "default_image": _default_image_case,
     "default_p7": _default_p7_case,
     "default_video": _default_video_case,
+    "encoded_vui": _encoded_vui_case,
     "executor_deferred": _executor_deferred_case,
     "executor_cross_root": _executor_cross_root_case,
     "executor_mixed_namespace_failure": _executor_mixed_namespace_failure_case,
@@ -1853,7 +1873,7 @@ CASES = {
 
 
 def main() -> None:
-    if len(sys.argv) != 2 or sys.argv[1] not in CASES:
+    if len(sys.argv) < 2 or sys.argv[1] not in CASES:
         _emit({"error": "unknown case"}, exit_code=2)
     try:
         payload = CASES[sys.argv[1]]()

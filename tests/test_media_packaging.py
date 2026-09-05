@@ -86,7 +86,6 @@ class MediaPackagingTests(unittest.TestCase):
             [destination for _, destination in entries],
             [
                 "config/vs_runtime.json",
-                "config/vsconfig.json",
                 "schemas/vs_runtime.schema.json",
                 "schemas/vs_job.schema.json",
             ],
@@ -103,7 +102,6 @@ class MediaPackagingTests(unittest.TestCase):
             root = Path(temp_dir)
             for relative in (
                 "config/vs_runtime.json",
-                "config/vsconfig.json",
                 "schemas/vs_runtime.schema.json",
             ):
                 path = root / relative
@@ -189,6 +187,8 @@ class MediaPackagingTests(unittest.TestCase):
                 self.assertIn(artifact, workflow)
         self.assertIn('"中文自测" in message', workflow)
         self.assertIn("len(message) > 65_536", workflow)
+        self.assertIn("$retiredArtifacts", workflow)
+        self.assertIn("旧 VS 文件被分发", workflow)
 
     def test_installer_upgrade_preserves_legacy_until_migration(self):
         from core.vs_runtime.migration import migrate_legacy_vsconfig_once
@@ -198,13 +198,8 @@ class MediaPackagingTests(unittest.TestCase):
             root = Path(temp_dir)
             payload = root / "ArknightsPassMaker"
             app_dir = root / "installed"
-            shipped_legacy = payload / "config" / "vsconfig.json"
             shipped_runtime = payload / "config" / "vs_runtime.json"
-            shipped_legacy.parent.mkdir(parents=True)
-            shipped_legacy.write_text(
-                '{"core":{"num_threads":0,"max_cache_size_mb":0}}',
-                encoding="utf-8",
-            )
+            shipped_runtime.parent.mkdir(parents=True)
             shipped_runtime.write_text('{"schema_version":1}', encoding="utf-8")
 
             installed_legacy = app_dir / "config" / "vsconfig.json"
@@ -237,21 +232,25 @@ class MediaPackagingTests(unittest.TestCase):
                 7,
             )
 
-    def test_installer_fresh_install_receives_legacy_default(self):
+    def test_installer_fresh_install_does_not_receive_legacy_default(self):
         entries = _read_inno_files_entries(Path("installer.iss"))
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            source = root / "ArknightsPassMaker" / "config" / "vsconfig.json"
+            source = root / "ArknightsPassMaker" / "config" / "vs_runtime.json"
             source.parent.mkdir(parents=True)
-            source.write_bytes(b"shipped-default")
+            source.write_text('{"schema_version":1}', encoding="utf-8")
             app_dir = root / "installed"
 
             _simulate_inno_files(entries, root, app_dir)
 
-            self.assertEqual(
-                (app_dir / "config" / "vsconfig.json").read_bytes(),
-                b"shipped-default",
+            self.assertFalse(
+                (app_dir / "config" / "vsconfig.json").exists(),
+                "新安装不应再分发已废弃的 vsconfig.json",
             )
+        installer = Path("installer.iss").read_text(encoding="utf-8-sig")
+        self.assertNotIn(
+            'Source: "ArknightsPassMaker\\config\\vsconfig.json"', installer
+        )
 
     def test_runtime_source_does_not_reference_removed_ffmpeg_stack(self):
         disallowed_tokens = (

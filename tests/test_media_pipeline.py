@@ -8,7 +8,6 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
-from core.export_service import VideoExportParams
 
 
 def _render_request():
@@ -189,16 +188,12 @@ class MediaToolchainTests(unittest.TestCase):
                 muxer_path="MP4Box.exe",
             )
 
-            # M5/C1: 插件和脚本 callable 的资格只由同一 frozen RenderSession 的
-            # worker preflight + runner contract 判断；export gate 不得重新读取
-            # legacy vsconfig，也不得为 VSPipe 调用 legacy subprocess env。
-            with mock.patch(
-                "config.vsconfig.load_vsconfig",
-                side_effect=AssertionError("legacy VSConfig must not be read"),
-            ), mock.patch.object(
+            # 插件和脚本 callable 的资格只由 frozen RenderSession 的 worker
+            # preflight + runner contract 判断；此 gate 只读取 executable 字段。
+            with mock.patch.object(
                 media_tools,
                 "build_media_subprocess_env",
-                side_effect=AssertionError("legacy VSPipe env must not be built"),
+                side_effect=AssertionError("export gate must not build an env"),
             ):
                 missing = toolchain.missing_for_export()
 
@@ -283,111 +278,6 @@ class MediaToolchainTests(unittest.TestCase):
                         f"to float: {exc}"
                     )
                 self.assertEqual(actual, command)
-
-
-class VapourSynthScriptTests(unittest.TestCase):
-    def test_writes_video_script_with_trim_crop_resize_and_padding(self):
-        from core.vs_script import write_vpy_script
-
-        params = VideoExportParams(
-            video_path=r"C:\media\loop.mp4",
-            cropbox=(10, 20, 100, 200),
-            start_frame=5,
-            end_frame=35,
-            fps=30.0,
-            resolution="360x640",
-            rotation=180,
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_path = Path(temp_dir) / "loop.vpy"
-            write_vpy_script(script_path, params)
-            script = script_path.read_text(encoding="utf-8")
-
-        self.assertIn("import vapoursynth as vs", script)
-        self.assertIn("LWLibavSource", script)
-        self.assertIn("clip = clip[5:35]", script)
-        self.assertIn("core.std.Crop", script)
-        self.assertIn("core.resize.Bicubic", script)
-        self.assertIn("core.std.AddBorders", script)
-        self.assertIn("format=vs.YUV420P8", script)
-        # Video sources are normalized to SMPTE 170M: unspecified _Matrix (2)
-        # gets the H.273 resolution heuristic stamped, then resize converts.
-        self.assertIn("matrix_s='170m'", script)
-        self.assertIn("_Matrix", script)
-        self.assertNotIn("ffmpeg", script.lower())
-
-    def test_video_script_never_emits_empty_trim(self):
-        from core.vs_script import write_vpy_script
-
-        params = VideoExportParams(
-            video_path=r"C:\media\loop.mp4",
-            cropbox=(0, 0, 0, 0),
-            start_frame=5,
-            end_frame=5,  # degenerate trim: clip[5:5] would be an EMPTY clip
-            fps=30.0,
-            resolution="360x640",
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_path = Path(temp_dir) / "loop.vpy"
-            write_vpy_script(script_path, params)
-            script = script_path.read_text(encoding="utf-8")
-
-        self.assertIn("clip = clip[5:6]", script)
-
-    def test_writes_image_loop_script(self):
-        from core.vs_script import write_vpy_script
-
-        params = VideoExportParams(
-            video_path=r"C:\media\logo.png",
-            cropbox=(0, 0, 0, 0),
-            start_frame=0,
-            end_frame=30,
-            fps=30.0,
-            resolution="720x1080",
-            is_image=True,
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_path = Path(temp_dir) / "image.vpy"
-            write_vpy_script(script_path, params)
-            script = script_path.read_text(encoding="utf-8")
-
-        self.assertIn("core.imwri.Read", script)
-        self.assertIn("core.std.Loop", script)
-        self.assertIn("times=30", script)
-        self.assertNotIn("length=30", script)
-        self.assertIn("width=720", script)
-        self.assertIn("height=1080", script)
-        # RGB->YUV conversion matrix must match the smpte170m VUI tags (sub-HD
-        # targets decode as BT.601 by convention; the old '709' produced a
-        # visible colour shift on export).
-        self.assertIn("matrix_s='170m'", script)
-        self.assertNotIn("matrix_s='709'", script)
-
-    def test_image_loop_script_applies_crop_and_rotation(self):
-        # The crop/rotation blocks used to live only in the video branch, so an
-        # image loop silently ignored the user's framing. They are shared now.
-        from core.vs_script import write_vpy_script
-
-        params = VideoExportParams(
-            video_path=r"C:\media\bg.png",
-            cropbox=(10, 20, 100, 200),
-            start_frame=0,
-            end_frame=30,
-            fps=30.0,
-            resolution="360x640",
-            is_image=True,
-            rotation=90,
-        )
-        with tempfile.TemporaryDirectory() as temp_dir:
-            script_path = Path(temp_dir) / "image.vpy"
-            write_vpy_script(script_path, params)
-            script = script_path.read_text(encoding="utf-8")
-
-        self.assertIn("core.std.Transpose", script)
-        self.assertIn("core.std.FlipHorizontal", script)
-        self.assertIn("core.std.CropAbs", script)
-        # Loop AFTER rotate/crop: one processed frame duplicated.
-        self.assertLess(script.index("CropAbs"), script.index("std.Loop"))
 
 
 class EncoderRunTests(unittest.TestCase):

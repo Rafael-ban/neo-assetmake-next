@@ -47,6 +47,24 @@ class DefaultPipelineHeaderTests(unittest.TestCase):
         )
 
 
+class DefaultPipelineSemanticTests(unittest.TestCase):
+    def test_default_script_orders_rotation_loop_trim_crop_and_padding(self):
+        """默认 compatible 脚本保留旧 goldens 覆盖的渲染语义，不锁定字节。"""
+        source = DEFAULT_PIPELINE.read_text(encoding="utf-8")
+        ordered_steps = (
+            "clip = rotate(clip, transform[\"rotation\"])",
+            "clip = core.std.Loop(clip, times=virtual_count)[:virtual_count]",
+            "clip.set_output(1)",
+            'clip = clip[timeline["start_frame"] : timeline["end_frame"]]',
+            "clip = crop_safely(",
+            "clip = core.resize.Bicubic(",
+            "clip = core.std.AddBorders(",
+            "clip.set_output(0)",
+        )
+        positions = [source.index(step) for step in ordered_steps]
+        self.assertEqual(positions, sorted(positions))
+
+
 class DefaultPipelineRealSubprocessTests(unittest.TestCase):
     def test_image_loops_full_editor_timeline_before_nonzero_trim(self):
         result = _run_child("default_image")

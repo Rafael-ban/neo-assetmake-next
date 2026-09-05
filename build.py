@@ -29,7 +29,6 @@ MEDIA_TOOL_CANDIDATES = [
 ]
 VS_CONTRACT_FILES = (
     "config/vs_runtime.json",
-    "config/vsconfig.json",
     "schemas/vs_runtime.schema.json",
     "schemas/vs_job.schema.json",
 )

@@ -226,30 +226,6 @@ class TransitionPreviewTests(unittest.TestCase):
         self.assertIn("transition_preview.set_target_resolution", src)
 
 
-class ExportRatioGuardTests(unittest.TestCase):
-    """vs_script.crop() must shrink both axes by one shared factor."""
-
-    def test_script_emits_ratio_preserving_clamp(self):
-        import tempfile
-        from pathlib import Path
-        from core.vs_script import write_vpy_script
-        from core.export_service import VideoExportParams
-
-        params = VideoExportParams(
-            video_path=r"C:\media\loop.mp4", cropbox=(10, 20, 100, 200),
-            start_frame=0, end_frame=30, fps=30.0, resolution="360x640",
-        )
-        with tempfile.TemporaryDirectory() as d:
-            script = Path(d) / "s.vpy"
-            write_vpy_script(str(script), params)
-            text = script.read_text(encoding="utf-8")
-        self.assertIn("_ar = 0.5625", text)
-        self.assertIn("_scale = min(", text)
-        # both axes derived from the shared scale, then re-locked to the ratio
-        self.assertIn("_ch = int(min(_ch, round(_cw / _ar)))", text)
-        self.assertIn("_cw = _cw & ~1", text)
-
-
 class ValidatorCropTests(unittest.TestCase):
     def _cfg(self, crop, screen="360x640"):
         return {

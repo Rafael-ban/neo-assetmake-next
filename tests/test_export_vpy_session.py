@@ -109,8 +109,8 @@ class ExportSessionTests(unittest.TestCase):
             },
         )
 
-    def test_export_video_eligibility_does_not_use_legacy_vapoursynth_config(self):
-        """M5 C1：资格门只检查三项 executable，不重开 legacy VS runtime。"""
+    def test_export_video_preflights_frozen_session_before_encoding(self):
+        """资格门只检查 executable；worker preflight 验证 frozen session。"""
         from core.export_service import ExportWorker
         from core.vs_runtime.session import NodeMetadata, SessionMetadata
 
@@ -137,13 +137,7 @@ class ExportSessionTests(unittest.TestCase):
                 ),
                 editor=None,
             )
-            with mock.patch(
-                "config.vsconfig.load_vsconfig",
-                side_effect=AssertionError("legacy VSConfig must not be read"),
-            ), mock.patch(
-                "core.media_tools.build_media_subprocess_env",
-                side_effect=AssertionError("legacy VSPipe env must not be built"),
-            ), mock.patch("core.export_service.SyncVSWorkerProcess") as process_type, mock.patch(
+            with mock.patch("core.export_service.SyncVSWorkerProcess") as process_type, mock.patch(
                 "core.export_service.MediaEncoder"
             ) as encoder_type, mock.patch.object(
                 ExportWorker,

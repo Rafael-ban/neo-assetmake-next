@@ -239,6 +239,21 @@ jobs:
               exit 1
             }
           }
+          $retiredArtifacts = @(
+            "ArknightsPassMaker/config/vsconfig.json",
+            "ArknightsPassMaker/lib/core/vs_graph.pyc",
+            "ArknightsPassMaker/lib/core/vs_script.pyc",
+            "ArknightsPassMaker/lib/core/vs_engine.pyc",
+            "ArknightsPassMaker/lib/core/vs_player.pyc",
+            "ArknightsPassMaker/lib/core/vs_frame.pyc",
+            "ArknightsPassMaker/lib/config/vsconfig.pyc"
+          )
+          foreach ($artifact in $retiredArtifacts) {
+            if (Test-Path $artifact) {
+              Write-Error "旧 VS 文件被分发: $artifact"
+              exit 1
+            }
+          }
           Write-Host "Running vs_worker.exe --self-test through WorkerProcess..."
           $code = @'
           from pathlib import Path

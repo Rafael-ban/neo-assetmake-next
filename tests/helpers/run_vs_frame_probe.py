@@ -1,4 +1,4 @@
-"""Clean interpreter helper for tests that must construct a VapourSynth core.
+"""Clean-process probes for the portable VapourSynth worker runtime.
 
 Do not import PyQt here. The parent test module intentionally stays VS-free so
 it can run beside Qt preview worker tests without triggering the bundled
@@ -17,18 +17,44 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def _frame_contract() -> dict[str, object]:
-    from core import vs_engine
-    from core.vs_frame import frame_to_bgr, request_bgr_frame, to_display_rgb_clip
+def _load_vs():
+    from config.vs_runtime import load_vs_runtime
+    from core.vs_runtime.vs_loader import load_vapoursynth
 
-    vs = vs_engine.load_vapoursynth()
-    core = vs_engine.get_core()
+    runtime = load_vs_runtime(ROOT / "config" / "vs_runtime.json")
+    return load_vapoursynth(ROOT, runtime)
+
+
+def _frame_to_bgr(frame) -> np.ndarray:
+    """Read real planar RGB24 valid rows/columns and convert them to BGR."""
+    if frame.format.name != "RGB24" or frame.format.num_planes != 3:
+        raise ValueError("probe expects a planar RGB24 frame")
+    planes = []
+    for plane in range(3):
+        array = np.asarray(frame[plane])
+        if array.ndim != 2 or array.shape[0] < frame.height:
+            raise AssertionError("RGB24 plane is shorter than its valid rows")
+        if array.shape[1] < frame.width or array.dtype != np.uint8:
+            raise AssertionError("RGB24 plane is shorter than its valid columns")
+        planes.append(np.ascontiguousarray(array[: frame.height, : frame.width]))
+    return np.ascontiguousarray(np.stack((planes[2], planes[1], planes[0]), axis=-1))
+
+
+def _frame_contract() -> dict[str, object]:
+    sys.path.insert(0, str(ROOT / "resources" / "vapoursynth" / "python"))
+    vs = _load_vs()
+    from assetmaker_vs.display import to_display_clip
+
+    core = vs.core
 
     red = core.std.BlankClip(
         width=64, height=32, length=1, format=vs.RGB24, color=[255, 0, 0]
     )
-    red_bgr = request_bgr_frame(red, 0)
-    assert red_bgr is not None
+    red_frame = red.get_frame(0)
+    try:
+        red_bgr = _frame_to_bgr(red_frame)
+    finally:
+        red_frame.close()
     assert red_bgr.shape == (32, 64, 3)
     assert red_bgr.dtype == np.uint8
     assert tuple(int(v) for v in red_bgr[0, 0]) == (0, 0, 255)
@@ -36,16 +62,22 @@ def _frame_contract() -> dict[str, object]:
     blue = core.std.BlankClip(
         width=8, height=8, length=1, format=vs.RGB24, color=[0, 0, 255]
     )
-    blue_bgr = request_bgr_frame(blue, 0)
-    assert blue_bgr is not None
+    blue_frame = blue.get_frame(0)
+    try:
+        blue_bgr = _frame_to_bgr(blue_frame)
+    finally:
+        blue_frame.close()
     assert tuple(int(v) for v in blue_bgr[0, 0]) == (255, 0, 0)
 
     # Width 360 has a measured 384-byte plane stride in the bundled core.
     green = core.std.BlankClip(
         width=360, height=16, length=1, format=vs.RGB24, color=[0, 255, 0]
     )
-    green_bgr = request_bgr_frame(green, 0)
-    assert green_bgr is not None
+    green_frame = green.get_frame(0)
+    try:
+        green_bgr = _frame_to_bgr(green_frame)
+    finally:
+        green_frame.close()
     assert green_bgr.shape == (16, 360, 3)
     assert bool((green_bgr[:, :, 1] == 255).all())
     assert bool((green_bgr[:, :, 0] == 0).all())
@@ -54,7 +86,7 @@ def _frame_contract() -> dict[str, object]:
         width=32, height=16, length=1, format=vs.RGB24, color=[10, 20, 30]
     ).get_frame(0)
     try:
-        owned_bgr = frame_to_bgr(owned)
+        owned_bgr = _frame_to_bgr(owned)
     finally:
         owned.close()
     assert owned_bgr is not None
@@ -64,35 +96,58 @@ def _frame_contract() -> dict[str, object]:
     gray = core.std.BlankClip(width=16, height=16, length=1, format=vs.GRAY8)
     gray_frame = gray.get_frame(0)
     try:
-        assert frame_to_bgr(gray_frame) is None
+        try:
+            _frame_to_bgr(gray_frame)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("non-RGB frame unexpectedly accepted")
     finally:
         gray_frame.close()
 
-    yuv = core.std.BlankClip(width=48, height=32, length=1, format=vs.YUV420P8)
-    rgb = to_display_rgb_clip(yuv, vs)
+    yuv = core.std.SetFrameProps(
+        core.std.BlankClip(
+            width=48, height=32, length=1, format=vs.YUV420P8
+        ),
+        _Matrix=6,
+        _Transfer=6,
+        _Primaries=6,
+        _ColorRange=1,
+    )
+    rgb = to_display_clip(
+        yuv,
+        viewport=(48, 32),
+        zoom_factor=1.0,
+        pan=(0.5, 0.5),
+    )
     assert rgb.format.id == vs.RGB24
-    assert to_display_rgb_clip(rgb, vs) is rgb
-    return {"status": "ok"}
-
-
-def _source_cache(path: Path) -> dict[str, object]:
-    from core import vs_engine
-
-    vs_engine.clear_caches()
-    first = vs_engine.source_clip(str(path))
-    second = vs_engine.source_clip(str(path))
-    assert first is second
+    rgb_frame = rgb.get_frame(0)
+    try:
+        assert _frame_to_bgr(rgb_frame).shape == (32, 48, 3)
+    finally:
+        rgb_frame.close()
     return {"status": "ok"}
 
 
 def _real_frame(path: Path) -> dict[str, object]:
-    from core import vs_engine
-    from core.vs_frame import request_bgr_frame, to_display_rgb_clip
+    sys.path.insert(0, str(ROOT / "resources" / "vapoursynth" / "python"))
+    vs = _load_vs()
+    from assetmaker_vs.display import to_display_clip
 
-    vs = vs_engine.load_vapoursynth()
-    clip = to_display_rgb_clip(vs_engine.source_clip(str(path)), vs)
-    frame = request_bgr_frame(clip, 10)
-    assert frame is not None
+    source = vs.core.lsmas.LWLibavSource(str(path))
+    clip = to_display_clip(
+        source,
+        viewport=(384, 640),
+        zoom_factor=1.0,
+        pan=(0.5, 0.5),
+    )
+    source_frame = source.get_frame(10)
+    source_frame.close()
+    rgb_frame = clip.get_frame(10)
+    try:
+        frame = _frame_to_bgr(rgb_frame)
+    finally:
+        rgb_frame.close()
     assert frame.ndim == 3
     assert frame.shape[2] == 3
     return {"shape": list(frame.shape), "mean": int(frame.mean())}
@@ -104,8 +159,6 @@ def _main() -> dict[str, object]:
     case = sys.argv[1]
     if case == "frame_contract":
         return _frame_contract()
-    if case == "source_cache":
-        return _source_cache(Path(sys.argv[2]).resolve())
     if case == "real_frame":
         return _real_frame(Path(sys.argv[2]).resolve())
     raise ValueError(f"unknown probe case: {case}")

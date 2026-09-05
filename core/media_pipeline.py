@@ -23,9 +23,6 @@ from resources.vapoursynth.python.assetmaker_vs.runtime_fingerprint import (
     RUNTIME_MEDIA_ROOT_ENV,
     canonical_runtime_json_bytes,
 )
-# M5 禁止生产调用点使用旧 writer；兼容 re-export 留至 M7 移除，供历史
-# 夹具与兼容性测试使用，不能作为 ExportWorker/MainWindow 的新入口。
-from core.vs_script import write_vpy_script
 
 # VSPipe -p prints "Frame: <done>/<total>" lines (\r-refreshed) to stderr.
 _VSPIPE_PROGRESS_RE = re.compile(rb"Frame:\s*(\d+)\s*/\s*(\d+)")
@@ -543,5 +540,4 @@ __all__ = [
     "build_mp4box_mux_command",
     "build_lsmash_mux_command",
     "build_mux_command",
-    "write_vpy_script",
 ]

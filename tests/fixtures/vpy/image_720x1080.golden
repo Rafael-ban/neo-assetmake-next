@@ -1,7 +1,0 @@
-import vapoursynth as vs
-core = vs.core
-clip = core.imwri.Read('C:/media/logo.png')
-clip = clip if clip.format.id == vs.RGB24 else core.resize.Bicubic(clip, format=vs.RGB24)
-clip = core.std.Loop(clip, times=30)
-clip = core.resize.Bicubic(clip, width=720, height=1080, format=vs.YUV420P8, matrix_s='170m')
-clip.set_output()

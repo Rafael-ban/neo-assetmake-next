@@ -80,7 +80,7 @@ class FrameConversionTests(_IsolatedVSCase):
 @unittest.skipUnless(
     VS_OK and ENCODE_OK, "VapourSynth / encode toolchain unavailable"
 )
-class WorkerProbeTests(_IsolatedVSCase):
+class LoaderProbeTests(_IsolatedVSCase):
     @classmethod
     def setUpClass(cls):
         from tests.helpers.m5_render_fixture import (
@@ -119,11 +119,7 @@ class WorkerProbeTests(_IsolatedVSCase):
         self.assertEqual((info.width, info.height, info.total_frames), (384, 640, 45))
         self.assertNotIn("vapoursynth", sys.modules)
 
-    def test_source_node_cache_is_owned_by_the_isolated_vs_process(self):
-        result = self._run_vs_child("source_cache", str(self.mp4))
-        self.assertEqual(result["status"], "ok")
-
-    def test_real_frame_round_trips_to_bgr_in_isolated_vs_process(self):
+    def test_real_frame_round_trips_to_bgr_in_isolated_loader_process(self):
         result = self._run_vs_child("real_frame", str(self.mp4))
         self.assertEqual(result["shape"], [640, 384, 3])
         self.assertGreater(result["mean"], 100)
