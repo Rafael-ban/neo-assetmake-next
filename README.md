@@ -124,6 +124,8 @@ uv run python rife_dlc.py --app-dir . --output dist/RIFE-DLC-r9_mod_v33.zip
 DLC 不包含主程序和 R79 基础媒体树。启用 GPU/运行库要求、脚本选择和本机插件
 目录设置见 [RIFE 配置](docs/vapoursynth-kb/17-filter-configuration.md#可选-rife-插帧到-60-fps)。
 GitHub Actions 的 **Build RIFE DLC** 可以独立生成 DLC 下载产物。
+版本发布流程会同时构建基础应用和 RIFE DLC，并在同一个 Release 提供安装版、
+绿色 ZIP、独立 DLC ZIP 与 SHA256SUMS；DLC 始终是单独下载的可选附件。
 
 ## 基本使用
 

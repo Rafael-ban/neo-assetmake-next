@@ -72,7 +72,7 @@ Windows 缺失 runtime 目录时记录一次部署提示，保留 GUI 启动。�
 | 分发/打包/layout 定向测试 | 68 父测试：59 通过、9 因 Windows 文件属性/重解析点/DLL API 不兼容 Linux而受阻；子测试合计 12 errors、2 failures，未宣称全通过 |
 | 既有真实导出集成测试 | 3 项尝试均受 Windows 路径 ABI 限制，未执行真实编码；部署 EXE 文件存在不代表 Linux 可运行它们 |
 | 新增冻结验收入口单元测试 | 10 通过；生产模型/会话序列化与真实 Qt 信号，媒体执行边界 mock；Linux 实际 CLI 非零退出并写出 platform 阶段报告 |
-| Windows 真实 worker 帧、VSPipe 编码、MP4 回读 | 当前执行环境未完成；需按下节在 Windows 跑 |
+| Windows 真实 worker 帧、VSPipe 编码、MP4 回读 | 后续 Windows CI 已通过，详见下方最新验证记录；PNG 源样本，不代表全部视频/GPU 场景 |
 
 原直接启动 main.py 的无界面超时已定位在首次使用公告的 `dialog.exec()`，属于等待交互，不应报告为主窗口崩溃。
 测试中只跳过该交互；正式产品公告逻辑保留。
@@ -90,7 +90,7 @@ Windows 缺失 runtime 目录时记录一次部署提示，保留 GUI 启动。�
 新增的 `--smoke-test` 入口运行实际生产 RenderJob/RenderSession、独立 worker IPC 与 ExportService，使用临时中文素材目录和隔离的 APPDATA；不会读取或改写用户 runtime 覆盖配置。
 测试请求第 0/11 帧并验证输出元数据，再导出 12 帧 MP4，用 OpenCV 回读帧数、尺寸和非黑画面。超时和异常写阶段报告并非零退出。
 该 PNG 样本覆盖 imwri 和编码链，不证明所有 MP4 解码器、所有滤镜、GPU/AI 算子或完整 GUI 工作流都已通过。
-构建 CI 在上传产物的流程中加入迁移目录真实验收及 JSON 报告上传；它需要下一次 Windows 构建执行，不能把新增 CI 代码说成已成功运行。
+构建 CI 在上传产物的流程中执行迁移目录真实验收并上传 JSON 报告；最新实际运行结果见下方记录。
 
 ## 发布及反馈约定
 
@@ -98,7 +98,7 @@ Windows 缺失 runtime 目录时记录一次部署提示，保留 GUI 启动。�
 - 用户使用新目录解压；旧项目保留，关闭所有实例后可清理旧 preview 缓存。
 - 反馈同时提供 `app_*.log` 与 `diagnostic-*.log`，以及便携包文件名和是否重新构建/解压；实际目录从 resolved_app_dir 看，不从 traceback 文件名猜。
 - 版本号应随真正发布同步，后续可给构建产物加入实际 commit 信息；目前 unknown 的记录只用于诚实诊断。
-- 本报告记录源码修改与本地验证结果；新增 Windows CI 验收仍需在 GitHub 上实际运行。本次未发布新的 Windows 二进制。
+- 本报告保留最初本地验证及其限制；后续 Windows CI 和 v2.2.1 开发预览发布以实际构建记录为准。
 
 ## 滤镜清单
 
@@ -126,3 +126,25 @@ Windows 缺失 runtime 目录时记录一次部署提示，保留 GUI 启动。�
 默认构建现只验证/包含R79基础树；不再要求任何VSRepo扩展或GPU模型。RIFE模板、4项依赖和DLC制作独立，资源根为tools/vs-rife，不与通用扩展同步/清理互相干扰。
 
 本地验证：基础冻结流程在可选RIFE校验故意失败的模拟边界下仍成功；分发/根目录隔离相关12个测试通过。独立脚本、路径、时间轴及默认图合同15个测试通过，后续根目录调整仅复测2个受影响测试。使用先前下载的真实DLL/模型/许可字节在新根安装校验通过：7个文件、26,559,742字节；重复同步不下载，其他扩展保持。DLC ZIP制作与最新Windows CI结果见对应PR。真实RIFE GPU推理仍需用户设备验收。
+
+
+## 最新 Windows 构建验证与 v2.2.1 开发预览
+
+PR #20 已合并，合并后的源码树与提交 482e143 的成功构建一致。
+[Build 172](https://github.com/Rafael-ban/neo-assetmaker-dev/actions/runs/38442381193)
+的 864 项 Python 测试、冻结构建、worker PIPE/Unicode 自检、绿色 ZIP 解压和 R79
+基础树校验全部通过。真实解压 EXE 迁移至中文/空格目录并从另一个工作目录启动，
+验收报告 success=true、frozen=true；PNG 源 worker 取帧、12 帧 360×640 MP4
+导出与 OpenCV 回读通过，私有工作目录和临时目录已清理。
+
+基础绿色 ZIP 实测 336.49 MiB；独立 RIFE ZIP 本地实测 21,288,923 字节，
+[Build RIFE DLC 3](https://github.com/Rafael-ban/neo-assetmaker-dev/actions/runs/38442381137)
+已成功生成下载产物。DLC 文件校验及打包不证明真实 Vulkan 推理完成。
+
+v2.2.1 统一应用、Python 项目及锁文件、安装器、模拟器及锁文件版本，更新日志
+标记为开发预览版。Auto Release 在同一提交并行构建基础应用与独立 DLC，等待两组
+构建成功后提供安装版、绿色包、DLC 和 SHA256SUMS。本次发布的实际构建结果以
+GitHub Actions 与 Release 附件为准，不把此前测试包的大小推定为新安装版的大小。
+
+用户已反馈完成人工测试；自动 PNG 验收仍不覆盖全部 MP4 解码器、完整 GUI、
+GPU 硬件及目标设备组合。

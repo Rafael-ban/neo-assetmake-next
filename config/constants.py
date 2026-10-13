@@ -7,8 +7,8 @@ from typing import Dict, Any, List
 
 # ===== 应用信息 =====
 APP_NAME = "明日方舟通行证素材工具箱"
-APP_VERSION = "2.2.0"
-APP_VERSION_LABEL = f"{APP_VERSION}（测试预览版）"
+APP_VERSION = "2.2.1"
+APP_VERSION_LABEL = f"{APP_VERSION}（开发预览版）"
 
 # ===== 基础尺寸配置 =====
 SCREEN_WIDTH = 360
