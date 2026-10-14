@@ -458,7 +458,12 @@ class ExportWorker(QThread):
             self.export_failed.emit(message)
         finally:
             self._staging_dir = ""
-            self._release_package_lock(package)
+            try:
+                self._release_package_lock(package)
+            finally:
+                # Drop copied image mats before Qt processes deferred deletion.
+                self._package = None
+                self._tasks = ()
 
     def _execute_task(self, task: ExportTask, base_progress: int, total_tasks: int) -> None:
         output_path = Path(self._staging_dir) / task.output_path

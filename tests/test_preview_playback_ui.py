@@ -52,23 +52,26 @@ class PlaybackUiTests(unittest.TestCase):
         self.assertEqual(request_frame.call_count, 2)
         preview.is_playing = False
 
-    def test_playing_builtin_crop_waits_until_pause(self):
+    def test_playing_bundled_crop_waits_until_pause(self):
         from gui.widgets.video_preview import VideoPreviewWidget, get_app_dir
 
-        preview = VideoPreviewWidget()
-        preview.video_path = "source.mp4"
-        preview._metadata_resolved = True
-        preview.is_playing = True
-        preview._session_metadata = SimpleNamespace(editor=object())
-        preview._selection = SimpleNamespace(script_path=str(
-            (Path(get_app_dir()) / "resources/vapoursynth/default_pipeline.vpy").resolve()
-        ))
-        preview._schedule_render_job(crop_only=True)
-        self.assertTrue(preview._job_dirty)
-        self.assertFalse(preview._job_debounce.isActive())
-        preview.pause()
-        self.assertTrue(preview._job_debounce.isActive())
-        preview._job_debounce.stop()
+        for script in ("default_pipeline.vpy", "rife_pipeline.vpy"):
+            with self.subTest(script=script):
+                preview = VideoPreviewWidget()
+                preview.video_path = "source.mp4"
+                preview._metadata_resolved = True
+                preview.is_playing = True
+                preview._session_metadata = SimpleNamespace(editor=object())
+                preview._selection = SimpleNamespace(script_path=str(
+                    (Path(get_app_dir()) / "resources/vapoursynth" / script).resolve()
+                ))
+                preview._schedule_render_job(crop_only=True)
+                self.assertTrue(preview._job_dirty)
+                self.assertFalse(preview._job_debounce.isActive())
+                preview.pause()
+                self.assertTrue(preview._job_debounce.isActive())
+                preview._job_debounce.stop()
+                preview.deleteLater()
 
     def test_custom_script_crop_still_reloads_during_playback(self):
         from gui.widgets.video_preview import VideoPreviewWidget

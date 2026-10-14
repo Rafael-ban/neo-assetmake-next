@@ -104,8 +104,8 @@ portable assetmaker_vs helper 根
 ## core 资源与插件
 
 worker/runner 在每次用户脚本前先恢复 core 基线或冻结的非零配置。配置值 0 表示
-原生基线；用户脚本仍可显式覆盖，例如内置模板设置 `max_cache_size=16000` MB。该值
-不是 RSS 硬上限。
+原生基线；用户脚本仍可显式覆盖。`default_pipeline.vpy` 设置 4096 MB，
+`rife_pipeline.vpy` 仍设置 16000 MB；运行时配置默认仍为 0。这些值不是 RSS 硬上限。
 
 native 目录按顺序逐个 `LoadAllPlugins`，Python 目录进入上述 import 搜索。脚本头
 requirement 在代码执行前按 namespace/callable/source 校验；缺失时应明确失败，不能

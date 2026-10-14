@@ -27,6 +27,23 @@ RGB 图片默认 sRGB/709/full。默认图实际执行 matrix、transfer、prima
 设备合同的 transfer `170m` 传入 resize 时使用 `601`，两者数值代码均为 6；
 matrix 与 primaries 的名称仍为 `170m`。
 
+## 缓存配置与对应测试
+
+缓存值分两层：程序先应用运行时配置，再执行所选脚本；脚本中的赋值会覆盖运行时初值。
+本次只调整默认脚本，没有把 RIFE 或运行时配置一起改成 4096。
+
+| 文件 | 当前值与作用 |
+| --- | --- |
+| `resources/vapoursynth/default_pipeline.vpy` | `VS_CACHE_SIZE_MB = 4096`，内置默认脚本执行时生效 |
+| `resources/vapoursynth/rife_pipeline.vpy` | `VS_CACHE_SIZE_MB = 16000`，选用 RIFE 脚本时生效 |
+| `config/vs_runtime.json`、`config/vs_runtime.py` | `max_cache_size_mb` 默认仍为 `0`，含义是恢复 VS 原生值；随后可被脚本覆盖 |
+| `tests/test_default_pipeline_cache.py` | 验证默认脚本覆盖运行时初值；本次按要求未修改测试，旧断言仍是 16000，与当前默认脚本不一致，执行时会失败，需另行同步 |
+| `tests/test_default_pipeline_rife.py` | 检查 RIFE 插帧和输出顺序、模型定位及缺文件诊断 |
+| `tests/test_rife_auto_discovery.py` | 检查独立 DLC 的自动加载、旧路径处理和运行时身份 |
+
+4096 和 16000 都是 VapourSynth 缓存策略的 MB 值，不是编辑器的总内存上限。
+导出任务持有的图片、预览缓存和插件内部内存需要各自按生命周期释放。
+
 ## 可选 RIFE 插帧到 60 fps
 
 `default_pipeline.vpy` 不包含 RIFE。需要插帧时选择独立的

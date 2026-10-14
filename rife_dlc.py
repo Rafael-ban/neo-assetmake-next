@@ -15,6 +15,8 @@ _MANIFEST = Path("resources/packaging/vs-rife.json")
 _SCRIPT = Path("resources/vapoursynth/rife_pipeline.vpy")
 _README_NAME = "RIFE-DLC-README.txt"
 _GUIDE = Path(__file__).resolve().parent / "docs" / "rife-dlc-guide.md"
+_LEGACY_README_NAME = "RIFE-DLC-v2.2.1.txt"
+_LEGACY_GUIDE = _GUIDE.with_name("rife-dlc-v2.2.1.md")
 
 
 def create_rife_dlc(app_dir: str | Path, output: str | Path) -> Path:
@@ -27,7 +29,10 @@ def create_rife_dlc(app_dir: str | Path, output: str | Path) -> Path:
     manifest = app / _MANIFEST
     if load_manifest(app, manifest)["install_root"] != "tools/vs-rife":
         raise PluginDistributionError("RIFE DLC manifest must install into tools/vs-rife")
-    readme = _GUIDE.read_text(encoding="utf-8")
+    guides = {
+        _README_NAME: _GUIDE.read_text(encoding="utf-8"),
+        _LEGACY_README_NAME: _LEGACY_GUIDE.read_text(encoding="utf-8"),
+    }
     files = verify_plugins(app, manifest)
     files.extend((manifest, app / _SCRIPT))
     members: dict[str, Path] = {}
@@ -48,9 +53,10 @@ def create_rife_dlc(app_dir: str | Path, output: str | Path) -> Path:
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for name, source in sorted(members.items()):
                 archive.write(source, name)
-            archive.writestr(_README_NAME, readme)
+            for name, content in guides.items():
+                archive.writestr(name, content)
         with zipfile.ZipFile(temporary) as archive:
-            expected = set(members) | {_README_NAME}
+            expected = set(members) | set(guides)
             if set(archive.namelist()) != expected or len(archive.namelist()) != len(expected):
                 raise PluginDistributionError("RIFE DLC ZIP has unexpected members")
             bad_member = archive.testzip()

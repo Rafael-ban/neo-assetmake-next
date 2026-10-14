@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import threading
+import weakref
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
 import time
 import unittest
 from unittest import mock
@@ -135,6 +140,46 @@ class ExportWorkerLifecycleTests(unittest.TestCase):
             self.assertEqual(failed, ["worker failure"])
 
         self.assertEqual(len(completed) + len(failed), 1)
+
+    def test_worker_releases_image_snapshot_on_every_terminal_path(self):
+        from core.export_service import ExportTask, ExportType, ExportWorker
+
+        for outcome in ("success", "failure", "cancel"):
+            with self.subTest(outcome=outcome):
+                mat = np.empty((512, 512, 4), dtype=np.uint8)
+                image_ref = weakref.ref(mat)
+                task = ExportTask(ExportType.OVERLAY, "overlay.argb", mat)
+                package = SimpleNamespace(tasks=(task,), final_dir=Path("unused"), staging_dir=Path("unused-staging"))
+                worker = ExportWorker()
+                worker.setup(package, media_toolchain=mock.Mock())
+                del mat, task, package
+
+                methods = (
+                    "_execute_task", "_validate_artifact",
+                    "_assert_all_video_identities", "_remove_private_work_dir",
+                    "_seal_package", "_assert_all_video_nonprivate_identities",
+                    "_commit_package", "_abort_package", "_release_package_lock",
+                )
+                patches = [mock.patch.object(worker, name) for name in methods]
+                try:
+                    mocks = [patcher.start() for patcher in patches]
+                    if outcome == "failure":
+                        mocks[0].side_effect = lambda *_: (_ for _ in ()).throw(RuntimeError("test failure"))
+                    if outcome == "cancel":
+                        worker.cancel()
+                    mocks[6].return_value = ""
+                    with mock.patch("core.export_service.logger.exception"):
+                        worker.run()
+                    for mocked in mocks:
+                        mocked.reset_mock()
+                    mocks[0].side_effect = None
+                finally:
+                    for patcher in reversed(patches):
+                        patcher.stop()
+
+                self.assertIsNone(worker._package)
+                self.assertEqual(worker._tasks, ())
+                self.assertIsNone(image_ref())
 
     def test_success_is_not_published_until_running_worker_exits(self):
         self._assert_terminal_waits_for_worker_exit("success")

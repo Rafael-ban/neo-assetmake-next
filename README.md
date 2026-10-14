@@ -115,8 +115,8 @@ RIFE 是可选的 60 fps 插帧 DLC。**完整解压到当前程序目录后，�
 当前源码会自动识别随包 DLL 和模型，不再要求编辑 JSON。已发布的 v2.2.1 旧 EXE 需升级才能使用此流程；
 默认“内置脚本”无需 RIFE。安装版、便携版用户请按
 [中文安装与使用说明](docs/rife-dlc-guide.md) 操作，其中有目录示意、界面步骤、报错处理和恢复内置脚本的方法；
-旧版必须使用的 JSON 配置已单列在附录。DLC 压缩包内的 `RIFE-DLC-README.txt`
-也使用这份说明。
+原 v2.2.1 用户使用[旧版专用说明](docs/rife-dlc-v2.2.1.md)。
+DLC 压缩包分别携带 `RIFE-DLC-README.txt` 和 `RIFE-DLC-v2.2.1.txt`，与这两份文档保持一致。
 
 源码运行和编译后的 EXE 使用各自的依赖目录。基础构建不会收集源码中的可选插件，
 给编译目录补装也不会更新源码目录或已有便携 ZIP。
@@ -195,7 +195,7 @@ neo-assetmaker/
 └── .github/workflows/                # CI、构建与发布工作流
 ```
 
-`config/vs_runtime.json` 仅控制 worker 超时、VS core 资源请求初值、插件目录和全局脚本位置；滤镜顺序、裁剪、颜色与输出由内置或用户 `.vpy` 明确编写，不能把这两类职责混在一起。`num_threads` / `max_cache_size_mb` 的 `0` 表示每个进程首次捕获的 VapourSynth 原生值；非零值在 worker 或 VSPipe 执行每个脚本前恢复，脚本仍可显式覆盖（内置脚本固定把 cache 设为 `16000` MB）。cache 大小不是整个进程 RSS 的硬上限。
+`config/vs_runtime.json` 仅控制 worker 超时、VS core 资源请求初值、插件目录和全局脚本位置；滤镜顺序、裁剪、颜色与输出由内置或用户 `.vpy` 明确编写，不能把这两类职责混在一起。`num_threads` / `max_cache_size_mb` 的 `0` 表示每个进程首次捕获的 VapourSynth 原生值；非零值在 worker 或 VSPipe 执行每个脚本前恢复，脚本仍可显式覆盖（`default_pipeline.vpy` 设为 `4096` MB，`rife_pipeline.vpy` 仍为 `16000` MB）。cache 大小不是整个进程 RSS 的硬上限。
 
 ## 测试
 

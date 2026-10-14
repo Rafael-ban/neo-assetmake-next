@@ -43,8 +43,8 @@
 顺序。每个 worker/VSPipe context 在启动边界冻结该配置和 runtime fingerprint；
 执行每个用户脚本前恢复 core 资源。`num_threads` / `max_cache_size_mb` 的 `0`
 表示首次捕获的 VapourSynth 原生值，非零值是脚本执行前的请求初值；脚本仍可
-显式覆盖（内置脚本固定设置 `core.max_cache_size = 16000`）。cache 不是整个进程
-RSS 的硬上限。
+显式覆盖：`default_pipeline.vpy` 设置为 4096 MB，`rife_pipeline.vpy` 仍设置为
+16000 MB。运行时分发配置仍为 0，不因默认脚本改值而改变。cache 不是整个进程 RSS 的硬上限。
 
 这些图像语义属于 `.vpy`：脚本作者可显式选择滤镜和参数；编码输出仍必须满足
 固定 output 0 契约。这样新增滤镜或插件不会要求在宿主 Python 代码中增加

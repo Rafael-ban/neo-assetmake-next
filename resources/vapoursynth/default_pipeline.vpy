@@ -21,7 +21,7 @@ core = vs.core
 
 # 可复制的默认处理参数。修改这些值或下方 process_source() 即可定制画质；
 # RenderJob 只描述编辑状态和设备输出，不承载滤镜参数。
-VS_CACHE_SIZE_MB = 16000
+VS_CACHE_SIZE_MB = 4096
 VIDEO_SOURCE_CACHE = 1  # LWLibavSource 的 .lwi 索引缓存
 UNTAGGED_HD_MIN_HEIGHT = 720  # 未标记 YUV 源按原始高度推断矩阵
 FINAL_RESIZER = core.resize.Lanczos

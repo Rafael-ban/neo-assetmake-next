@@ -1518,6 +1518,9 @@ class MainWindow(QMainWindow):
                 intro_render_session=export_data.get('intro_render_session'),
                 aux_images=aux_images,
             )
+            # Modal exec keeps this stack frame and original mats alive.
+            export_data = None
+            aux_images = None
 
             dialog.exec()
             return dialog, dir_path

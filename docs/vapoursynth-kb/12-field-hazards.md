@@ -45,11 +45,12 @@ worker 首次建 core 后捕获 `num_threads`、`max_cache_size` 等原生基线
 
 - runtime 配置为 0：恢复原生基线；
 - runtime 配置为非零：应用该明确值；
-- 内置默认脚本随后显式设置 `core.max_cache_size=16000` MB。
+- `default_pipeline.vpy` 随后显式设置 `core.max_cache_size=4096` MB；
+- 独立 `rife_pipeline.vpy` 仍设置为 16000 MB，未随默认脚本调整。
 
 该值控制 VS cache 策略，不等于进程总内存限额；frame、numpy/mmap、插件内部缓存、
 索引和 Python 对象都可能位于其外。当前运行时对长周期缓存的实际行为须用进程级 RSS/
-commit 与请求模式测量，不能把 16000 写成“最多占 16 GB”。
+commit 与请求模式测量，不能把 4096 写成“整个进程最多占 4 GB”。
 
 脚本可修改 core 资源，因此 graph 退休和下一次执行前的基线恢复是合同的一部分。
 普通 worker restart 沿用启动时冻结的 RuntimeSnapshot；只有显式应用/新 context

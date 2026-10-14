@@ -63,7 +63,7 @@ class RifeDlcTests(unittest.TestCase):
                 self.expected.pop(name)
         self.assertEqual(create_rife_dlc(self.app, self.output), self.output)
         with zipfile.ZipFile(self.output) as archive:
-            self.assertEqual(set(archive.namelist()), set(self.expected) | {"RIFE-DLC-README.txt"})
+            self.assertEqual(set(archive.namelist()), set(self.expected) | {"RIFE-DLC-README.txt", "RIFE-DLC-v2.2.1.txt"})
             self.assertIsNone(archive.testzip())
             for name, data in self.expected.items():
                 self.assertEqual(archive.read(name), data)
@@ -71,6 +71,11 @@ class RifeDlcTests(unittest.TestCase):
             guide = Path(__file__).resolve().parents[1] / "docs/rife-dlc-guide.md"
             self.assertEqual(readme, guide.read_text(encoding="utf-8"))
             self.assertIn("全局本机脚本", readme)
+            legacy = guide.with_name("rife-dlc-v2.2.1.md")
+            self.assertEqual(
+                archive.read("RIFE-DLC-v2.2.1.txt").decode("utf-8"),
+                legacy.read_text(encoding="utf-8"),
+            )
         self.assertFalse(list(self.output.parent.glob("*.partial")))
 
     def test_incomplete_addon_leaves_no_output(self):

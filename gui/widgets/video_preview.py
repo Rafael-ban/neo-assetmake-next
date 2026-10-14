@@ -648,7 +648,7 @@ class VideoPreviewWidget(QWidget):
             # trim/rotation 等 pending 状态仍由 _job_dirty 保留到提交后。
             return
         if self._job_crop_only and self._can_defer_playing_crop():
-            # The builtin editor output is the full source, independent of
+            # The bundled editor outputs are full canvases, independent of
             # crop. Keep decoding it during playback. Pause, final preview,
             # and export flush the committed crop into output 0.
             return
@@ -661,10 +661,10 @@ class VideoPreviewWidget(QWidget):
             and self._selection is not None
             and self._session_metadata is not None
             and self._session_metadata.editor is not None
-            and self._selection.script_path == str(
-                (Path(get_app_dir()) / "resources" / "vapoursynth"
-                 / "default_pipeline.vpy").resolve()
-            )
+            and self._selection.script_path in {
+                str((Path(get_app_dir()) / "resources" / "vapoursynth" / name).resolve())
+                for name in ("default_pipeline.vpy", "rife_pipeline.vpy")
+            }
         )
 
     def _flush_debounced_render_job(self) -> None:
