@@ -279,6 +279,41 @@ class PreviewWorkerRetirementTests(unittest.TestCase):
         self.assertTrue(current_path.is_file())
         self.assertTrue(all(not path.exists() for path in retired_paths))
 
+    def test_failed_reload_stops_playback_and_retry_restores_it(self):
+        self._load_resolved()
+        playback_states = []
+        self.widget.playback_state_changed.connect(playback_states.append)
+        self.widget.play()
+        self.assertTrue(self.widget.timer.isActive())
+
+        failed_session = self.widget.flush_render_job()
+        failed_request = self.widget._load_request_id
+        self.client.request_failed.emit(failed_request, "script.error", "bad script")
+        QCoreApplication.processEvents()
+
+        self.assertFalse(self.widget.is_playing)
+        self.assertFalse(self.widget.timer.isActive())
+        self.assertFalse(self.widget._has_video)
+        self.assertEqual(playback_states, [True, False])
+        self.assertFalse(self.widget.restart_button.isHidden())
+        self.assertIsNone(self.widget._load_request_id)
+        self.assertTrue(Path(failed_session.job_path).is_file())
+
+        self.widget.restart_rendering()
+        self.assertEqual(self.client.restarts, 1)
+        self.client.ready.emit()
+        self.client.emit_metadata(
+            self.widget._load_request_id,
+            self._metadata(failed_session.epoch),
+        )
+        QCoreApplication.processEvents()
+        self.assertTrue(self.widget._has_video)
+        self.assertTrue(self.widget._worker_ready_for_frames)
+        self.assertTrue(self.widget.restart_button.isHidden())
+        self.widget.play()
+        self.assertEqual(playback_states, [True, False, True])
+        self.widget.pause()
+
     def test_worker_death_releases_a_retiring_job(self):
         session = self._load_resolved()
         job_path = Path(session.job_path)
@@ -333,6 +368,23 @@ class PreviewIdleReleaseTests(unittest.TestCase):
         self.assertEqual(replacement.loads, [session])
         replacement.emit_metadata(self.widget._load_request_id, self.metadata)
         self.assertEqual(replacement.requests[-1].index, 2)
+
+    def test_retry_after_worker_release_starts_a_new_client(self):
+        self.widget.release_worker_resources()
+        with self.assertLogs("gui.widgets.video_preview", level="ERROR"):
+            self.widget._show_worker_unavailable("worker gone")
+        self.assertFalse(self.widget._has_video)
+        self.assertFalse(self.widget.restart_button.isHidden())
+
+        self.widget.restart_rendering()
+        replacement = self.clients[-1]
+        self.assertIsNot(replacement, self.client)
+        self.assertEqual(replacement.started, 1)
+        replacement.ready.emit()
+        self.assertEqual(replacement.loads, [self.widget._render_session])
+        replacement.emit_metadata(self.widget._load_request_id, self.metadata)
+        self.assertTrue(self.widget._has_video)
+        self.assertTrue(self.widget.restart_button.isHidden())
 
     def test_capture_after_release_waits_for_metadata_and_requests_fresh_frame(self):
         self.widget.release_worker_resources()

@@ -865,6 +865,7 @@ class VideoPreviewWidget(QWidget):
             else metadata.output0
         )
         first_metadata = not self._metadata_resolved
+        self._has_video = True
         self._session_metadata = metadata
         self._output0_frames = metadata.output0.num_frames
         self._worker_ready_for_frames = True
@@ -880,7 +881,6 @@ class VideoPreviewWidget(QWidget):
             self._timeline_start = 0
             self._timeline_end_exclusive = self.total_frames
             self.current_frame = None
-            self._has_video = True
             self._metadata_resolved = True
             self._init_cropbox()
             self.video_loaded.emit(self.total_frames, self.video_fps)
@@ -1129,6 +1129,7 @@ class VideoPreviewWidget(QWidget):
         self._restart_pending = False
         self._worker_ready_for_frames = False
         self._vs_active = False
+        self._has_video = False
         self.current_frame = None
         self.video_label.clear()
         self.video_label.setText("渲染进程已退出")
@@ -1142,22 +1143,30 @@ class VideoPreviewWidget(QWidget):
         )
 
     def restart_rendering(self) -> None:
-        if self._worker_client is None or self._render_session is None:
+        if self._render_session is None:
             return
         self._worker_ready_for_frames = False
         self.current_frame = None
         self.video_label.clear()
         self.video_label.setText("正在重启渲染进程…")
-        self._restart_pending = True
-        self._worker_client.terminate_and_restart()
+        if self._worker_client is None:
+            self._resume_worker()
+        else:
+            self._restart_pending = True
+            self._worker_client.terminate_and_restart()
 
     def _fail_current_load(self, message: str) -> None:
+        self.pause()
+        self._job_debounce.stop()
+        self._resolve_all_pending_captures()
         self._worker_ready_for_frames = False
         self._vs_active = False
         self._has_video = False
+        self._load_request_id = None
         self.current_frame = None
         self.video_label.clear()
         self.video_label.setText("无法加载视频元数据")
+        self.restart_button.setVisible(self._render_session is not None)
         self._cleanup_unused_cache_dirs()
         self.load_failed.emit(message)
 
