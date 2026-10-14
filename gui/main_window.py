@@ -4026,43 +4026,66 @@ class MainWindow(QMainWindow):
 
     def _finish_editor_restore(self, preview):
         """加载完成:恢复打开前保存的裁剪/旋转/入出点,并解除同步挂起。"""
-        self._editor_sync_suspended.discard(preview)
         track = self._pending_editor_restore.pop(preview, None)
-        if track is None or track.is_default() or not self._config:
-            return
         self._restoring_editor_state = True
         try:
-            if track.rotation and self._preview_supports(preview, "rotation"):
-                # 先旋转再设裁剪框:旋转会按目标比例重新适配裁剪框。
-                preview.set_rotation(track.rotation)
-            if track.crop and self._preview_supports(preview, "crop"):
-                preview.set_cropbox(*track.crop)
-                # set_cropbox 会把框规整到当前屏幕比例。若被改动(旧工程存的
-                # 框比例不符、或来自其它分辨率),明确告知用户而非静默变更。
-                if list(preview.get_cropbox()) != [int(v) for v in track.crop]:
-                    self.status_bar.showMessage(
-                        "裁剪框已按当前屏幕比例修正", 5000)
-            if (
-                self._preview_supports(preview, "trim")
-                and 0 <= track.in_frame <= track.out_frame
-            ):
-                total = max(1, int(getattr(preview, "total_frames", 1)))
-                in_f = min(track.in_frame, total - 1)
-                out_f = min(track.out_frame, total - 1)
+            if track is not None and not track.is_default() and self._config:
+                self._restore_loaded_editor_track(preview, track)
                 if preview is self.video_preview:
-                    self._loop_in_out = (in_f, out_f)
+                    self._config.editor.loop = track
                 else:
-                    self._intro_in_out = (in_f, out_f)
-                if self._is_timeline_bound_to(preview):
-                    self.timeline.set_in_point(in_f)
-                    self.timeline.set_out_point(out_f)
+                    self._config.editor.intro = track
+            self._sync_loaded_editor_track(preview)
         finally:
             self._restoring_editor_state = False
-        # 以打开前的拷贝写回,修正加载期间默认值对 config.editor 的任何覆盖。
-        if preview is self.video_preview:
-            self._config.editor.loop = track
-        else:
-            self._config.editor.intro = track
+            self._editor_sync_suspended.discard(preview)
+
+    def _restore_loaded_editor_track(self, preview, track):
+        """把已保存的轨道状态应用到刚加载的预览器。"""
+        if track.rotation and self._preview_supports(preview, "rotation"):
+            # 先旋转再设裁剪框:旋转会按目标比例重新适配裁剪框。
+            preview.set_rotation(track.rotation)
+        if track.crop and self._preview_supports(preview, "crop"):
+            preview.set_cropbox(*track.crop)
+            # set_cropbox 会把框规整到当前屏幕比例。
+            if list(preview.get_cropbox()) != [int(v) for v in track.crop]:
+                self.status_bar.showMessage("裁剪框已按当前屏幕比例修正", 5000)
+        if (
+            self._preview_supports(preview, "trim")
+            and 0 <= track.in_frame <= track.out_frame
+        ):
+            total = max(1, int(getattr(preview, "total_frames", 1)))
+            in_f = min(track.in_frame, total - 1)
+            out_f = min(track.out_frame, total - 1)
+            if preview is self.video_preview:
+                self._loop_in_out = (in_f, out_f)
+            else:
+                self._intro_in_out = (in_f, out_f)
+            if self._is_timeline_bound_to(preview):
+                self.timeline.set_in_point(in_f)
+                self.timeline.set_out_point(out_f)
+
+    def _sync_loaded_editor_track(self, preview):
+        """静默收敛加载后的实际状态，供保存和自动保存读取。"""
+        if not self._config or not self._preview_has_loaded_media(preview):
+            return
+        track = (
+            self._config.editor.loop
+            if preview is self.video_preview
+            else self._config.editor.intro
+        )
+        if self._preview_supports(preview, "crop"):
+            track.crop = list(preview.get_cropbox_in_rotated_space())
+        if self._preview_supports(preview, "rotation"):
+            track.rotation = preview.get_rotation()
+        if self._preview_supports(preview, "trim"):
+            start, end = self._get_trim_bounds(preview)
+            in_out = (start, end - 1)
+            if preview is self.video_preview:
+                self._loop_in_out = in_out
+            else:
+                self._intro_in_out = in_out
+            track.in_frame, track.out_frame = in_out
 
     def _on_preview_load_failed(self, which: str, message: str, preview=None):
         """异步视频加载失败(元数据探测/启动失败信号)——聚合后弹一次警告。"""

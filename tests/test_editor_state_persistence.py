@@ -76,6 +76,7 @@ class _FakePreview:
         self.calls = []
         self.cropbox = (11, 22, 333, 444)
         self.rotation = 90
+        self.timeline_ranges = []
 
     def get_cropbox_in_rotated_space(self):
         return self.cropbox
@@ -90,10 +91,14 @@ class _FakePreview:
 
     def set_rotation(self, deg):
         self.calls.append(("rotation", deg))
+        self.rotation = deg
 
     def set_cropbox(self, *box):
         self.calls.append(("crop", box))
         self.cropbox = tuple(box)
+
+    def set_timeline_range(self, start, end):
+        self.timeline_ranges.append((start, end))
 
 
 class EditorSyncTests(unittest.TestCase):
@@ -108,11 +113,16 @@ class EditorSyncTests(unittest.TestCase):
         w.video_preview = _FakePreview()
         w.intro_preview = object()
         w._is_timeline_bound_to = lambda p: False
-        w._get_cached_in_out = lambda p: (3, 77)
+        w._loop_in_out = (3, 77)
+        w._intro_in_out = (3, 77)
+        w._get_cached_in_out = lambda p: (
+            w._intro_in_out if p is w.intro_preview else w._loop_in_out
+        )
         w._snapshot_active_timeline_state = lambda: None
         w._is_modified = False
         w._update_title = lambda: None
         w._mark_undo_change = lambda: None  # undo subsystem out of scope here
+        w.status_bar = types.SimpleNamespace(showMessage=lambda *args: None)
         return w
 
     def test_change_writes_config_and_marks_dirty(self):
@@ -153,6 +163,15 @@ class EditorSyncTests(unittest.TestCase):
             set_in_point=lambda v: timeline_calls.append(("in", v)),
             set_out_point=lambda v: timeline_calls.append(("out", v)),
         )
+        undo_calls = []
+        w._mark_undo_change = lambda: undo_calls.append(True)
+        set_rotation = preview.set_rotation
+
+        def rotate_and_emit(value):
+            set_rotation(value)
+            MainWindow._on_editor_state_changed(w, preview)
+
+        preview.set_rotation = rotate_and_emit
 
         MainWindow._finish_editor_restore(w, preview)
 
@@ -167,6 +186,54 @@ class EditorSyncTests(unittest.TestCase):
         self.assertIs(w._config.editor.loop, saved)  # written back verbatim
         self.assertNotIn(preview, w._editor_sync_suspended)
         self.assertFalse(w._is_modified, "restoring saved state is not an edit")
+        self.assertEqual(undo_calls, [])
+
+    def test_fresh_media_load_syncs_actual_track_without_edit_history(self):
+        from gui.main_window import MainWindow
+
+        w = self._window()
+        w.video_preview.total_frames = 48
+        w._config.editor.loop = EditorTrackState(
+            crop=[1, 2, 3, 4], rotation=180, in_frame=90, out_frame=120
+        )
+        undo_calls = []
+        w._mark_undo_change = lambda: undo_calls.append(True)
+
+        MainWindow._on_video_loaded(w, 48, 24.0)
+
+        track = w._config.editor.loop
+        self.assertEqual(track.crop, [11, 22, 333, 444])
+        self.assertEqual(track.rotation, 90)
+        self.assertEqual((track.in_frame, track.out_frame), (0, 47))
+        self.assertEqual(w._loop_in_out, (0, 47))
+        self.assertEqual(w.video_preview.timeline_ranges, [(0, 48)])
+        self.assertFalse(w._is_modified)
+        self.assertEqual(undo_calls, [])
+
+    def test_inactive_intro_load_restores_and_clamps_saved_trim(self):
+        from gui.main_window import MainWindow
+
+        w = self._window()
+        w.intro_preview = _FakePreview()
+        w.intro_preview.total_frames = 40
+        saved = EditorTrackState(
+            crop=[5, 6, 70, 80], rotation=180, in_frame=20, out_frame=90
+        )
+        w._config.editor.intro = saved
+        MainWindow._begin_editor_restore(w, w.intro_preview, saved)
+        undo_calls = []
+        w._mark_undo_change = lambda: undo_calls.append(True)
+
+        MainWindow._on_intro_video_loaded(w, 40, 24.0)
+
+        track = w._config.editor.intro
+        self.assertEqual(track.crop, [5, 6, 70, 80])
+        self.assertEqual(track.rotation, 180)
+        self.assertEqual((track.in_frame, track.out_frame), (20, 39))
+        self.assertEqual(w._intro_in_out, (20, 39))
+        self.assertEqual(w.intro_preview.timeline_ranges, [(20, 40)])
+        self.assertFalse(w._is_modified)
+        self.assertEqual(undo_calls, [])
 
 
 if __name__ == "__main__":
