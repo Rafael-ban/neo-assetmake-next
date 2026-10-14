@@ -432,27 +432,32 @@ class VideoPreviewWidget(QWidget):
         self._cleanup_job_files()
 
     def _release_idle_worker(self) -> None:
-        if self.is_playing or self._crop_edit_start is not None:
+        if self.is_playing:
             return
-        if self._request_epochs or self._job_dirty:
+        if self._crop_edit_start is not None or self._request_epochs or self._job_dirty:
             self._idle_release_timer.start()
             return
-        self.release_worker_resources()
+        try:
+            self.release_worker_resources()
+        except RuntimeError:
+            logger.exception("预览计算进程未能退出，将重试释放")
+            self._idle_release_timer.start()
 
     def release_worker_resources(self) -> None:
         """Release the process/GPU graph while retaining the displayed frame and job."""
         self._idle_release_timer.stop()
         client = self._worker_client
+        if client is not None:
+            self._disconnect_worker_client(client)
+            # Keep ownership on failure so a later close can retry termination.
+            client.close()
+            client.deleteLater()
         self._worker_client = None
         self._worker_runtime_snapshot = None
         self._worker_started = False
         self._worker_ready_for_frames = False
         self._restart_pending = False
         self._load_request_id = None
-        if client is not None:
-            self._disconnect_worker_client(client)
-            client.close()
-            client.deleteLater()
         self._on_worker_stopped()
 
     def reload_rendering(self) -> None:

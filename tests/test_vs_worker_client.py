@@ -4,6 +4,7 @@ import os
 import sys
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -12,7 +13,9 @@ from PyQt6.QtCore import QCoreApplication, QEvent, QObject, QThread, QTimer, pyq
 
 from config.vs_runtime import VSRuntimeConfig, WorkerConfig
 from core.vs_runtime.session import NodeMetadata, SessionMetadata
-from core.vs_runtime.worker_process import STAGING_CLEANUP_ERROR_CODE
+from core.vs_runtime.worker_process import (
+    STAGING_CLEANUP_ERROR_CODE, WorkerProcess, WorkerProcessError,
+)
 from gui.workers.vs_worker_client import VSWorkerClient
 from tests.qt_harness import ensure_app
 
@@ -153,6 +156,30 @@ class _ThreadProbe(QObject):
         self.calls.append(
             (request_id, epoch, surface, index, frame, QThread.currentThread())
         )
+
+
+class WorkerCloseVerificationTests(unittest.TestCase):
+    def test_closed_transport_still_checks_os_process_and_client_can_retry(self):
+        ensure_app()
+        transport = WorkerProcess(command=[sys.executable])
+        client = VSWorkerClient(transport=transport)
+        process = mock.Mock()
+        process.poll.return_value = None
+        transport._process = process
+
+        def close_protocol():
+            transport._closed = True
+            transport._exit_event.set()
+
+        with mock.patch.object(transport, "_close_transport", side_effect=close_protocol):
+            with self.assertRaisesRegex(WorkerProcessError, "did not exit"):
+                client.close()
+            self.assertFalse(transport.alive)
+            self.assertFalse(client._closed)
+            process.poll.return_value = 0
+            client.close()
+            self.assertTrue(client._closed)
+        transport._process = None
 
 
 class VSWorkerClientTests(unittest.TestCase):

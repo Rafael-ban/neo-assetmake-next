@@ -500,13 +500,11 @@ class VSWorkerClient(QObject):
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
         self._restart_requested = False
         self._clear_all_timeouts()
         self.transport.remove_listener(self._relay_transport_event)
         self.transport.close()
-        if self.transport.alive:
-            raise RuntimeError("VapourSynth preview worker did not exit")
+        self._closed = True
 
 
 __all__ = ["VSWorkerClient"]

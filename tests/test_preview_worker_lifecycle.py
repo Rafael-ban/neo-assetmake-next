@@ -351,6 +351,40 @@ class PreviewIdleReleaseTests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         self.assertEqual(int(captured[0][0, 0, 0]), 9)
 
+    def test_cancelled_paused_crop_rearms_idle_release(self):
+        self.widget._job_dirty = False
+        self.widget._job_debounce.stop()
+        self.assertTrue(self.widget.begin_crop_edit())
+        # A single-shot timer is inactive by the time its slot runs.
+        self.widget._idle_release_timer.stop()
+        self.widget._release_idle_worker()
+        self.assertTrue(self.widget._idle_release_timer.isActive())
+        self.assertEqual(self.client.closed, 0)
+        self.widget.end_crop_edit(commit=False)
+        self.widget._release_idle_worker()
+        self.assertIsNone(self.widget._worker_client)
+        self.assertEqual(self.client.closed, 1)
+
+    def test_failed_close_keeps_client_for_retry(self):
+        with mock.patch.object(self.client, "close", side_effect=RuntimeError("still running")):
+            with self.assertRaisesRegex(RuntimeError, "still running"):
+                self.widget.release_worker_resources()
+        self.assertIs(self.widget._worker_client, self.client)
+        self.widget.release_worker_resources()
+        self.assertIsNone(self.widget._worker_client)
+        self.assertEqual(self.client.closed, 1)
+
+    def test_idle_close_failure_retries_without_escaping_qt_slot(self):
+        self.widget._job_dirty = False
+        self.widget._job_debounce.stop()
+        with mock.patch.object(self.client, "close", side_effect=RuntimeError("still running")):
+            with self.assertLogs("gui.widgets.video_preview", level="ERROR"):
+                self.widget._release_idle_worker()
+        self.assertIs(self.widget._worker_client, self.client)
+        self.assertTrue(self.widget._idle_release_timer.isActive())
+        self.widget._release_idle_worker()
+        self.assertIsNone(self.widget._worker_client)
+
     def test_playing_and_pending_frames_delay_idle_release(self):
         self.widget.play()
         self.widget._release_idle_worker()

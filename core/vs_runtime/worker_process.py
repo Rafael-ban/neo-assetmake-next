@@ -1326,6 +1326,13 @@ class WorkerProcess:
             process.kill()
 
     def close(self) -> None:
+        self._close_transport()
+        # Protocol state may already be closed even if OS termination failed.
+        with self._state_lock:
+            if self._process is not None and self._process.poll() is None:
+                raise WorkerProcessError("VapourSynth worker did not exit")
+
+    def _close_transport(self) -> None:
         with self._state_lock:
             self._closed = True
             process = self._process
