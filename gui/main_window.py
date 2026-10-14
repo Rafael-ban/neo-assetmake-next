@@ -1143,6 +1143,53 @@ class MainWindow(QMainWindow):
             logger.warning(f"迁移临时项目失败: {e}")
             # 迁移失败时保留临时目录作为备份
 
+    def _rebase_saved_media_paths(self, old_base_dir: str) -> None:
+        """Keep relative media references valid when Save As changes project root."""
+        config = self._config
+        paths = [
+            (config, "icon"),
+            (config.loop, "file"),
+            (config.intro, "file"),
+        ]
+        for transition in (config.transition_in, config.transition_loop):
+            if transition.options is not None:
+                paths.append((transition.options, "image"))
+        if config.overlay.arknights_options is not None:
+            paths.extend((
+                (config.overlay.arknights_options, "logo"),
+                (config.overlay.arknights_options, "operator_class_icon"),
+            ))
+        if config.overlay.image_options is not None:
+            paths.append((config.overlay.image_options, "image"))
+        for owner, attr in paths:
+            value = getattr(owner, attr)
+            if value and not os.path.isabs(value):
+                setattr(owner, attr, os.path.abspath(os.path.join(old_base_dir, value)))
+
+    def _refresh_saved_preview_sessions(
+        self, old_base_dir: str, new_base_dir: str, was_temp: bool
+    ) -> None:
+        """Replace jobs bound to the old project root without resetting editor UI."""
+        for preview in (self.video_preview, self.intro_preview):
+            path = getattr(preview, "video_path", "")
+            if was_temp and path:
+                try:
+                    relative = os.path.relpath(path, old_base_dir)
+                except ValueError:
+                    # External media may be on another Windows drive.
+                    relative = None
+                if (
+                    relative is not None
+                    and relative != os.pardir
+                    and not relative.startswith(os.pardir + os.sep)
+                ):
+                    migrated = os.path.join(new_base_dir, relative)
+                    if os.path.isfile(migrated):
+                        preview.video_path = migrated
+            if getattr(preview, "current_render_session", None) is not None:
+                if preview.current_render_session() is not None:
+                    preview.reload_rendering()
+
     def _on_shortcuts(self):
         """显示快捷键帮助"""
         from gui.dialogs.shortcuts_dialog import ShortcutsDialog
@@ -1376,9 +1423,16 @@ class MainWindow(QMainWindow):
 
         try:
             new_base_dir = os.path.dirname(path)
+            old_base_dir = self._base_dir
+            root_changed = os.path.normcase(os.path.abspath(old_base_dir)) != (
+                os.path.normcase(os.path.abspath(new_base_dir))
+            )
+            was_temp = bool(self._temp_dir and old_base_dir == self._temp_dir)
 
-            if self._temp_dir and self._base_dir == self._temp_dir:
+            if was_temp:
                 self._migrate_temp_to_permanent(new_base_dir)
+            elif root_changed:
+                self._rebase_saved_media_paths(old_base_dir)
 
             self._config.save_to_file(path)
             self._project_path = path
@@ -1388,6 +1442,10 @@ class MainWindow(QMainWindow):
             self.advanced_config_panel.set_config(self._config, self._base_dir)
             self.json_preview.set_config(self._config, self._base_dir)
             self._configure_preview_render_contexts()
+            if root_changed:
+                self._refresh_saved_preview_sessions(
+                    old_base_dir, new_base_dir, was_temp
+                )
 
             # 重新指向自动保存(路径已切换;服务缓存的是 start() 时的值)。
             self._start_auto_save()
