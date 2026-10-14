@@ -8,7 +8,7 @@
 
 output 1 是旋转后、trim/crop 前的完整编辑画布；output 0 严格按 RenderJob
 生成设备编码帧。低帧率视频默认插帧到 60 fps；图片、单帧和高帧率视频跳过。
-选择此脚本前须安装独立 RIFE 运行资源，并配置 native_plugin_dirs。
+选择此脚本前须将独立 RIFE DLC 解压到应用目录。
 脚本有意保持自包含和可读，便于用户复制到项目或外部目录后定制。
 """
 
@@ -165,12 +165,21 @@ def interpolate_timeline(clip, *, kind):
     rife = getattr(getattr(core, "rife", None), "RIFE", None)
     if not callable(rife):
         raise RuntimeError(
-            "已启用 RIFE，但缺少 rife.RIFE 插件；请安装 RIFE 运行资源并在 "
-            "vs_runtime.user.json 的 native_plugin_dirs 中配置 tools/vs-rife/rife"
+            "已启用 RIFE，但缺少 rife.RIFE 插件；请将 RIFE DLC 解压到应用目录，"
+            "确认 tools/vs-rife/rife/librife_windows_x86-64.dll 存在"
         )
     model_path = Path(RIFE_MODEL_PATH).resolve()
     if not model_path.is_dir():
         raise RuntimeError(f"已启用 RIFE，但模型目录不存在: {model_path}")
+    missing_models = [
+        name for name in ("flownet.bin", "flownet.param")
+        if not (model_path / name).is_file()
+    ]
+    if missing_models:
+        raise RuntimeError(
+            f"已启用 RIFE，但模型文件缺失: {', '.join(missing_models)}；"
+            f"请完整解压 RIFE DLC 到应用目录: {model_path}"
+        )
     source_count = clip.num_frames
     # RIFE-ncnn-Vulkan 只接受 planar 32-bit float RGB。已补齐的源颜色
     # 属性决定矩阵/transfer；保持源 transfer，避免先转到设备 BT.601。

@@ -54,6 +54,8 @@ _KNOWN_PACKAGE_ARTIFACTS = frozenset(
         "class_icon.png",
         "ark_logo.png",
         "overlay.png",
+        "transition_in.png",
+        "transition_loop.png",
     }
 )
 
@@ -171,6 +173,7 @@ class _PreparedExportPackage:
     tasks: tuple[ExportTask, ...]
     manifest: tuple[_ArtifactExpectation, ...]
     epconfig_bytes: bytes
+    foreign_entries: tuple[str, ...] = ()
     final_generation: _FinalGeneration | None = None
     lock_path: Path | None = None
     lock_token: bytes = b""
@@ -253,7 +256,8 @@ def _capture_final_generation(final_dir: Path) -> _FinalGeneration:
             (
                 entry.name,
                 _filesystem_identity(entry),
-                hashlib.sha256(entry.read_bytes()).hexdigest(),
+                (hashlib.sha256(entry.read_bytes()).hexdigest()
+                 if entry.name in _KNOWN_PACKAGE_ARTIFACTS and entry.is_file() else ""),
             )
         )
     return _FinalGeneration(True, directory, tuple(files))
@@ -334,7 +338,7 @@ def _epconfig_references(payload: object) -> set[str]:
 
 
 def _assert_replaceable_final_dir(final_dir: Path) -> None:
-    """Fail closed unless an existing non-empty directory is our old package."""
+    """Allow unrelated entries while protecting source projects and artifact names."""
     if final_dir.is_symlink():
         raise RuntimeError(f"导出目标不能是链接或非目录: {final_dir}")
     if not final_dir.exists():
@@ -346,12 +350,14 @@ def _assert_replaceable_final_dir(final_dir: Path) -> None:
         return
     files: set[str] = set()
     for entry in entries:
-        if _is_reparse_or_symlink(entry) or not entry.is_file():
-            raise RuntimeError(f"拒绝替换包含未知目录或链接的用户目录: {final_dir}")
+        if _is_reparse_or_symlink(entry):
+            raise RuntimeError(f"拒绝导出到包含链接的目录: {final_dir}")
         files.add(entry.name)
     config_path = final_dir / "epconfig.json"
     if "epconfig.json" not in files:
-        raise RuntimeError(f"拒绝替换没有 epconfig.json 的非空目录: {final_dir}")
+        if files & _KNOWN_PACKAGE_ARTIFACTS:
+            raise RuntimeError(f"拒绝覆盖未识别的已有素材: {final_dir}")
+        return
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -361,11 +367,14 @@ def _assert_replaceable_final_dir(final_dir: Path) -> None:
         or not isinstance(payload.get("version"), int)
         or not isinstance(payload.get("screen"), str)
         or not isinstance(payload.get("loop"), dict)
+        or "editor" in payload
     ):
         raise RuntimeError(f"拒绝替换无效的旧导出包: {final_dir}")
+    if any(not (final_dir / name).is_file() for name in files & _KNOWN_PACKAGE_ARTIFACTS):
+        raise RuntimeError(f"旧导出素材不是普通文件: {final_dir}")
     references = _epconfig_references(payload)
-    if not references.issubset(files) or not files.issubset(_KNOWN_PACKAGE_ARTIFACTS):
-        raise RuntimeError(f"拒绝替换包含未知文件的目录: {final_dir}")
+    if not references.issubset(files):
+        raise RuntimeError(f"旧导出包缺少引用的素材: {final_dir}")
 
 
 class ExportWorker(QThread):
@@ -890,7 +899,11 @@ class ExportWorker(QThread):
                 raise self._manual_recovery_error(
                     package, "旧包移入备份", identity_error
                 ) from identity_error
+            moved_foreign: list[str] = []
             try:
+                for name in package.foreign_entries:
+                    self._rename_dir_no_replace(backup_dir / name, staging_dir / name)
+                    moved_foreign.append(name)
                 self._assert_package_path(
                     package,
                     staging_dir,
@@ -911,6 +924,8 @@ class ExportWorker(QThread):
                         backup_prefix,
                         package.backup_dir_identity,
                     )
+                    for name in reversed(moved_foreign):
+                        self._rename_dir_no_replace(staging_dir / name, backup_dir / name)
                     self._rename_dir_no_replace(backup_dir, final_dir)
                     self._assert_final_directory(
                         package, package.backup_dir_identity, "回滚旧包"
@@ -1108,6 +1123,17 @@ class ExportService(QObject):
             if not tasks:
                 raise RuntimeError("No content to export")
             manifest = self._build_manifest(tasks, epconfig_bytes)
+            foreign_entries = tuple(
+                name for name, _, _ in final_generation.files
+                if name not in _KNOWN_PACKAGE_ARTIFACTS
+            )
+            artifact_names = {item.relative_path.casefold() for item in manifest}
+            if any(
+                name.casefold() in artifact_names
+                for name, _, _ in final_generation.files
+                if name not in _KNOWN_PACKAGE_ARTIFACTS
+            ):
+                raise RuntimeError("导出工件与目标目录中的原文件重名")
             atomic_write_bytes(staging_dir / "epconfig.json", epconfig_bytes)
             return _PreparedExportPackage(
                 final_dir=final_dir,
@@ -1117,6 +1143,7 @@ class ExportService(QObject):
                 tasks=tasks,
                 manifest=manifest,
                 epconfig_bytes=epconfig_bytes,
+                foreign_entries=foreign_entries,
                 final_generation=final_generation,
                 lock_path=lock_path,
                 lock_token=lock_token,

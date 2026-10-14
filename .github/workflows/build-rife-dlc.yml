@@ -8,6 +8,7 @@ on:
       - .github/workflows/build-rife-dlc.yml
       - plugin_distribution.py
       - rife_dlc.py
+      - docs/rife-dlc-guide.md
       - resources/packaging/vs-rife.json
       - resources/vapoursynth/rife_pipeline.vpy
       - tests/test_rife_dlc.py

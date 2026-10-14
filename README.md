@@ -111,21 +111,19 @@ tools\media\runtime\Lib\site-packages\vapoursynth\vspipe.exe --version
 部署基础包后按需运行 `uv run python plugin_distribution.py sync --app-dir .`；
 `verify` 校验、`sync` 修复不完整安装、`clean` 清除该扩展根目录。
 
-RIFE 使用独立模板 `resources/vapoursynth/rife_pipeline.vpy`，依赖清单为
-`resources/packaging/vs-rife.json`，安装到 `tools/vs-rife/`。可单独下载 RIFE DLC ZIP，
-解压到实际应用目录后选择该脚本；默认“内置脚本”不依赖 RIFE。
-源码安装及制作 DLC：
+RIFE 是可选的 60 fps 插帧 DLC。**完整解压到当前程序目录后，选择 RIFE 脚本即可**；
+当前源码会自动识别随包 DLL 和模型，不再要求编辑 JSON。已发布的 v2.2.1 旧 EXE 需升级才能使用此流程；
+默认“内置脚本”无需 RIFE。安装版、便携版用户请按
+[中文安装与使用说明](docs/rife-dlc-guide.md) 操作，其中有目录示意、界面步骤、报错处理和恢复内置脚本的方法；
+旧版必须使用的 JSON 配置已单列在附录。DLC 压缩包内的 `RIFE-DLC-README.txt`
+也使用这份说明。
 
-```powershell
-uv run python plugin_distribution.py sync --app-dir . --manifest resources/packaging/vs-rife.json
-uv run python rife_dlc.py --app-dir . --output dist/RIFE-DLC-r9_mod_v33.zip
-```
-
-DLC 不包含主程序和 R79 基础媒体树。启用 GPU/运行库要求、脚本选择和本机插件
-目录设置见 [RIFE 配置](docs/vapoursynth-kb/17-filter-configuration.md#可选-rife-插帧到-60-fps)。
+源码运行和编译后的 EXE 使用各自的依赖目录。基础构建不会收集源码中的可选插件，
+给编译目录补装也不会更新源码目录或已有便携 ZIP。
+源码安装、给指定便携目录部署及制作 DLC 的命令见
+[开发者配置说明](docs/vapoursynth-kb/17-filter-configuration.md#安装与打包给开发者)。
 GitHub Actions 的 **Build RIFE DLC** 可以独立生成 DLC 下载产物。
-版本发布流程会同时构建基础应用和 RIFE DLC，并在同一个 Release 提供安装版、
-绿色 ZIP、独立 DLC ZIP 与 SHA256SUMS；DLC 始终是单独下载的可选附件。
+版本发布流程提供基础安装版、便携 ZIP、独立 DLC ZIP 与 SHA256SUMS。
 
 ## 基本使用
 
@@ -135,6 +133,9 @@ GitHub Actions 的 **Build RIFE DLC** 可以独立生成 DLC 下载产物。
 4. 在配置面板填写名称、UUID、屏幕规格、过渡和叠加层；保存项目。
 5. 运行导出。输出目录包含 `epconfig.json`、`loop.mp4`、可选 `intro.mp4`、图标与叠加资源。
 6. 可启动模拟器核对最终播放流程，再上传到设备或通过 RNDIS 远程管理同步。
+
+可重复导出到已有素材包目录，无需先清空。无关文件和子目录会保留；导出失败会尝试恢复旧包。
+请使用独立的导出目录，不要选择当前编辑项目目录；无法识别的同名素材会提示冲突。
 
 所有配置中的时间值均使用**微秒**：`1 秒 = 1_000_000`。
 

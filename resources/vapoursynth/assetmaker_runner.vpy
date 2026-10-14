@@ -40,6 +40,7 @@ from assetmaker_vs.core_resources import (  # noqa: E402
     restore_core_resources,
 )
 from assetmaker_vs.native_plugins import (  # noqa: E402
+    activate_rife_plugin,
     configure_native_plugins,
     verify_native_plugin_requirements,
 )
@@ -93,6 +94,9 @@ native_plugin_state = configure_native_plugins(
     builtin_plugin_dirs=verified_runtime.layout.builtin_plugin_dirs,
 )
 header = parse_script_header(assetmaker_script)
+native_plugin_state, _rife_dll_handle = activate_rife_plugin(
+    vs.core, native_plugin_state, verified_runtime.layout.app_dir, header["requires"]
+)
 _verify_job_content("读取 job 前")
 job = load_job(assetmaker_job, for_export=True)
 _verify_job_content("读取 job 后")

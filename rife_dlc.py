@@ -14,31 +14,7 @@ from plugin_distribution import PluginDistributionError, load_manifest, verify_p
 _MANIFEST = Path("resources/packaging/vs-rife.json")
 _SCRIPT = Path("resources/vapoursynth/rife_pipeline.vpy")
 _README_NAME = "RIFE-DLC-README.txt"
-_README = """AssetMaker optional RIFE DLC
-
-Extract this ZIP into the actual AssetMaker application folder, preserving paths.
-The tools/vs-rife and resources folders must be inside that application folder.
-
-Requirements: a Vulkan-capable GPU and working Vulkan driver, plus the Microsoft
-Visual C++ v14 Redistributable (x64). Packaging does not require a GPU.
-
-Edit the Windows local configuration override at:
-%APPDATA%\\ArknightsPassMaker\\vapoursynth\\vs_runtime.user.json
-Add the absolute <app>\\tools\\vs-rife\\rife directory to
-plugins.native_plugin_dirs. Merge this setting into the existing JSON rather
-than replacing your existing configuration. Replace <app> with the actual
-application folder, and escape backslashes in JSON. For example:
-{"plugins": {"native_plugin_dirs": ["C:\\\\AssetMaker\\\\tools\\\\vs-rife\\\\rife"]}}
-Equivalent directory notation: native_plugin_dirs=<app>/tools/vs-rife/rife
-
-Select VapourSynth 脚本 → 来源 → 全局本机脚本 and choose
-resources/vapoursynth/rife_pipeline.vpy, or copy that script into your project
-and select the project script. Edit the script's documented RIFE controls there.
-
-The base application's default pipeline stays unchanged. RIFE is used only
-when you select this optional script. Keep this manifest with the DLC so its
-pinned binaries, models, dependencies, and licenses can be verified.
-"""
+_GUIDE = Path(__file__).resolve().parent / "docs" / "rife-dlc-guide.md"
 
 
 def create_rife_dlc(app_dir: str | Path, output: str | Path) -> Path:
@@ -51,6 +27,7 @@ def create_rife_dlc(app_dir: str | Path, output: str | Path) -> Path:
     manifest = app / _MANIFEST
     if load_manifest(app, manifest)["install_root"] != "tools/vs-rife":
         raise PluginDistributionError("RIFE DLC manifest must install into tools/vs-rife")
+    readme = _GUIDE.read_text(encoding="utf-8")
     files = verify_plugins(app, manifest)
     files.extend((manifest, app / _SCRIPT))
     members: dict[str, Path] = {}
@@ -71,7 +48,7 @@ def create_rife_dlc(app_dir: str | Path, output: str | Path) -> Path:
         with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for name, source in sorted(members.items()):
                 archive.write(source, name)
-            archive.writestr(_README_NAME, _README)
+            archive.writestr(_README_NAME, readme)
         with zipfile.ZipFile(temporary) as archive:
             expected = set(members) | {_README_NAME}
             if set(archive.namelist()) != expected or len(archive.namelist()) != len(expected):

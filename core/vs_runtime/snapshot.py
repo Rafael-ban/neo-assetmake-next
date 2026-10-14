@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping
 
@@ -89,6 +89,23 @@ class RuntimeSnapshot:
             root / "config" / "vs_runtime.json",
             default_vs_runtime_user_path() if user_path is None else user_path,
         )
+        # Previous RIFE instructions stored an absolute DLC path in user JSON.
+        # The app-local DLC now resolves on demand; drop only those legacy entries
+        # from this in-memory snapshot, leaving every other plugin override intact.
+        app_rife = root / "tools" / "vs-rife" / "rife" / "librife_windows_x86-64.dll"
+        native_dirs = tuple(
+            path for path in runtime.plugins.native_plugin_dirs
+            if not (
+                tuple(part.casefold() for part in Path(path).parts[-3:])
+                == ("tools", "vs-rife", "rife")
+                and (app_rife.is_file() or not Path(path).is_dir())
+            )
+        )
+        if native_dirs != runtime.plugins.native_plugin_dirs:
+            runtime = replace(
+                runtime,
+                plugins=replace(runtime.plugins, native_plugin_dirs=native_dirs),
+            )
         return cls(
             app_dir=str(root),
             runtime=runtime,

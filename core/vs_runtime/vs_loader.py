@@ -28,6 +28,7 @@ _dll_directory_handles: tuple[Any, ...] = ()
 _resource_baseline: Any | None = None
 _native_plugin_state: Any | None = None
 _loaded_layout: RuntimeLayout | None = None
+_optional_plugin_handles: list[Any] = []
 
 
 class VSLoaderError(RuntimeError):
@@ -168,10 +169,12 @@ def verify_vapoursynth_native_plugins(
     requirements: list[str],
 ) -> None:
     """在用户脚本执行前核验 required callable 与实际 native plugin 来源。"""
+    global _native_plugin_state
     if _native_plugin_state is None:
         raise VSLoaderError("VapourSynth native plugin 状态尚未捕获")
     config = _validated_runtime(runtime)
     from resources.vapoursynth.python.assetmaker_vs.native_plugins import (
+        activate_rife_plugin,
         canonical_native_plugin_dirs,
     )
 
@@ -183,7 +186,7 @@ def verify_vapoursynth_native_plugins(
             *config.plugins.native_plugin_dirs,
         )
     )
-    if configured != _native_plugin_state.configured_dirs:
+    if _native_plugin_state.configured_dirs[:len(configured)] != configured:
         raise VSLoaderError("VapourSynth native plugin 配置与加载状态不一致")
     from resources.vapoursynth.python.assetmaker_vs.native_plugins import (
         NativePluginPolicyError,
@@ -191,6 +194,11 @@ def verify_vapoursynth_native_plugins(
     )
 
     try:
+        _native_plugin_state, handle = activate_rife_plugin(
+            module.core, _native_plugin_state, _loaded_layout.app_dir, requirements
+        )
+        if handle is not None:
+            _optional_plugin_handles.append(handle)
         verify_native_plugin_requirements(module.core, _native_plugin_state, requirements)
     except NativePluginPolicyError as error:
         raise VSLoaderError(str(error)) from error

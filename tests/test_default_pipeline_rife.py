@@ -69,6 +69,8 @@ class RifeTemplateTests(unittest.TestCase):
             and node.targets[0].id == "RIFE_MODEL_PATH"
         )
         with TemporaryDirectory() as directory:
+            for name in ("flownet.bin", "flownet.param"):
+                (Path(directory) / name).write_bytes(b"test")
             runtime_root = Path(directory) / "runtime"
             helper_root = Path(directory) / "fallback-runtime"
             helper = helper_root / "resources/vapoursynth/python/assetmaker_vs/job_api.py"
@@ -119,6 +121,8 @@ class RifeTemplateTests(unittest.TestCase):
 class RifeTimelineTests(unittest.TestCase):
     def test_25_and_ntsc_sources_use_real_target_rate_and_floor_frame_count(self):
         with TemporaryDirectory() as directory:
+            for name in ("flownet.bin", "flownet.param"):
+                (Path(directory) / name).write_bytes(b"test")
             for source_fps in (Fraction(25), Fraction(24000, 1001), Fraction(30000, 1001)):
                 with self.subTest(fps=source_fps):
                     source = _clip(source_fps)
@@ -151,16 +155,23 @@ class RifeTimelineTests(unittest.TestCase):
 
     def test_missing_plugin_and_model_are_clear_errors(self):
         with TemporaryDirectory() as directory:
+            for name in ("flownet.bin", "flownet.param"):
+                (Path(directory) / name).write_bytes(b"test")
             core = SimpleNamespace()
-            with self.assertRaisesRegex(RuntimeError, "native_plugin_dirs"):
+            with self.assertRaisesRegex(RuntimeError, "RIFE DLC"):
                 _rife_function(core, directory)(_clip(), kind="video")
             core.rife = SimpleNamespace(RIFE=Mock())
             with self.assertRaisesRegex(RuntimeError, "模型目录不存在"):
                 _rife_function(core, Path(directory) / "missing")(_clip(), kind="video")
+            (Path(directory) / "flownet.param").unlink()
+            with self.assertRaisesRegex(RuntimeError, "模型文件缺失.*flownet.param"):
+                _rife_function(core, directory)(_clip(), kind="video")
             core.rife.RIFE.assert_not_called()
 
     def test_gpu_initialization_error_never_falls_back_to_source(self):
         with TemporaryDirectory() as directory:
+            for name in ("flownet.bin", "flownet.param"):
+                (Path(directory) / name).write_bytes(b"test")
             core = SimpleNamespace(
                 resize=SimpleNamespace(Lanczos=Mock(return_value=object())),
                 rife=SimpleNamespace(RIFE=Mock(side_effect=RuntimeError("no Vulkan device"))),
@@ -170,6 +181,8 @@ class RifeTimelineTests(unittest.TestCase):
 
     def test_bad_plugin_rate_or_count_is_rejected(self):
         with TemporaryDirectory() as directory:
+            for name in ("flownet.bin", "flownet.param"):
+                (Path(directory) / name).write_bytes(b"test")
             source = _clip()
             for result in (_clip(Fraction(25), 26), _clip(Fraction(60), 11)):
                 with self.subTest(result=result):

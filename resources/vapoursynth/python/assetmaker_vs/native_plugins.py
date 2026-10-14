@@ -326,6 +326,51 @@ def configure_native_plugins(
     )
 
 
+def activate_rife_plugin(
+    core: Any,
+    state: NativePluginState,
+    app_dir: str | os.PathLike[str],
+    requirements: Iterable[str],
+) -> tuple[NativePluginState, Any | None]:
+    """Load app-local RIFE DLC only for scripts that require it.
+
+    The returned Windows DLL directory handle must live as long as the core.
+    Explicit user directories are already loaded in state and take priority.
+    """
+    if "rife.RIFE" not in requirements:
+        return state, None
+    if "rife" in state.plugin_sources:
+        return state, None
+
+    directory = Path(app_dir).resolve() / "tools" / "vs-rife" / "rife"
+    plugin = directory / "librife_windows_x86-64.dll"
+    if not plugin.is_file():
+        raise NativePluginPolicyError(
+            "native_plugin.rife_dlc_missing",
+            f"缺少 rife.RIFE；请将 RIFE DLC 解压到应用目录，"
+            f"需要的插件文件: {plugin}",
+        )
+    if directory in state.configured_dirs:
+        return state, None
+
+    handle = os.add_dll_directory(str(directory)) if os.name == "nt" else None
+    try:
+        messages = _load_all_plugins_with_diagnostics(core, directory)
+        _raise_loader_warning(directory, messages)
+        sources = _sources(core)
+        updated = NativePluginState(
+            configured_dirs=(*state.configured_dirs, directory),
+            builtin_plugin_dirs=state.builtin_plugin_dirs,
+            plugin_sources=MappingProxyType(sources),
+        )
+        verify_native_plugin_requirements(core, updated, ("rife.RIFE",))
+        return updated, handle
+    except BaseException:
+        if handle is not None:
+            handle.close()
+        raise
+
+
 def verify_native_plugin_requirements(
     core: Any,
     state: NativePluginState,
@@ -363,6 +408,7 @@ def verify_native_plugin_requirements(
 __all__ = [
     "NativePluginPolicyError",
     "NativePluginState",
+    "activate_rife_plugin",
     "canonical_native_plugin_dirs",
     "configure_native_plugins",
     "verify_native_plugin_requirements",

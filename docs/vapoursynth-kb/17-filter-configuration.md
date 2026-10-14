@@ -40,67 +40,85 @@ matrix 与 primaries 的名称仍为 `170m`。
 DLL导入包含VCOMP140.DLL和MSVC v14运行库；基础R79包不包含VCOMP140.DLL。
 这些要求只适用于选用RIFE的电脑。
 
-### 安装 DLC 或从源码安装
+### 安装与打包（给开发者）
 
-RIFE DLC ZIP包含独立脚本、DLL、模型、MIT许可及其清单；不包含主程序和基础媒体包。
-把 ZIP内容解压到包含 `ArknightsPassMaker.exe` 的实际应用目录，保持resources/tools层级。
-基础目录和DLC版本分别安装；默认内置脚本继续使用基础图。
+安装版和便携版用户请直接阅读 [RIFE DLC 中文安装说明](../rife-dlc-guide.md)。
+完整 DLC 包含 DLL、模型、许可、独立脚本和清单。当前源码在选用 RIFE 脚本时自动加载
+应用根下的 `tools/vs-rife/rife`，模型使用同目录的 `models/rife-v4.6_ensembleFalse`。
+标准安装不再要求配置 `plugins.native_plugin_dirs` 或修改 `RIFE_MODEL_PATH`。
+已发布的 v2.2.1 旧 EXE 仍使用旧加载逻辑，需要重新构建或升级主程序。
 
-源码目录可直接安装（或修复）RIFE：
+以下命令区分三个路径，不能混用：
 
-```powershell
-uv run python plugin_distribution.py sync --app-dir . --manifest resources/packaging/vs-rife.json
-uv run python plugin_distribution.py verify --app-dir . --manifest resources/packaging/vs-rife.json
-```
+| 路径 | 用途 |
+| --- | --- |
+| `$sourceRoot` | 包含 `main.py` 的源码根；运行源码时，依赖必须在这里 |
+| `$portableRoot` | 已构建的 `ArknightsPassMaker.exe` 所在目录；运行 EXE 时，依赖必须在这里 |
+| `$dlcOutput` | DLC ZIP 的保存位置；不是运行程序时的依赖目录 |
 
-RIFE管理根为 `tools/vs-rife/`；通用扩展根为 `tools/vs-plugins/`。
-同步、修复及清理只影响相应根，不会删除另一组扩展。安装到已有便携包时，从源码
-目录运行同一工具，将 `--app-dir` 指向该应用目录，`--manifest`仍指向源码中的独立清单。
+按你的实际位置修改变量。`--app-dir` 决定安装目标；`.` 只是当前 PowerShell 工作目录，
+不会自动表示源码根。主程序基础构建只包含 R79 媒体树，明确排除可选 RIFE 和通用扩展。
+因此“先装依赖再构建”也不会把 DLC 收入基础包；给产物目录补装也不会同步源码目录。
 
-### 配置插件路径与选择脚本
-
-把实际应用的 `tools/vs-rife/rife` 绝对目录加入本机运行覆盖的
-`plugins.native_plugin_dirs`，不写入随源码分发的config/vs_runtime.json。
-以前配置过 `tools/vs-plugins/rife` 时，用新目录替换，避免重复加载同一个插件。
-下列命令在源码根执行，保留其他本机配置并生成当前应用路径：
+**从源码运行时安装或修复：**
 
 ```powershell
-uv run python -c 'from pathlib import Path; from config.vs_runtime import load_vs_runtime, save_vs_runtime_override, default_vs_runtime_user_path; folder = str((Path.cwd() / "tools" / "vs-rife" / "rife").resolve()); old = (Path.cwd() / "tools" / "vs-plugins" / "rife").resolve(); dirs = list(dict.fromkeys([*[d for d in load_vs_runtime().plugins.native_plugin_dirs if Path(d).resolve() != old], folder])); save_vs_runtime_override(default_vs_runtime_user_path(), {"plugins": {"native_plugin_dirs": dirs}})'
+$sourceRoot = 'D:\Project_Folder\neo-assetmaker-dev'
+Set-Location -LiteralPath $sourceRoot
+uv run python plugin_distribution.py sync --app-dir "$sourceRoot" --manifest "$sourceRoot\resources\packaging\vs-rife.json"
+uv run python plugin_distribution.py verify --app-dir "$sourceRoot" --manifest "$sourceRoot\resources\packaging\vs-rife.json"
 ```
 
-在“VapourSynth脚本 → 来源”选择“全局本机脚本”，选中独立的rife_pipeline.vpy；
-或复制到项目内，选择“项目脚本”，按现有流程确认信任。“内置脚本”始终使用基础图。
-独立模板的参数默认为 `RIFE_ENABLED=True`、`RIFE_TARGET_FPS=60`。
-选择“重载”或重新打开素材后生效。模板头声明rife.RIFE，所以选用它前须安装并配置
-RIFE，即使当前素材会跳过插帧；需要基础处理时直接选择内置脚本。
+这两条命令安装并校验 DLL 和模型。之后运行源码编辑器，按用户指南选择 RIFE 脚本即可。
+`verify` 只确认文件完整性，不执行 GPU 推理。
 
-模型默认位于当前RenderSession实际应用根的
-`tools/vs-rife/rife/models/rife-v4.6_ensembleFalse`；复制脚本到项目或外部目录不会
-改变模型根。模型另存于外部目录时，可显式设置RIFE_MODEL_PATH。
-插件、模型或GPU失败会报告原因，不把原视频冒充为成功插帧结果。
-
-插帧位于output 1与trim之前；预览、编辑和导出使用同一时间轴。
-帧数按floor(源帧数×60/源帧率)取整，尾部误差小于一个60 fps帧。
-旧项目只保存trim帧编号，切换脚本后需要重新核对入出点。
-尺寸缩放不指定YUV420P8；设备输出前单独转换格式，保留原有抖动和x264设置。
-DLC打包和模拟测试不代表已完成Vulkan GPU推理验收。
-
-### 制作与清理 DLC
-
-完成RIFE资源安装后运行：
+**给编译后的程序部署：** 推荐把完整 DLC ZIP 解压到 `$portableRoot`，这样脚本、清单、
+DLL、模型都会到位。只想用源码工具修复其中的插件文件时，仍在源码目录执行：
 
 ```powershell
-uv run python rife_dlc.py --app-dir . --output dist/RIFE-DLC-r9_mod_v33.zip
+$portableRoot = 'D:\Apps\ArknightsPassMaker'
+uv run python plugin_distribution.py sync --app-dir "$portableRoot" --manifest "$sourceRoot\resources\packaging\vs-rife.json"
+uv run python plugin_distribution.py verify --app-dir "$portableRoot" --manifest "$sourceRoot\resources\packaging\vs-rife.json"
 ```
 
-打包前校验锁定文件，输出已存在时要求选择新文件名，不覆盖已有包。
-**Build RIFE DLC**工作流可独立生成下载产物，无需构建主程序。
+`sync` 只部署清单管理的插件和模型，不会复制 `rife_pipeline.vpy`，也不会升级 EXE。
+如果目标缺少脚本，应部署完整 DLC。旧版 EXE 缺少自动识别修复时，复制插件也不会改变加载逻辑。
+上述命令不会修改已经生成的便携 ZIP；分发时应提供基础包和独立 DLC。
 
-清理RIFE独立资源（脚本模板保留）：
+**制作 DLC：** 先完成源码根的 `sync`，再从同一根收集资源打包，不需要先编译主程序。
 
 ```powershell
-uv run python plugin_distribution.py clean --app-dir . --manifest resources/packaging/vs-rife.json
+$dlcOutput = "$sourceRoot\dist\RIFE-DLC-r9_mod_v33.zip"
+uv run python rife_dlc.py --app-dir "$sourceRoot" --output "$dlcOutput"
 ```
+
+打包会校验插件、模型，并加入独立脚本、清单和中文指南；不会打包主程序或基础媒体树。
+此工具不覆盖已有 ZIP，重新制作时请使用新输出文件名。
+GitHub Actions 的 **Build RIFE DLC** 也按“源码根安装资源 → 制作 DLC”的顺序执行。
+
+清理时先切回内置脚本并退出编辑器。只清理你指定目录中的 RIFE 资源：
+
+```powershell
+uv run python plugin_distribution.py clean --app-dir "$sourceRoot" --manifest "$sourceRoot\resources\packaging\vs-rife.json"
+```
+
+`tools/vs-rife` 与通用扩展 `tools/vs-plugins` 分开管理，清理一组不会删除另一组。
+旧教程添加过的 RIFE 本机路径可从用户配置移除；不应删除其他插件配置。
+
+### 脚本行为与验证边界
+
+独立模板默认 `RIFE_ENABLED=True`、`RIFE_TARGET_FPS=60`。插帧位于 output 1 和 trim 之前，
+所以预览、编辑和导出使用同一条插帧时间轴，不存在独立的“仅导出补帧”模式。
+帧数按 floor(源帧数 × 60 / 源帧率) 取整，尾部误差小于一个 60 fps 帧。
+旧项目仅保存 trim 帧编号，切换脚本后不会自动换算时间，必须重新核对入出点。
+
+模型定位基于 RenderSession 的实际应用根，与 `.vpy` 复制到哪个项目无关。
+只有主动把模型放到其他位置的自定义脚本才需要修改 `RIFE_MODEL_PATH`。
+脚本头声明 `rife.RIFE`，因此即使素材会跳过插帧、或 `RIFE_ENABLED=False`，也仍要求插件可用；
+不使用 RIFE 时应选择内置脚本。GPU、模型或插件失败会报告错误，不会静默当作插帧成功。
+
+尺寸缩放保留源格式和位深；设备输出前单独转换格式，仍保留 `error_diffusion` 和原有 x264 设置。
+文件校验、打包成功和模拟测试不代表 Vulkan GPU 实际推理验收。
 
 ## 通用扩展的安装、修复与清理
 

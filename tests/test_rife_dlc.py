@@ -68,7 +68,8 @@ class RifeDlcTests(unittest.TestCase):
             for name, data in self.expected.items():
                 self.assertEqual(archive.read(name), data)
             readme = archive.read("RIFE-DLC-README.txt").decode("utf-8")
-            self.assertIn("native_plugin_dirs=<app>/tools/vs-rife/rife", readme)
+            guide = Path(__file__).resolve().parents[1] / "docs/rife-dlc-guide.md"
+            self.assertEqual(readme, guide.read_text(encoding="utf-8"))
             self.assertIn("全局本机脚本", readme)
         self.assertFalse(list(self.output.parent.glob("*.partial")))
 

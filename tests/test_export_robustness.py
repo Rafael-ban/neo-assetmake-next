@@ -702,17 +702,96 @@ class C3PackageTransactionTests(unittest.TestCase):
             self.assertIn(str(stagings[0]), failed[0])
             self.assertFalse(list(root.glob(".package.lock")))
 
-    def test_non_package_directory_is_never_replaced(self):
-        """A user directory with an unknown file fails closed before worker start."""
+    def test_existing_directory_keeps_unrelated_file_and_subdirectory(self):
         from core.export_service import ExportWorker
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            final_dir = Path(temp_dir) / "user-files"
-            final_dir.mkdir()
-            final_dir.joinpath("keep.txt").write_text("do not touch", encoding="utf-8")
-            failed = []
+            root = Path(temp_dir)
+            final_dir = root / "package"
+            _write_old_package(final_dir)
+            (final_dir / "notes.txt").write_text("keep", encoding="utf-8")
+            extra_dir = final_dir / "project-assets"
+            extra_dir.mkdir()
+            (extra_dir / "source.bin").write_bytes(b"source")
             service = self._service()
+            completed = []
+            service.export_completed.connect(completed.append)
+
+            real_read_bytes = Path.read_bytes
+
+            def read_known_only(path):
+                if path.name in {"notes.txt", "source.bin"}:
+                    raise AssertionError("must not read unrelated content")
+                return real_read_bytes(path)
+
+            with mock.patch.object(
+                ExportWorker, "start",
+                side_effect=lambda: _run_service_worker_synchronously(service),
+            ), mock.patch(
+                "core.export_service.shutil.copy2",
+                side_effect=AssertionError("must not copy"),
+            ), mock.patch.object(Path, "read_bytes", read_known_only):
+                service.export_all(
+                    output_dir=str(final_dir),
+                    epconfig=self._config(),
+                    logo_mat=np.full((16, 16, 3), 200, np.uint8),
+                )
+
+            self.assertTrue(completed)
+            self.assertEqual((final_dir / "notes.txt").read_text(encoding="utf-8"), "keep")
+            self.assertEqual((final_dir / "project-assets" / "source.bin").read_bytes(), b"source")
+            self.assertEqual(sorted(path.name for path in final_dir.iterdir()),
+                             ["epconfig.json", "icon.png", "notes.txt", "project-assets"])
+
+    def test_unrelated_entries_return_on_promotion_failure(self):
+        from core.export_service import ExportWorker
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            final_dir = root / "package"
+            old_bytes = _write_old_package(final_dir)
+            (final_dir / "notes.txt").write_text("keep", encoding="utf-8")
+            old_bytes = _package_bytes(final_dir)
+            real_rename = os.rename
+
+            def fail_publish(source, destination):
+                if (Path(source).name.startswith(".package.staging-")
+                        and Path(destination) == final_dir):
+                    raise PermissionError("publish blocked")
+                return real_rename(source, destination)
+
+            service = self._service()
+            failed = []
             service.export_failed.connect(failed.append)
+            with mock.patch.object(
+                ExportWorker, "start",
+                side_effect=lambda: _run_service_worker_synchronously(service),
+            ), mock.patch("core.export_service.os.rename", side_effect=fail_publish):
+                service.export_all(
+                    output_dir=str(final_dir),
+                    epconfig=self._config(),
+                    logo_mat=np.full((16, 16, 3), 200, np.uint8),
+                )
+
+            self.assertTrue(failed)
+            self.assertEqual(_package_bytes(final_dir), old_bytes)
+            self.assertFalse(list(root.glob(".package.backup-*")))
+
+    def test_project_editor_config_is_not_overwritten(self):
+        from core.export_service import ExportWorker
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_dir = Path(temp_dir) / "project"
+            _write_old_package(final_dir)
+            config_path = final_dir / "epconfig.json"
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            payload["editor"] = {"loop": {}}
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+            original = _package_bytes(final_dir)
+            service = self._service()
+            failed = []
+            service.export_failed.connect(failed.append)
+
             with mock.patch.object(ExportWorker, "start") as start:
                 service.export_all(
                     output_dir=str(final_dir),
@@ -722,7 +801,32 @@ class C3PackageTransactionTests(unittest.TestCase):
 
             start.assert_not_called()
             self.assertTrue(failed)
+            self.assertEqual(_package_bytes(final_dir), original)
+
+    def test_non_package_directory_keeps_its_unrelated_file(self):
+        from core.export_service import ExportWorker
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_dir = Path(temp_dir) / "user-files"
+            final_dir.mkdir()
+            final_dir.joinpath("keep.txt").write_text("do not touch", encoding="utf-8")
+            completed = []
+            service = self._service()
+            service.export_completed.connect(completed.append)
+            with mock.patch.object(
+                ExportWorker, "start",
+                side_effect=lambda: _run_service_worker_synchronously(service),
+            ):
+                service.export_all(
+                    output_dir=str(final_dir),
+                    epconfig=self._config(),
+                    logo_mat=np.full((16, 16, 3), 200, np.uint8),
+                )
+
+            self.assertTrue(completed)
             self.assertEqual(final_dir.joinpath("keep.txt").read_text(encoding="utf-8"), "do not touch")
+            self.assertTrue((final_dir / "epconfig.json").is_file())
+            self.assertTrue((final_dir / "icon.png").is_file())
 
     def test_final_directory_symlink_is_rejected_before_worker_start(self):
         """The lexical output link must not be resolved into a replaceable package."""

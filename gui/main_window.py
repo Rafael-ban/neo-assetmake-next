@@ -1460,6 +1460,14 @@ class MainWindow(QMainWindow):
         )
         if not dir_path:
             return
+        if (
+            os.path.normcase(os.path.abspath(dir_path))
+            == os.path.normcase(os.path.abspath(self._base_dir))
+        ):
+            QMessageBox.warning(
+                self, "导出目录无效", "不能将素材导出到当前项目目录，请选择其他目录。"
+            )
+            return
 
         # 暂停信号、准备阶段的错误弹窗也可能重入，须先建立本次导出的边界。
         self._export_in_progress = True
