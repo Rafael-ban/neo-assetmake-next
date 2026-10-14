@@ -7,7 +7,7 @@
 """AssetMaker 内置 compatible pipeline。
 
 output 1 是旋转后、trim/crop 前的完整编辑画布；output 0 严格按 RenderJob
-生成设备编码帧。脚本有意保持自包含和可读，便于用户复制后定制。
+生成处理帧；编码格式由导出模块决定。脚本有意保持自包含和可读，便于用户复制后定制。
 """
 
 from pathlib import Path
@@ -26,9 +26,6 @@ VIDEO_SOURCE_CACHE = 1  # LWLibavSource 的 .lwi 索引缓存
 UNTAGGED_HD_MIN_HEIGHT = 720  # 未标记 YUV 源按原始高度推断矩阵
 FINAL_RESIZER = core.resize.Lanczos
 FINAL_RESIZE_OPTIONS = {}  # 尺寸缩放保留源格式和位深
-OUTPUT_CONVERSION_OPTIONS = {"dither_type": "error_diffusion"}
-# RenderJob 使用设备合同的名称；zimg 对 BT.601 transfer 使用 "601"。
-RESIZE_TRANSFER_NAMES = {"709": "709", "170m": "601"}
 
 core.max_cache_size = VS_CACHE_SIZE_MB
 job = load_job(assetmaker_job, for_export=False)
@@ -189,35 +186,5 @@ clip = FINAL_RESIZER(
     **FINAL_RESIZE_OPTIONS,
 )
 
-# 只在设备输出边界转换格式和颜色；此步骤不再改变画面尺寸。
-clip = core.resize.Lanczos(
-    clip,
-    format=vs.YUV420P8,
-    matrix_s=output["matrix"],
-    transfer_s=RESIZE_TRANSFER_NAMES[output["transfer"]],
-    primaries_s=output["primaries"],
-    range_s=output["range"],
-    **OUTPUT_CONVERSION_OPTIONS,
-)
-
-right_border = output["coded_width"] - output["display_width"]
-bottom_border = output["coded_height"] - output["display_height"]
-if right_border or bottom_border:
-    clip = core.std.AddBorders(
-        clip,
-        right=right_border,
-        bottom=bottom_border,
-    )
-if output["final_rotate_180"]:
-    clip = core.std.Turn180(clip)
-
-colour_codes = {"709": 1, "170m": 6}
-range_codes = {"limited": 0, "full": 1}
-clip = core.std.SetFrameProps(
-    clip,
-    _Matrix=colour_codes[output["matrix"]],
-    _Transfer=colour_codes[output["transfer"]],
-    _Primaries=colour_codes[output["primaries"]],
-    _Range=range_codes[output["range"]],
-)
+# 输出处理结果，保留颜色属性和精度；设备格式由导出适配层转换。
 clip.set_output(0)

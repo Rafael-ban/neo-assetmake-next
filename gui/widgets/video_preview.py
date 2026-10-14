@@ -223,6 +223,11 @@ class VideoPreviewWidget(QWidget):
         self._worker_started = False
         self._worker_ready_for_frames = False
         self._restart_pending = False
+        self._idle_release_timer = QTimer(self)
+        self._idle_release_timer.setSingleShot(True)
+        self._idle_release_timer.setInterval(3000)
+        self._idle_release_timer.timeout.connect(self._release_idle_worker)
+        self._resume_captures: list[Callable] = []
         self._render_context: PreviewRenderContext | None = None
         self._execution_blocked_reason = ""
         self._render_session: RenderSession | None = None
@@ -354,14 +359,14 @@ class VideoPreviewWidget(QWidget):
         layout.addWidget(zoom_container)
 
     def _teardown_media(self, sync_shutdown: bool = False):
-        """取消当前 epoch；close 时再终止该 widget 独占的 worker。"""
+        """取消当前 epoch，并终止该 widget 独占的 worker。"""
+        self._idle_release_timer.stop()
         self._job_debounce.stop()
         self._resolve_all_pending_captures()
         self._dismiss_timeout_dialogs()
         self._request_epochs.clear()
         self._latest_display_request_id = None
         old_session = self._render_session
-        client = self._worker_client
         if old_session is not None:
             self._retire_render_session(old_session)
         self._worker_ready_for_frames = False
@@ -372,11 +377,8 @@ class VideoPreviewWidget(QWidget):
         self._load_request_id = None
         self._vs_active = False
         self._has_video = False
+        self.release_worker_resources()
         if sync_shutdown:
-            if client is not None:
-                client.close()
-                self._worker_client = None
-                self._worker_started = False
             self._cleanup_job_files()
         else:
             self._cleanup_unused_cache_dirs()
@@ -428,6 +430,49 @@ class VideoPreviewWidget(QWidget):
             self._disconnect_worker_client(client)
             client.close()
         self._cleanup_job_files()
+
+    def _release_idle_worker(self) -> None:
+        if self.is_playing or self._crop_edit_start is not None:
+            return
+        if self._request_epochs or self._job_dirty:
+            self._idle_release_timer.start()
+            return
+        self.release_worker_resources()
+
+    def release_worker_resources(self) -> None:
+        """Release the process/GPU graph while retaining the displayed frame and job."""
+        self._idle_release_timer.stop()
+        client = self._worker_client
+        self._worker_client = None
+        self._worker_runtime_snapshot = None
+        self._worker_started = False
+        self._worker_ready_for_frames = False
+        self._restart_pending = False
+        self._load_request_id = None
+        if client is not None:
+            self._disconnect_worker_client(client)
+            client.close()
+            client.deleteLater()
+        self._on_worker_stopped()
+
+    def reload_rendering(self) -> None:
+        """Explicit reload always replaces the process, retaining editor state."""
+        self.ensure_render_state_committed()
+        self.release_worker_resources()
+        self._default_runtime_snapshot = None
+        if not self.video_path or self._render_session is None:
+            return
+        self._job_debounce.stop()
+        self._job_dirty = False
+        self._load_render_job(bootstrap=not self._metadata_resolved)
+
+    def _resume_worker(self) -> bool:
+        self._idle_release_timer.stop()
+        if self._render_session is None or self._worker_client is not None:
+            return False
+        self._restart_pending = True
+        self._ensure_worker()
+        return True
 
     def _disconnect_worker_client(self, client: VSWorkerClient) -> None:
         """旧 client 在 close 后仍可能有 queued Qt 信号，必须不再指向本 widget。"""
@@ -724,6 +769,8 @@ class VideoPreviewWidget(QWidget):
         return "editor", source_index
 
     def _request_current_frame(self, *, coalesce: bool = False) -> None:
+        if self._resume_worker():
+            return
         if (
             not self._worker_ready_for_frames
             or self._worker_client is None
@@ -833,6 +880,9 @@ class VideoPreviewWidget(QWidget):
             self._init_cropbox()
             self.video_loaded.emit(self.total_frames, self.video_fps)
         self._request_current_frame()
+        callbacks, self._resume_captures = self._resume_captures, []
+        for callback in callbacks:
+            self.capture_frame_async(callback)
 
         if self.is_playing:
             self._play_origin_ns = time.perf_counter_ns()
@@ -868,6 +918,8 @@ class VideoPreviewWidget(QWidget):
         owned = np.array(array, copy=True)
         self.current_frame = owned
         self._display_frame(owned)
+        if not self.is_playing:
+            self._idle_release_timer.start()
         if self.is_playing:
             self._play_displayed_frames += 1
             # If the clock advanced while this frame rendered, start catching
@@ -901,8 +953,9 @@ class VideoPreviewWidget(QWidget):
             logger.exception("截帧回调失败")
 
     def _resolve_all_pending_captures(self) -> None:
-        callbacks = tuple(self._pending_captures.values())
+        callbacks = tuple(self._pending_captures.values()) + tuple(self._resume_captures)
         self._pending_captures.clear()
+        self._resume_captures.clear()
         for callback in callbacks:
             try:
                 callback(None)
@@ -1530,6 +1583,7 @@ class VideoPreviewWidget(QWidget):
         if self.is_playing or not (self._has_video or self._loop_frame is not None):
             return
         self.is_playing = True
+        self._resume_worker()
         self._play_origin_ns = time.perf_counter_ns()
         self._play_origin_frame = self.current_frame_index
         self._play_sample_started_ns = self._play_origin_ns
@@ -1541,6 +1595,7 @@ class VideoPreviewWidget(QWidget):
         self.timer.stop()
         was_playing = self.is_playing
         self.is_playing = False
+        self._idle_release_timer.start()
         if was_playing:
             elapsed = (time.perf_counter_ns() - self._play_sample_started_ns) / 1e9
             if elapsed >= 1.0:
@@ -1601,6 +1656,11 @@ class VideoPreviewWidget(QWidget):
 
     def capture_frame_async(self, callback):
         """非合并地请求当前 surface/index；绝不返回可能过期的缓存帧。"""
+        if self._vs_active and self._render_session is not None:
+            self._resume_worker()
+            if not self._worker_ready_for_frames:
+                self._resume_captures.append(callback)
+                return
         if not self._vs_active or self._worker_client is None or self._render_session is None:
             callback(None if self.current_frame is None else self.current_frame.copy())
             return

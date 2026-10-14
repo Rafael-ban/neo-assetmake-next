@@ -568,7 +568,7 @@ class ExportWorker(QThread):
         process = SyncVSWorkerProcess(app_dir=app_dir)
         try:
             process.start()
-            metadata = process.load(session)
+            metadata = process.load(session, for_export=True)
         finally:
             process.close()
 

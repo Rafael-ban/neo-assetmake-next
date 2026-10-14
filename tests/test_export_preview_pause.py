@@ -355,6 +355,24 @@ class MainWindowExportLifecycleTests(unittest.TestCase):
         self.assertFalse(self.window._export_in_progress)
         self.assertEqual(self.window._export_dialog.completed, [(True, "完成")])
 
+    def test_preview_workers_are_released_before_export_starts(self):
+        previews = (
+            self.window.video_preview, self.window.intro_preview,
+            self.window.frame_capture_preview,
+            self.window.transition_preview.preview_in,
+            self.window.transition_preview.preview_loop,
+        )
+        for preview in previews:
+            preview.release_worker_resources = mock.Mock()
+
+        class Service(_CompletedExportService):
+            def export_all(service, **kwargs):
+                for preview in previews:
+                    preview.release_worker_resources.assert_called_once_with()
+                super().export_all(**kwargs)
+
+        self._run_export_with(Service)
+
     def test_second_export_is_blocked_while_previous_worker_is_running(self):
         """删除重入保护时，第二次导出会替换仍在运行 worker 的父对象引用。"""
         self.window._export_in_progress = True

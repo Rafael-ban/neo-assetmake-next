@@ -195,7 +195,7 @@ neo-assetmaker/
 └── .github/workflows/                # CI、构建与发布工作流
 ```
 
-`config/vs_runtime.json` 仅控制 worker 超时、VS core 资源请求初值、插件目录和全局脚本位置；滤镜顺序、裁剪、颜色与输出由内置或用户 `.vpy` 明确编写，不能把这两类职责混在一起。`num_threads` / `max_cache_size_mb` 的 `0` 表示每个进程首次捕获的 VapourSynth 原生值；非零值在 worker 或 VSPipe 执行每个脚本前恢复，脚本仍可显式覆盖（`default_pipeline.vpy` 设为 `4096` MB，`rife_pipeline.vpy` 仍为 `16000` MB）。cache 大小不是整个进程 RSS 的硬上限。
+`config/vs_runtime.json` 仅控制 worker 超时、VS core 资源请求初值、插件目录和全局脚本位置；滤镜顺序、裁剪和缩放由内置或用户 `.vpy` 明确编写，设备编码格式与目标颜色转换由导出适配层处理，不能把这两类职责混在一起。`num_threads` / `max_cache_size_mb` 的 `0` 表示每个进程首次捕获的 VapourSynth 原生值；非零值在 worker 或 VSPipe 执行每个脚本前恢复，脚本仍可显式覆盖（`default_pipeline.vpy` 设为 `4096` MB，`rife_pipeline.vpy` 仍为 `16000` MB）。cache 大小不是整个进程 RSS 的硬上限。
 
 ## 测试
 

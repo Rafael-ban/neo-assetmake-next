@@ -64,6 +64,8 @@ VS_WORKER_SUPPORT_FILES = (
     "resources/vapoursynth/python/assetmaker_vs/runtime_layout.py",
     "resources/vapoursynth/python/assetmaker_vs/core_resources.py",
     "resources/vapoursynth/python/assetmaker_vs/native_plugins.py",
+    "resources/vapoursynth/python/assetmaker_vs/encoding.py",
+    "resources/vapoursynth/python/assetmaker_vs/rife_cache.py",
 )
 
 

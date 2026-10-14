@@ -5,27 +5,17 @@
 
 ## 内置处理链
 
-`resources/vapoursynth/default_pipeline.vpy` 顶部集中缓存、未标记源的解释、
-尺寸缩放核和设备格式转换参数。默认使用 Lanczos，尺寸缩放不传 `format=vs.YUV420P8`，
-保留源格式和位深。修改 `FINAL_RESIZER` / `FINAL_RESIZE_OPTIONS` 可选择其他 resize 核。
-缩放结束后单独执行设备所需的格式/颜色转换；`OUTPUT_CONVERSION_OPTIONS` 保留原有
-`dither_type="error_diffusion"`，显示端的 RGB24 转换也保留该抖动设置。
+`default_pipeline.vpy` 的 `FINAL_RESIZER` / `FINAL_RESIZE_OPTIONS` 只负责尺寸缩放，
+不指定 YUV420P8。处理顺序为源 → 颜色解释 → 旋转 → 图片循环 → output 1 →
+截取 → 裁剪 → `process_source()` → 缩放 → output 0。
 
-顺序为：取源 → 补充未标记源的颜色信息 → 旋转 → 图片循环 → output 1 →
-时间裁切 → 空间裁剪 → `process_source()` → 保留源格式的尺寸缩放 → 设备格式/色彩转换 → 补边/设备旋转 →
-output 0。`process_source()` 默认原样返回，供按实际素材加入去噪、去色带等处理。
-启用第三方调用时，同时在脚本头的 `assetmaker-requires` 中声明具体函数。
+RIFE 模板在旋转之后插入补帧和项目磁盘缓存，将该节点另存为 output 2；
+output 1 与 output 0 共享它。脚本保留处理中的位深与颜色，最终设备颜色、
+格式、补边和安装方向由 `assetmaker_vs.encoding` 在导出边界处理。
+详见 [15 多路输出与编码边界](15-output-contract.md)。
 
-output 1 保留完整编辑画布与时间轴；output 0 固定为设备需要的 YUV420P8。
-中间处理可以使用高位深或 float，但必须在输出前回到该合同。
-不要把教程中的固定 1920×1080、10-bit 输出或 IVTC 帧率直接用于 compatible 脚本。
-
-输入已有颜色标签时保留标签；缺少标签时，YUV 按原始源高度推断 709/170m，
-RGB 图片默认 sRGB/709/full。默认图实际执行 matrix、transfer、primaries、range
-转换，不仅重写最终标签。显示支路转换到 sRGB/709/full；适应窗口使用 Lanczos，
-像素放大保留 Point。画面比较应在相同显示色彩空间中进行。
-设备合同的 transfer `170m` 传入 resize 时使用 `601`，两者数值代码均为 6；
-matrix 与 primaries 的名称仍为 `170m`。
+输入已有颜色标签时保留；缺少标签时按源类型和原始高度补足解释。
+显示支路转换到 sRGB/709/full。自定义脚本应保留真实颜色属性，不应伪造设备标签。
 
 ## 缓存配置与对应测试
 
@@ -134,7 +124,7 @@ uv run python plugin_distribution.py clean --app-dir "$sourceRoot" --manifest "$
 脚本头声明 `rife.RIFE`，因此即使素材会跳过插帧、或 `RIFE_ENABLED=False`，也仍要求插件可用；
 不使用 RIFE 时应选择内置脚本。GPU、模型或插件失败会报告错误，不会静默当作插帧成功。
 
-尺寸缩放保留源格式和位深；设备输出前单独转换格式，仍保留 `error_diffusion` 和原有 x264 设置。
+尺寸缩放保留源格式和位深；导出适配层单独转换设备格式，保留 `error_diffusion` 和原有 x264 设置。
 文件校验、打包成功和模拟测试不代表 Vulkan GPU 实际推理验收。
 
 ## 通用扩展的安装、修复与清理
@@ -194,3 +184,23 @@ uv run python plugin_distribution.py clean --app-dir .
 
 不能仅凭插件名把任意 HDR、AI 或插帧链当作默认画质增强。此类脚本需明确源格式、
 目标格式和时间轴语义，使用单个实际样本验证后再用于项目。
+
+## 补帧结果磁盘缓存与资源回收
+
+当前源码在项目 `.assetmaker-vs/rife-cache/` 保存无损压缩的 RGBS float32 帧和颜色属性。
+这是按需缓存，不会导入时等待整片算完；再次访问已完成帧时不重新推理。
+默认项目磁盘预算 8 GiB，由 RIFE 模板的 `RIFE_DISK_CACHE_BYTES` 设置。
+容量不足会淘汰旧帧，之后访问时重算；它不是永久素材归档。
+
+RIFE 的 VS 工作缓存保持 16000 MB，默认脚本保持 4096 MB。磁盘结果节点关闭重复的
+VS 自动帧缓存；工作图仍需要运行内存和显存，不承诺播放时零内存占用。
+预览暂停或静态显示空闲 3 秒后关闭计算进程，保留当前显示帧与编辑状态。
+下次播放、seek 或截帧会按需恢复，首次恢复可能有初始化延迟。
+导出开始前释放预览进程，结束后只有原本播放的预览自动恢复。
+
+通过“操作 → 清除补帧缓存”暂停预览并清理当前项目缓存。清理失败会显示错误；
+完成的帧可复用，未完成写入使用临时文件，重试不会把半帧当作有效结果。
+普通预览 session 的 `.lwi` 索引不是补帧缓存，不要混淆。
+
+测试入口：`tests.test_rife_disk_cache`、`tests.test_preview_worker_lifecycle`、
+`tests.test_export_preview_pause`。原 v2.2.1 EXE 不具备这些源码改动，需重新构建主程序。

@@ -31,35 +31,29 @@ _ColorRange=1 + range_in_s=full    -> RGB R=0
 
 ## 当前默认脚本的真实顺序
 
-`resources/vapoursynth/default_pipeline.vpy` 在取源后补充缺失的颜色标签，
-在 trim/crop 与 `process_source()` 后执行：
+内置脚本在取源后补足缺失的颜色解释，在 trim/crop 与 `process_source()` 后只缩放尺寸：
 
 ```python
-clip = core.resize.Spline36(
+clip = FINAL_RESIZER(
     clip,
     width=output["display_width"],
     height=output["display_height"],
-    format=vs.YUV420P8,
-    matrix_s=output["matrix"],
-    transfer_s=RESIZE_TRANSFER_NAMES[output["transfer"]],
-    primaries_s=output["primaries"],
-    range_s=output["range"],
-    dither_type="error_diffusion",
+    **FINAL_RESIZE_OPTIONS,
 )
+clip.set_output(0)
 ```
 
-- YUV 缺失/unspecified 的颜色标签按原始源高补 709 或 170m；已有标签保留。
-  图片由 `imwri.Read` 以 RGB 输入，缺失标签时按 sRGB/709/full 解释。
-- Spline36 把裁剪结果转换到内容画布和 YUV420P8，matrix/transfer/primaries/range
-  来自 profile。设备合同中的 transfer `170m` 在 resize 中名为 `601`，数值同为 6。
-- 补边与可选最终 180° 完成后，脚本再写 `_Matrix`、`_Transfer`、
-  `_Primaries`、`_Range`。这是输出标签，不会再次改变像素。
-- VSPipe 的 Y4M 接 x264；编码器参数还需与这些输出标签一致。当前 x264 使用
-  `smpte170m` 与 `--range tv`。
+`FINAL_RESIZER` 默认 Lanczos，不指定 format，保留处理中的格式和位深。
+RIFE 处理结果可以保持 RGBS；显示支路按真实源颜色转到显示色彩空间。
+
+导出模块的 `assetmaker_vs.encoding.prepare_encoding_clip()` 单独负责当前设备的
+YUV420P8、170m/limited 转换及设备方向，使用 error_diffusion。它不替脚本缩放尺寸。
+VSPipe Y4M 和 x264 使用这个编码适配结果。设备 transfer 名称 `170m` 在 resize
+中使用 `601`，两者对应数值代码 6。
 
 ## 受保护的输出合同
 
-profile 由 `assetmaker_vs.job_api` 固定，而不是可随意拼接的旧全局配置：
+下表约束导出适配层的最终编码结果，不限制脚本中间处理格式；profile 来自 `assetmaker_vs.job_api`：
 
 | profile | 内容画布 | 编码画布 | format | matrix/range |
 |---|---:|---:|---|---|

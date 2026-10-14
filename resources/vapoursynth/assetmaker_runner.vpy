@@ -24,7 +24,7 @@ if _helper_root not in sys.path:
     sys.path.insert(0, _helper_root)
 
 from assetmaker_vs.contract import (  # noqa: E402
-    validate_outputs,
+    validate_encoding_outputs,
     verify_required_callables,
 )
 from assetmaker_vs.executor import execute_user_script  # noqa: E402
@@ -116,5 +116,5 @@ graph = execute_user_script(
     python_module_dirs=runtime_python_dirs_from_env(),
 )
 _verify_job_content("执行用户脚本后")
-validated = validate_outputs(vs, job, header)
+validated = validate_encoding_outputs(vs, job, header)
 validated.guarded_clip.set_output(0)

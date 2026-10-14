@@ -152,10 +152,10 @@ def build_x264_command(
 
     ``vui`` is deliberately mandatory. x264-7mod defaults to undefined
     matrix/primaries/transfer and automatic range; the values must instead
-    come from the same worker-validated output 0 that VSPipe consumes.
+    come from the shared export adapter validated by the worker and VSPipe.
     """
     if not isinstance(vui, X264Vui):
-        raise TypeError("vui 必须是 output 0 派生的 X264Vui")
+        raise TypeError("vui 必须是编码适配结果派生的 X264Vui")
     return [
         x264_path,
         "--demuxer",

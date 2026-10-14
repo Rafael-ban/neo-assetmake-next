@@ -255,13 +255,8 @@ class PreviewWorkerRetirementTests(unittest.TestCase):
         QCoreApplication.processEvents()
         self.assertIsNone(self.widget.current_frame)
         self.assertEqual(self.widget.video_label.text(), "No media loaded")
-        self.assertTrue(job_path.is_file())
-
-        self.client.operation_completed.emit(
-            self.client.unload_request_ids[-1],
-            "unload",
-        )
-        QCoreApplication.processEvents()
+        self.assertEqual(self.client.closed, 1)
+        self.assertIsNone(self.widget._worker_client)
         self.assertFalse(job_path.exists())
 
     def test_repeated_flushes_collect_retired_jobs_but_keep_current_job(self):
@@ -287,13 +282,84 @@ class PreviewWorkerRetirementTests(unittest.TestCase):
     def test_worker_death_releases_a_retiring_job(self):
         session = self._load_resolved()
         job_path = Path(session.job_path)
-        self.widget.clear()
+        self.widget._retire_render_session(session)
         self.assertTrue(job_path.is_file())
 
         self.client.worker_stopped.emit()
         QCoreApplication.processEvents()
 
         self.assertFalse(job_path.exists())
+
+
+class PreviewIdleReleaseTests(unittest.TestCase):
+    def setUp(self):
+        from tests.test_preview_worker_integration import PreviewWorkerContractTests
+
+        PreviewWorkerContractTests.setUp(self)
+        self.clients = [self.client]
+
+        def factory(_parent):
+            client = FakeWorkerClient()
+            self.clients.append(client)
+            return client
+
+        # Keep the fixture's initial client, then create fresh clients on resume.
+        self.widget._worker_client_factory = lambda _parent: self.clients[0]
+        self.assertTrue(self.widget.load_video(str(self.media)))
+        self.widget._worker_client_factory = factory
+        session = self.client.loads[-1]
+        self.metadata = PreviewWorkerContractTests._metadata(self, session.epoch)
+        self.client.emit_metadata(self.widget._load_request_id, self.metadata)
+        request = self.client.requests[-1]
+        self.client.frame_ready.emit(
+            request.request_id, request.epoch, request.surface, request.index,
+            np.full((4, 4, 3), 7, dtype=np.uint8),
+        )
+
+    def test_idle_release_preserves_frame_and_job_then_seek_reloads(self):
+        session = self.widget._render_session
+        self.widget._job_dirty = False
+        self.widget._job_debounce.stop()
+        frame = self.widget.current_frame.copy()
+        self.widget._release_idle_worker()
+        self.assertEqual(self.client.closed, 1)
+        self.assertIsNone(self.widget._worker_client)
+        self.assertIs(self.widget._render_session, session)
+        self.assertTrue(Path(session.job_path).is_file())
+        np.testing.assert_array_equal(self.widget.current_frame, frame)
+        self.widget.seek_to_frame(2)
+        replacement = self.clients[-1]
+        replacement.ready.emit()
+        self.assertEqual(replacement.loads, [session])
+        replacement.emit_metadata(self.widget._load_request_id, self.metadata)
+        self.assertEqual(replacement.requests[-1].index, 2)
+
+    def test_capture_after_release_waits_for_metadata_and_requests_fresh_frame(self):
+        self.widget.release_worker_resources()
+        captured = []
+        self.widget.capture_frame_async(captured.append)
+        self.assertEqual(captured, [])
+        replacement = self.clients[-1]
+        replacement.ready.emit()
+        replacement.emit_metadata(self.widget._load_request_id, self.metadata)
+        request = replacement.requests[-1]
+        self.assertFalse(request.coalesce)
+        replacement.frame_ready.emit(
+            request.request_id, request.epoch, request.surface, request.index,
+            np.full((4, 4, 3), 9, dtype=np.uint8),
+        )
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(int(captured[0][0, 0, 0]), 9)
+
+    def test_playing_and_pending_frames_delay_idle_release(self):
+        self.widget.play()
+        self.widget._release_idle_worker()
+        self.assertEqual(self.client.closed, 0)
+        self.widget.pause()
+        self.widget._request_current_frame()
+        self.widget._release_idle_worker()
+        self.assertEqual(self.client.closed, 0)
+        self.assertTrue(self.widget._idle_release_timer.isActive())
 
 
 if __name__ == "__main__":

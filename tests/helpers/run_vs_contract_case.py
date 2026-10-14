@@ -1727,7 +1727,8 @@ def _execute_default(job_path: Path, *, for_export: bool):
     sys.path.insert(0, str(HELPER_ROOT))
     vs = _load_vs()
     from assetmaker_vs.contract import (
-        validate_outputs,
+        validate_script_outputs,
+        validate_encoding_outputs,
         verify_required_callables,
     )
     from assetmaker_vs.executor import execute_user_script
@@ -1747,7 +1748,10 @@ def _execute_default(job_path: Path, *, for_export: bool):
         api_version="1",
         mode="compatible",
     )
-    validated = validate_outputs(vs, job, header)
+    validated = (
+        validate_encoding_outputs(vs, job, header) if for_export
+        else validate_script_outputs(vs, job, header)
+    )
     return vs, graph, validated
 
 
@@ -1852,6 +1856,7 @@ def _default_image_case() -> dict[str, object]:
         )
         vs, graph, validated = _execute_default(job, for_export=True)
         output0 = _node_metadata(validated.guarded_clip)
+        processed0 = _node_metadata(vs.get_output(0).clip)
         output1 = _node_metadata(vs.get_output(1).clip)
         graph.close()
         runner = _run_default_vspipe(job)
@@ -1863,6 +1868,7 @@ def _default_image_case() -> dict[str, object]:
         gc.collect()
     return {
         "output0": output0,
+        "processed0": processed0,
         "output1": output1,
         "runner": runner,
         "encoded": encoded,

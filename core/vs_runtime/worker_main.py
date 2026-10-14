@@ -583,6 +583,9 @@ class WorkerServer:
             compute_script_bundle_hash,
         )
 
+        for_export = message.get("for_export", False)
+        if type(for_export) is not bool:
+            raise ProtocolError("for_export 必须是 bool", code="protocol.request_shape")
         request_id = _validate_request_fields(
             message,
             {
@@ -597,7 +600,7 @@ class WorkerServer:
                 "bundle_hash",
                 "runtime_fingerprint",
                 "mode",
-            },
+            } | ({"for_export"} if "for_export" in message else set()),
         )
         api_version = message["api_version"]
         if type(api_version) is not int or api_version != WORKER_API_VERSION:
@@ -652,7 +655,7 @@ class WorkerServer:
             )
 
             self._assert_snapshot_job_identity(snapshot, message["job_sha256"])
-            job = load_job(snapshot.job_path)
+            job = load_job(snapshot.job_path, for_export=for_export)
             self._assert_snapshot_job_identity(snapshot, message["job_sha256"])
             header = parse_script_header(snapshot.script_path)
             comparisons = (
@@ -818,7 +821,8 @@ class WorkerServer:
                 OutputContractError,
                 RequirementError,
                 decode_output_contract_error,
-                validate_outputs,
+                validate_script_outputs,
+                validate_encoding_outputs,
                 verify_required_callables,
             )
             from resources.vapoursynth.python.assetmaker_vs.executor import (
@@ -902,7 +906,11 @@ class WorkerServer:
                 raise _FatalWorkerExit(FATAL_RETIREMENT_EXIT) from error
             return
         try:
-            outputs = validate_outputs(vs, job, header)
+            outputs = (
+                validate_encoding_outputs(vs, job, header)
+                if message.get("for_export", False)
+                else validate_script_outputs(vs, job, header)
+            )
         except BaseException as error:
             decoded = (
                 error
@@ -944,10 +952,11 @@ class WorkerServer:
         with self._condition:
             self._loaded = loaded
             self._cancelled_epochs.discard(loaded.epoch)
-        output_colour = {
-            field: job["output"][field]
-            for field in ("matrix", "transfer", "primaries", "range")
-        }
+        output_colour = (
+            {field: job["output"][field]
+             for field in ("matrix", "transfer", "primaries", "range")}
+            if message.get("for_export", False) else outputs.colour
+        )
         metadata = {
             "epoch": loaded.epoch,
             "mode": header["mode"],

@@ -12,7 +12,10 @@ from resources.vapoursynth.python.assetmaker_vs.contract import (
     TRANSFER_CODES,
     OutputContractError,
     RequirementError,
+    ScriptOutputs,
     ValidatedOutputs,
+    validate_script_outputs as _validate_script_outputs,
+    validate_encoding_outputs as _validate_encoding_outputs,
     X264Vui,
     decode_output_contract_error,
     guard_output0,
@@ -48,13 +51,24 @@ def validate_outputs(
     return _validate_outputs(vs, _job_payload(job), _header_payload(header))
 
 
+def validate_script_outputs(vs: Any, job: Any, header: Any) -> ScriptOutputs:
+    return _validate_script_outputs(vs, _job_payload(job), _header_payload(header))
+
+
+def validate_encoding_outputs(vs: Any, job: Any, header: Any) -> ValidatedOutputs:
+    return _validate_encoding_outputs(vs, _job_payload(job), _header_payload(header))
+
+
 __all__ = [
     "MATRIX_CODES",
     "OutputContractError",
     "PRIMARIES_CODES",
     "RequirementError",
     "TRANSFER_CODES",
+    "ScriptOutputs",
     "ValidatedOutputs",
+    "validate_script_outputs",
+    "validate_encoding_outputs",
     "X264Vui",
     "decode_output_contract_error",
     "guard_output0",

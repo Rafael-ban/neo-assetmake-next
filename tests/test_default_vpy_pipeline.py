@@ -58,7 +58,7 @@ class DefaultPipelineSemanticTests(unittest.TestCase):
         self.assertNotIn("rife", source.lower())
         self.assertNotIn("interpolate_timeline", source)
 
-    def test_resize_keeps_source_format_until_device_output_conversion(self):
+    def test_resize_keeps_source_format_for_export_adapter(self):
         tree = ast.parse(DEFAULT_PIPELINE.read_text(encoding="utf-8"))
         constants = [
             node for node in tree.body
@@ -82,8 +82,7 @@ class DefaultPipelineSemanticTests(unittest.TestCase):
             with self.subTest(source_format=source_format):
                 source = SimpleNamespace(format=source_format)
                 scaled = SimpleNamespace(format=source_format)
-                final = SimpleNamespace(format="YUV420P8")
-                resize = Mock(side_effect=[scaled, final])
+                resize = Mock(return_value=scaled)
                 namespace = {
                     "clip": source,
                     "core": SimpleNamespace(resize=SimpleNamespace(Lanczos=resize)),
@@ -96,18 +95,11 @@ class DefaultPipelineSemanticTests(unittest.TestCase):
                 }
                 exec(compile(ast.Module(body=constants + stages, type_ignores=[]),
                              str(DEFAULT_PIPELINE), "exec"), namespace)
-                scale_call, conversion_call = resize.call_args_list
-                self.assertIs(scale_call.args[0], source)
-                self.assertEqual(scale_call.kwargs, {"width": 360, "height": 640})
-                self.assertIs(conversion_call.args[0], scaled)
-                self.assertEqual(conversion_call.kwargs["format"], 100)
-                self.assertNotIn("width", conversion_call.kwargs)
-                self.assertNotIn("height", conversion_call.kwargs)
-                self.assertEqual(conversion_call.kwargs["transfer_s"], "601")
-                self.assertEqual(conversion_call.kwargs["dither_type"], "error_diffusion")
-                self.assertIs(namespace["clip"], final)
+                resize.assert_called_once_with(source, width=360, height=640)
+                self.assertIs(namespace["clip"], scaled)
 
-    def test_default_script_orders_rotation_loop_trim_crop_and_padding(self):
+
+    def test_default_script_orders_rotation_loop_trim_crop_and_scaling(self):
         """默认 compatible 脚本保留旧 goldens 覆盖的渲染语义，不锁定字节。"""
         source = DEFAULT_PIPELINE.read_text(encoding="utf-8")
         ordered_steps = (
@@ -117,9 +109,11 @@ class DefaultPipelineSemanticTests(unittest.TestCase):
             'clip = clip[timeline["start_frame"] : timeline["end_frame"]]',
             "clip = crop_safely(",
             "clip = FINAL_RESIZER(",
-            "clip = core.std.AddBorders(",
             "clip.set_output(0)",
         )
+        self.assertNotIn("core.std.AddBorders", source)
+        self.assertNotIn("final_rotate_180", source)
+        self.assertNotIn("format=vs.YUV420P8", source)
         positions = [source.index(step) for step in ordered_steps]
         self.assertEqual(positions, sorted(positions))
 
@@ -213,6 +207,11 @@ class DefaultPipelineRealSubprocessTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         output0 = payload["output0"]
         output1 = payload["output1"]
+        processed = payload["processed0"]
+        self.assertEqual(processed["format"], "RGB24")
+        self.assertEqual(processed["props"], {
+            "_Matrix": 0, "_Transfer": 13, "_Primaries": 1, "_Range": 1,
+        })
         self.assertEqual(
             (output0["width"], output0["height"]), (360, 640)
         )

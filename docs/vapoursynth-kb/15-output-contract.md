@@ -1,113 +1,52 @@
-# 15 — output 0/1 与设备编码契约
+# 15 — 多路处理输出与编码边界
 
-## 两个输出的职责
+## 脚本输出的职责
 
-用户脚本可以自由构图，但宿主只消费明确注册的 `VideoOutputTuple`：
+| 输出 | 用途 | 内容 |
+| --- | --- | --- |
+| output 0 | final 预览、导出的处理输入 | 已截取、裁剪、滤镜和缩放的画面；保留处理格式与真实颜色属性 |
+| output 1 | compatible 编辑画布 | 旋转和补帧之后、截取和裁剪之前的完整时间轴 |
+| output 2 | 内置 RIFE 的补帧结果节点 | 项目磁盘缓存支路；与 output 1/0 共用上游，不建立第二套推理图 |
 
-| 输出 | 使用者 | 合同 |
-|---|---|---|
-| output 0 | final 预览、导出预检、VSPipe→x264 | 必需的设备编码 clip |
-| output 1 | compatible 编辑器的 editor surface | 仅 `assetmaker-editor-output: 1` 时必需 |
+output 0 必需，output 1 由 `assetmaker-editor-output: 1` 声明。
+output 2 是 RIFE 模板的额外输出，普通自定义脚本不必提供。
+raw 模式仍由用户自行构图，只需 output 0。
 
-历史 R73 官方 `set_output()`/`get_output()` 参考（保留用于对照）：
-`https://github.com/vapoursynth/vapoursynth/blob/R73/doc/pythonreference.rst`。
-当前 binding 的 `get_output()` 返回 `VideoOutputTuple`；项目拒绝非 `VideoNode`、带
-alpha 或非零 `alt_output`，不会从脚本全局变量猜哪个 clip 应导出。
+## 处理输入与编码输出是两层合同
 
-`compatible` 脚本若声明 trim/crop/rotation 能力，output 1 的语义是旋转后、正式
-trim/crop 前的完整编辑时间轴。`raw` 必须声明 editor output 0，只提供 output 0。
+`validate_script_outputs()` 检查固定的 RGB/YUV/GRAY 格式、display 尺寸、正帧数和帧率，
+以及已解析的 timeline。脚本保留真实的 matrix/transfer/primaries/range；不能只重写
+目标颜色标签而不转换像素。宿主不替脚本补尺寸缩放。
 
-## output 0 静态合同
+`validate_encoding_outputs()` 在导出预检和 VSPipe 中使用同一个
+`assetmaker_vs.encoding.prepare_encoding_clip()`：
 
-`assetmaker_vs.contract.validate_outputs()` 要求：
+1. 将处理结果转换为当前设备所需的 YUV420P8、170m、limited，保留 error_diffusion。
+2. 根据 profile 补齐 coded 尺寸并应用设备安装方向。
+3. 用严格合同验证编码帧，生成 x264 VUI，再逐帧 guard。
 
-- format 精确为 `YUV420P8`，且 clip format 固定；
-- width/height 精确等于 job 的 `coded_width/coded_height`，并满足实际 chroma
-  subsampling；
-- `num_frames > 0`，已解析 timeline 时等于 `end_frame - start_frame`；
-- fps 为正有理数，已解析 job fps 时按交叉乘法精确相等；
-- 首/中/末 sentinel frame 的尺寸、format、matrix、transfer、primaries、range
-  符合 job 且彼此一致。
+这是导出模块的格式适配，不是滤镜脚本中的强制格式归一化。现有传输为
+VSPipe Y4M → x264；Y4M 不能直接承载 RGB 浮点，因此不能只删掉转换而保持其他链路不变。
+`--output-csp i420` 指定最终编码格式，不能代替上游 RGBS 的传输适配和正确颜色转换。
 
-profile 几何示例：
+| profile | 脚本 display 尺寸 | 当前 coded 尺寸 |
+| --- | --- | --- |
+| 360x640 | 360×640 | 360×640 |
+| 720x1280 | 720×1280 | 720×1280 |
+| 800x1280 | 800×1280 | 800×1280 |
 
-| profile | 内容画布 | output 0 编码画布 |
-|---|---:|---:|
-| `360x640` | 360×640 | 360×640 |
-| `720x1280` | 720×1280 | 720×1280 |
-| `800x1280` | 800×1280 | 800×1280 |
+不再补右侧 24 像素。旧自定义脚本若自行补边或应用最终设备旋转，应移除这些步骤，
+避免与导出层重复。已有固定格式 YUV420P8 脚本仍可作为处理输入。
 
-360 profile 按素材包的实际画布直接输出 360×640，不再补右侧 24 像素。
-contract 接受最终 360×640；旧自定义脚本若固定输出 384×640，需要同步调整。
+## 预览与验证
 
-## 当前 R79 色彩与 VUI
+普通 worker 的 final surface 是脚本处理结果；editor surface 是 output 1。
+导出预检显式传 `for_export=True`，VSPipe runner 注册适配后的编码 clip 为 output 0。
+因此显示预览保留源颜色解释，设备转换后的像素由编码预检与真实导出 parity 验证。
 
-当前 profile 要求 `matrix/transfer/primaries=170m`、`range=limited`。当前 contract：
+严格编码合同仍要求真实 FrameProps 的 `_Range`，不接受物理旧 `_ColorRange` 键；
+sentinel 和逐帧 guard 保留。`validate_outputs()` 是严格编码结果校验入口，
+不是普通脚本结果的直接入口。
 
-- `_Matrix/_Transfer/_Primaries` 必须是受支持的普通整数 code；
-- 默认脚本写 `_Range`：普通整数 `0` limited、`1` full；
-- 有界接受精确 `vs.Range` 类型的 `RANGE_LIMITED/RANGE_FULL`；拒绝其他枚举、bool、float；
-- 真实 `vs.FrameProps` 中若存在物理 `_ColorRange`，无论是否与 `_Range` 并存都拒绝；
-- 普通映射的兼容 `_ColorRange` 整数为 `1` limited、`0` full，双键须语义一致。
-
-sentinel 校验产出 `X264Vui`，导出命令据此明确传
-`--colormatrix/--colorprim/--transfer/--range`。因此像素转换、frame props 与码流
-VUI 是三层一致性，不可只修其中一层。
-
-R79 旧键兼容访问可能遮蔽物理属性，不能证明旧值正确。具体拒绝条件和
-验证入口见 [01 色彩范围](01-colour-range-props.md)，不以 `int()` 吞掉未知类型。
-
-## 逐帧 guard
-
-首/中/末 sentinel 只用于预检签名。通过后，contract 还用 `std.ModifyFrame` 包装
-output 0；每一帧真正被 worker 或 VSPipe 请求时都会再次验证 format、尺寸和色彩
-props。这样脚本若在第 2 帧或后续帧漂移，fresh VSPipe 顺序消费会在编码期间失败，
-而不是仅靠第 0 帧误放行。
-
-worker 的 final surface 和 VSPipe runner 都消费 `guarded_clip`。VSPipe runner 校验后
-把 guarded clip 重新注册为 output 0，x264 不会看到未经合同保护的原始输出。
-
-## output 1 合同与边界
-
-若脚本头声明 editor output 1，contract 要求：
-
-- 正尺寸、正帧数、固定 format 与正 fps；
-- 已解析 `end_frame` 时，完整编辑时间轴至少覆盖该帧；
-- fps 与 job 一致；
-- 图片的帧数精确等于 `virtual_frame_count`。
-
-这些是可机械验证的结构。contract 不能从像素自动证明“rotation 已应用且 trim/crop
-未应用”；该语义由脚本头承诺、默认脚本顺序测试与真实 editor/final parity 共同
-保证。不要把 metadata 校验夸大成对任意用户滤镜语义的证明。
-
-## 常见失败
-
-- 只写 `clip` 变量但没 `set_output(0)`；
-- 输出 RGB、10-bit、可变 format、alpha 或错误 coded size；
-- 仍按旧规则补黑边并注册 384×640 的 output 0；
-- timeline 帧数或有理 fps 不一致；
-- 只写标签但像素未转换，或像素已转换但 props/VUI 不一致；
-- compatible 脚本声明 editor output 1 却未注册，或图片 output 1 已被 trim。
-
-宿主不会在 output 0 后偷偷补 resize 来“修好”用户脚本，因为那会让用户脚本、
-预览与导出看到不同图。修复应回到 `.vpy`。
-
-## 验证
-
-```powershell
-uv run python -m unittest -v `
-  tests.test_vs_output_contract `
-  tests.test_default_vpy_pipeline `
-  tests.test_preview_export_parity `
-  tests.test_export_color_roundtrip `
-  tests.test_vs_runner
-```
-
-真实 parity/编码测试必须报告是否 skip。
-
-## 相关
-
-- [01 色彩范围](01-colour-range-props.md)
-- [02 Resize](02-resize-semantics.md)
-- [13 用户 VPY ABI](13-user-vpy-abi.md)
-- [14 worker 协议](14-worker-protocol.md)
+对应测试：`tests.test_vs_encoding_boundary`、`tests.test_vs_output_contract`、
+`tests.test_default_vpy_pipeline`、`tests.test_preview_export_parity`。

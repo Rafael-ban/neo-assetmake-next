@@ -111,7 +111,7 @@ def _preview_export_contract() -> dict[str, object]:
         )
         try:
             worker.start(timeout_ms=15_000)
-            worker.load(session, timeout_ms=30_000)
+            worker.load(session, timeout_ms=30_000, for_export=True)
             preview = worker.request_frame(
                 epoch=session.epoch,
                 index=0,

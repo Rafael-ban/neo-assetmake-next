@@ -263,10 +263,13 @@ class VSWorkerClient(QObject):
             raise RuntimeError("VSWorkerClient 已关闭")
         return self._start_transport()
 
-    def load(self, session: RenderSession) -> int:
+    def load(self, session: RenderSession, *, for_export: bool = False) -> int:
         if not hasattr(session, "to_load_message"):
             raise TypeError("session 必须提供 to_load_message()")
-        payload = session.to_load_message(1)
+        payload = (
+            session.to_load_message(1, for_export=True)
+            if for_export else session.to_load_message(1)
+        )
         request_id = self.transport.send_request(payload)
         self._schedule_timeout(
             request_id,
@@ -502,6 +505,8 @@ class VSWorkerClient(QObject):
         self._clear_all_timeouts()
         self.transport.remove_listener(self._relay_transport_event)
         self.transport.close()
+        if self.transport.alive:
+            raise RuntimeError("VapourSynth preview worker did not exit")
 
 
 __all__ = ["VSWorkerClient"]

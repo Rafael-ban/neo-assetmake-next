@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -21,16 +22,30 @@ def _clip(fps: Fraction = Fraction(25), frames: int = 11):
     return SimpleNamespace(fps_num=fps.numerator, fps_den=fps.denominator, num_frames=frames)
 
 
-def _rife_function(core, model_path, *, enabled=True, target_fps=60):
+def _rife_function(core, model_path, *, enabled=True, target_fps=60, cache=None):
     tree = ast.parse(PIPELINE.read_text(encoding="utf-8"))
     function = next(
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "interpolate_timeline"
     )
+    plugin = getattr(core, "rife", None)
+    if plugin is not None:
+        plugin.version = (1, 0)
+        plugin.plugin_path = str(Path(model_path) / "flownet.param")
     namespace = {
         "core": core, "vs": SimpleNamespace(RGBS=901), "Path": Path,
         "Fraction": Fraction, "RIFE_ENABLED": enabled,
         "RIFE_TARGET_FPS": target_fps, "RIFE_MODEL_PATH": model_path,
+        "RIFE_DISK_CACHE_BYTES": 8 * 1024**3,
+        "UNTAGGED_HD_MIN_HEIGHT": 720, "hashlib": hashlib,
+        "job": {
+            "project_root": str(Path(model_path)),
+            "source": {"path": str(Path(model_path) / "source.mp4")},
+            "transform": {"rotation": 90},
+        },
+        "cached_rife": cache if cache is not None else (
+            lambda core, rgb, factory, **kwargs: factory()
+        ),
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(PIPELINE), "exec"), namespace)
     return namespace["interpolate_timeline"]
@@ -110,11 +125,19 @@ class RifeTemplateTests(unittest.TestCase):
             return [ast.dump(node) for node in tree.body[start:]
                     if not (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
                             and isinstance(node.value.func, ast.Name)
-                            and node.value.func.id == "interpolate_timeline")]
+                            and node.value.func.id == "interpolate_timeline")
+                    and not (isinstance(node, ast.Expr)
+                             and isinstance(node.value, ast.Call)
+                             and isinstance(node.value.func, ast.Attribute)
+                             and node.value.func.attr == "set_output"
+                             and node.value.args
+                             and isinstance(node.value.args[0], ast.Constant)
+                             and node.value.args[0].value == 2)]
         self.assertEqual(output_stages(default), output_stages(rife))
         source = PIPELINE.read_text(encoding="utf-8")
         self.assertLess(source.index("clip = rotate("), source.index("clip = interpolate_timeline("))
-        self.assertLess(source.index("clip = interpolate_timeline("), source.index("clip.set_output(1)"))
+        self.assertLess(source.index("clip = interpolate_timeline("), source.index("clip.set_output(2)"))
+        self.assertLess(source.index("clip.set_output(2)"), source.index("clip.set_output(1)"))
         self.assertLess(source.index("clip.set_output(1)"), source.index('clip = clip[timeline["start_frame"]'))
 
 
@@ -139,6 +162,34 @@ class RifeTimelineTests(unittest.TestCase):
                     duration_delta = source.num_frames / source_fps - Fraction(result.num_frames, 60)
                     self.assertGreaterEqual(duration_delta, 0)
                     self.assertLess(duration_delta, Fraction(1, 60))
+
+    def test_cache_entry_uses_interpolation_identity_and_keeps_factory_lazy(self):
+        with TemporaryDirectory() as directory:
+            model = Path(directory)
+            for name in ("flownet.bin", "flownet.param"):
+                (model / name).write_bytes(b"test")
+            result = object()
+            cache = Mock(return_value=result)
+            rife = Mock()
+            rgb = object()
+            core = SimpleNamespace(
+                resize=SimpleNamespace(Lanczos=Mock(return_value=rgb)),
+                rife=SimpleNamespace(RIFE=rife),
+            )
+            interpolate = _rife_function(core, model, cache=cache)
+            self.assertIs(interpolate(_clip(), kind="video"), result)
+            rife.assert_not_called()
+            kwargs = cache.call_args.kwargs
+            self.assertEqual(kwargs['num_frames'], 26)
+            self.assertEqual(kwargs['rotation'], 90)
+            self.assertEqual(kwargs['max_bytes'], 8 * 1024**3)
+            self.assertEqual(kwargs['settings']['plugin_version'], [1, 0])
+            self.assertNotIn('script_sha256', kwargs['settings'])
+            self.assertNotIn('gpu_thread', kwargs['settings'])
+            source = PIPELINE.read_text(encoding='utf-8')
+            self.assertIn('VS_CACHE_SIZE_MB = 16000', source)
+            self.assertNotIn('core.num_threads =', source)
+            self.assertNotIn('gpu_thread=', source)
 
     def test_disabled_images_single_frames_and_at_least_60_fps_need_no_gpu_or_models(self):
         core = SimpleNamespace(resize=SimpleNamespace(Lanczos=Mock()))

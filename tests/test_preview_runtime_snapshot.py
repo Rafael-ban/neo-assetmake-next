@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -81,6 +82,21 @@ class PreviewRuntimeSnapshotTests(unittest.TestCase):
         self.assertTrue(self.widget._worker_ready_for_frames)
         self.assertTrue(Path(session_b.job_path).exists())
 
+    def test_explicit_reload_same_snapshot_closes_process_and_preserves_frame(self):
+        old, session = self.load_resolved()
+        frame = np.full((2, 2, 3), 7, dtype=np.uint8)
+        self.widget.current_frame = frame.copy()
+        self.widget.current_frame_index = 12
+        self.widget.reload_rendering()
+        new = self.clients[-1]
+        self.assertEqual(old.closed, 1)
+        self.assertIsNot(new, old)
+        self.assertEqual(len(new.loads), 1)
+        self.assertEqual(new.loads[0].runtime_fingerprint, session.runtime_fingerprint)
+        self.assertNotEqual(new.loads[0].epoch, session.epoch)
+        self.assertEqual(self.widget.current_frame_index, 12)
+        np.testing.assert_array_equal(self.widget.current_frame, frame)
+
     def test_trim_and_restart_keep_same_snapshot_without_reading_or_hashing(self):
         client, session = self.load_resolved()
         self.assertEqual(session.runtime_fingerprint, 'a' * 64)
@@ -135,6 +151,61 @@ class PreviewRuntimeSnapshotTests(unittest.TestCase):
         new, session_b = self.load_resolved()
         self.assertIsNot(old, new)
         self.assertEqual(session_b.runtime_fingerprint, self.b.fingerprint)
+
+
+class MainWindowExplicitResourceActionsTests(unittest.TestCase):
+    def setUp(self):
+        self.events = []
+        self.previews = []
+        for index in range(5):
+            preview = SimpleNamespace(
+                release_worker_resources=mock.Mock(
+                    side_effect=lambda index=index: self.events.append(("release", index))),
+                reload_rendering=mock.Mock(
+                    side_effect=lambda index=index: self.events.append(("reload", index))),
+            )
+            self.previews.append(preview)
+        self.window = SimpleNamespace(
+            _config=object(), _base_dir="project", _export_in_progress=False,
+            video_preview=self.previews[0], intro_preview=self.previews[1],
+            frame_capture_preview=self.previews[2],
+            transition_preview=SimpleNamespace(
+                preview_in=self.previews[3], preview_loop=self.previews[4]),
+            _ensure_render_state_committed=mock.Mock(),
+            _pause_all_videos=mock.Mock(),
+            _configure_preview_render_contexts=mock.Mock(
+                side_effect=lambda: self.events.append(("configure", None))),
+            status_bar=mock.Mock(),
+        )
+
+    def test_reload_retires_all_areas_before_resolving_configuration(self):
+        from gui.main_window import MainWindow
+
+        MainWindow._on_script_reload(self.window)
+        self.assertEqual(self.events, [("release", i) for i in range(5)]
+            + [("configure", None)] + [("reload", i) for i in range(5)])
+
+    def test_cache_clear_releases_all_areas_without_rebuilding(self):
+        from gui.main_window import MainWindow
+
+        with mock.patch(
+            "resources.vapoursynth.python.assetmaker_vs.rife_cache.clear_rife_cache"
+        ) as clear:
+            MainWindow._on_clear_rife_cache(self.window)
+        clear.assert_called_once_with("project")
+        self.window._pause_all_videos.assert_called_once_with()
+        self.assertEqual(self.events, [("release", i) for i in range(5)])
+
+    def test_cache_clear_reports_failure(self):
+        from gui.main_window import MainWindow
+
+        with mock.patch(
+            "resources.vapoursynth.python.assetmaker_vs.rife_cache.clear_rife_cache",
+            side_effect=OSError("cache locked"),
+        ), mock.patch("gui.main_window.show_error") as error:
+            MainWindow._on_clear_rife_cache(self.window)
+        self.assertEqual(error.call_args.args[1], "清除补帧缓存")
+
 
 
 if __name__ == '__main__':

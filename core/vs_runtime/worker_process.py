@@ -1483,9 +1483,12 @@ class SyncVSWorkerProcess:
         return self._wait_for(request_id, timeout_ms)
 
     def load(
-        self, session: RenderSession, *, timeout_ms: int = 30_000
+        self, session: RenderSession, *, timeout_ms: int = 30_000,
+        for_export: bool = False
     ) -> SessionMetadata:
-        request_id = self.transport.send_request(session.to_load_message(1))
+        request_id = self.transport.send_request(
+            session.to_load_message(1, for_export=for_export)
+        )
         response = self._wait_for(request_id, timeout_ms)
         return response["metadata"]
 

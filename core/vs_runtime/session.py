@@ -269,10 +269,14 @@ class RenderSession:
         _sha256(self.job_sha256, "job_sha256")
         _sha256(self.runtime_fingerprint, "runtime_fingerprint")
 
-    def to_load_message(self, request_id: int) -> dict[str, Any]:
+    def to_load_message(
+        self, request_id: int, *, for_export: bool = False
+    ) -> dict[str, Any]:
         if type(request_id) is not int or request_id <= 0:
             raise ValueError("request_id 必须是严格正整数")
-        return {
+        if type(for_export) is not bool:
+            raise TypeError("for_export 必须是 bool")
+        payload = {
             "type": "load",
             "request_id": request_id,
             "api_version": self.selection.api_version,
@@ -285,6 +289,9 @@ class RenderSession:
             "runtime_fingerprint": self.runtime_fingerprint,
             "mode": self.selection.mode,
         }
+        if for_export:
+            payload["for_export"] = True
+        return payload
 
 
 def resolve_worker_command(app_dir: str | Path) -> list[str]:

@@ -314,9 +314,13 @@ def _format_name(format_: Any) -> Any:
     return None if format_ is None else getattr(format_, "name", None)
 
 
-def _check_node_static(vs: Any, clip: Any, job: dict[str, Any]) -> None:
+def _check_node_static(
+    vs: Any, clip: Any, job: dict[str, Any], *, require_encoding_format: bool = True
+) -> None:
     format_ = clip.format
-    if format_ is None or getattr(format_, "id", None) != vs.YUV420P8:
+    if format_ is None or (
+        require_encoding_format and getattr(format_, "id", None) != vs.YUV420P8
+    ):
         raise _error("pixel_format", "YUV420P8", _format_name(format_))
     subsampling_w = 1 << int(getattr(format_, "subsampling_w", 0))
     subsampling_h = 1 << int(getattr(format_, "subsampling_h", 0))
@@ -539,6 +543,100 @@ def _check_editor_clip(clip: Any, job: dict[str, Any]) -> None:
             )
 
 
+@dataclass(frozen=True)
+class ScriptOutputs:
+    """脚本处理结果及其真实颜色；尚未套用设备编码格式。"""
+
+    clip: Any
+    guarded_clip: Any
+    editor_clip: Any | None
+    colour: dict[str, Any]
+
+
+def _source_colour(vs: Any, frame: Any, clip: Any) -> dict[str, Any]:
+    if frame.format is None or frame.format.id != clip.format.id:
+        raise _error("pixel_format", _format_name(clip.format), _format_name(frame.format))
+    if [frame.width, frame.height] != [clip.width, clip.height]:
+        raise _error("display_size", [clip.width, clip.height], [frame.width, frame.height])
+    family = clip.format.color_family
+    props = frame.props
+    values = {}
+    for field, prop in (("matrix", "_Matrix"), ("transfer", "_Transfer"),
+                        ("primaries", "_Primaries")):
+        code = props.get(prop)
+        if field == "matrix" and family == vs.GRAY and code is None:
+            values[field] = "gray"
+            continue
+        if type(code) is not int or code < 0 or code == 2:
+            raise _error(field, "explicit supported source colour code", code)
+        if field == "matrix" and family == vs.RGB and code != 0:
+            raise _error(field, "RGB matrix 0", code)
+        if field == "matrix" and family == vs.YUV and code == 0:
+            raise _error(field, "YUV matrix != 0", code)
+        values[field] = _CODE_LABELS.get(code, str(code))
+    values["range"] = _range_value(vs, props)
+    if family == vs.RGB and values["range"] != "full":
+        raise _error("range", "full for RGB", values["range"])
+    return values
+
+
+def validate_script_outputs(
+    vs: Any, job: dict[str, Any], header: dict[str, Any]
+) -> ScriptOutputs:
+    """验证脚本尺寸/时间轴和实际源颜色，保留格式、位深和像素。"""
+    clip = _get_output_tuple(vs, 0).clip
+    if clip.format is None or clip.format.color_family not in (vs.RGB, vs.YUV, vs.GRAY):
+        raise _error("pixel_format", "fixed RGB/YUV/GRAY format", _format_name(clip.format))
+    # 复用时间轴规则，但脚本提供 display 画面，编码补边由导出负责。
+    output = dict(job["output"])
+    output["coded_width"] = output["display_width"]
+    output["coded_height"] = output["display_height"]
+    geometry_job = dict(job, output=output)
+    _check_node_static(vs, clip, geometry_job, require_encoding_format=False)
+    baseline = None
+    for index in sorted({0, clip.num_frames // 2, clip.num_frames - 1}):
+        frame = clip.get_frame(index)
+        try:
+            colour = _source_colour(vs, frame, clip)
+        finally:
+            frame.close()
+        if baseline is None:
+            baseline = colour
+        elif colour != baseline:
+            raise _error("frame_props", baseline, colour)
+    editor_clip = None
+    if header["editor_output"] == 1:
+        editor_clip = _get_output_tuple(vs, 1).clip
+        _check_editor_clip(editor_clip, job)
+
+    def selector(n: int, f: Any) -> Any:
+        del n
+        colour = _source_colour(vs, f, clip)
+        if colour != baseline:
+            raise _error("frame_props", baseline, colour)
+        return f
+
+    guarded = vs.core.std.ModifyFrame(clip=clip, clips=clip, selector=selector)
+    return ScriptOutputs(clip, guarded, editor_clip, baseline)
+
+
+def validate_encoding_outputs(
+    vs: Any, job: dict[str, Any], header: dict[str, Any]
+) -> ValidatedOutputs:
+    """导出预检与 VSPipe 共用的处理结果到编码帧适配。"""
+    from .encoding import prepare_encoding_clip
+
+    source = validate_script_outputs(vs, job, header)
+    clip = prepare_encoding_clip(vs, source.guarded_clip, job)
+    _check_node_static(vs, clip, job)
+    matrix, transfer, primaries, range_name = _sentinel_signature(vs, clip, job)
+    vui = X264Vui(
+        X264_MATRIX[matrix], X264_PRIMARIES[primaries],
+        X264_TRANSFER[transfer], {"limited": "tv", "full": "pc"}[range_name],
+    )
+    return ValidatedOutputs(clip, guard_output0(vs, clip, job), source.editor_clip, vui)
+
+
 def validate_outputs(
     vs: Any, job: dict[str, Any], header: dict[str, Any]
 ) -> ValidatedOutputs:
@@ -573,7 +671,10 @@ __all__ = [
     "PRIMARIES_CODES",
     "RequirementError",
     "TRANSFER_CODES",
+    "ScriptOutputs",
     "ValidatedOutputs",
+    "validate_script_outputs",
+    "validate_encoding_outputs",
     "X264Vui",
     "decode_output_contract_error",
     "guard_output0",

@@ -136,7 +136,7 @@ def preflight_encode_request(
     )
     try:
         worker.start(timeout_ms=15_000)
-        metadata = worker.load(session, timeout_ms=30_000)
+        metadata = worker.load(session, timeout_ms=30_000, for_export=True)
     finally:
         worker.close()
     request = VSPipeRenderRequest(

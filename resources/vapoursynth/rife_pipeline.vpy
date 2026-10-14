@@ -7,12 +7,13 @@
 """AssetMaker 可选 RIFE compatible pipeline。
 
 output 1 是旋转后、trim/crop 前的完整编辑画布；output 0 严格按 RenderJob
-生成设备编码帧。低帧率视频默认插帧到 60 fps；图片、单帧和高帧率视频跳过。
+生成处理帧；编码格式由导出模块决定。低帧率视频默认插帧到 60 fps；图片、单帧和高帧率视频跳过。
 选择此脚本前须将独立 RIFE DLC 解压到应用目录。
 脚本有意保持自包含和可读，便于用户复制到项目或外部目录后定制。
 """
 
 import os
+import hashlib
 from pathlib import Path
 from fractions import Fraction
 
@@ -20,18 +21,19 @@ import vapoursynth as vs
 
 from assetmaker_vs import job_api
 from assetmaker_vs.job_api import load_job
+from assetmaker_vs.rife_cache import cached_rife
 
 
 core = vs.core
 
 # 可复制的默认处理参数。修改这些值或下方 process_source() 即可定制画质；
 # RenderJob 只描述编辑状态和设备输出，不承载滤镜参数。
-VS_CACHE_SIZE_MB = 16000
+VS_CACHE_SIZE_MB = 16000  # 保留用户指定阈值；空闲/重载时通过退出 worker 回收资源
+RIFE_DISK_CACHE_BYTES = 8 * 1024**3  # 项目补帧缓存总额上限 8 GiB
 VIDEO_SOURCE_CACHE = 1  # LWLibavSource 的 .lwi 索引缓存
 UNTAGGED_HD_MIN_HEIGHT = 720  # 未标记 YUV 源按原始高度推断矩阵
 FINAL_RESIZER = core.resize.Lanczos
 FINAL_RESIZE_OPTIONS = {}  # 尺寸缩放保留源格式和位深
-OUTPUT_CONVERSION_OPTIONS = {"dither_type": "error_diffusion"}
 # 插帧会改变编辑时间轴的帧编号；请在开始编辑新素材前决定是否开启。
 # 旧项目仅保存 trim 帧编号，修改此开关后须重新检查入出点。
 RIFE_ENABLED = True
@@ -44,8 +46,6 @@ RIFE_MODEL_PATH = (
     if os.environ.get("ASSETMAKER_VS_APP_DIR")
     else Path(job_api.__file__).resolve().parents[4]
 ) / "tools" / "vs-rife" / "rife" / "models" / "rife-v4.6_ensembleFalse"
-# RenderJob 使用设备合同的名称；zimg 对 BT.601 transfer 使用 "601"。
-RESIZE_TRANSFER_NAMES = {"709": "709", "170m": "601"}
 
 core.max_cache_size = VS_CACHE_SIZE_MB
 job = load_job(assetmaker_job, for_export=False)
@@ -186,24 +186,41 @@ def interpolate_timeline(clip, *, kind):
     rgb = core.resize.Lanczos(
         clip, format=vs.RGBS, range_s="full", dither_type="none"
     )
-    try:
-        interpolated = rife(
-            rgb,
-            fps_num=RIFE_TARGET_FPS,
-            fps_den=1,
-            model_path=str(model_path),
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "RIFE 插帧失败；请确认 Vulkan GPU/驱动及模型可用: " + str(exc)
-        ) from exc
-    actual_fps = Fraction(interpolated.fps_num, interpolated.fps_den)
-    if (
-        actual_fps != RIFE_TARGET_FPS
-        or interpolated.num_frames != int(source_count * RIFE_TARGET_FPS / source_fps)
-    ):
-        raise RuntimeError("RIFE 输出帧率/帧数不符合目标帧率插帧契约")
-    return interpolated
+    expected_count = int(source_count * RIFE_TARGET_FPS / source_fps)
+
+    def compute():
+        try:
+            interpolated = rife(
+                rgb, fps_num=RIFE_TARGET_FPS, fps_den=1,
+                model_path=str(model_path),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "RIFE 插帧失败；请确认 Vulkan GPU/驱动及模型可用: " + str(exc)
+            ) from exc
+        if (Fraction(interpolated.fps_num, interpolated.fps_den) != RIFE_TARGET_FPS
+                or interpolated.num_frames != expected_count):
+            raise RuntimeError("RIFE 输出帧率/帧数不符合目标帧率插帧契约")
+        return interpolated
+
+    # 磁盘命中时不创建 RIFE 实例；预览/导出跨进程复用同一组完整帧。
+    return cached_rife(
+        core, rgb, compute, project_root=job["project_root"],
+        source_path=job["source"]["path"], rotation=job["transform"]["rotation"],
+        target_fps=RIFE_TARGET_FPS, model_path=model_path,
+        settings={
+            # 仅包含补帧上游策略；trim/crop/输出尺寸变更复用同一组帧。
+            "input_colour_policy": 1,
+            "untagged_hd_min_height": UNTAGGED_HD_MIN_HEIGHT,
+            "rgb_resize": ["Lanczos", "RGBS", "full", "none"],
+            "plugin_version": list(core.rife.version),
+            "plugin_sha256": hashlib.sha256(
+                Path(core.rife.plugin_path).read_bytes()
+            ).hexdigest(),
+        },
+        max_bytes=RIFE_DISK_CACHE_BYTES, num_frames=expected_count,
+    )
+
 
 
 source = job["source"]
@@ -234,6 +251,8 @@ clip = fill_missing_source_colour(
 )
 clip = rotate(clip, transform["rotation"])
 clip = interpolate_timeline(clip, kind=source["kind"])
+# output 2 暴露补帧缓存节点；output 1 与 output 0 共享此节点，不另建推理图。
+clip.set_output(2)
 
 if source["kind"] == "image":
     virtual_count = source["virtual_frame_count"]
@@ -262,35 +281,5 @@ clip = FINAL_RESIZER(
     **FINAL_RESIZE_OPTIONS,
 )
 
-# 只在设备输出边界转换格式和颜色；此步骤不再改变画面尺寸。
-clip = core.resize.Lanczos(
-    clip,
-    format=vs.YUV420P8,
-    matrix_s=output["matrix"],
-    transfer_s=RESIZE_TRANSFER_NAMES[output["transfer"]],
-    primaries_s=output["primaries"],
-    range_s=output["range"],
-    **OUTPUT_CONVERSION_OPTIONS,
-)
-
-right_border = output["coded_width"] - output["display_width"]
-bottom_border = output["coded_height"] - output["display_height"]
-if right_border or bottom_border:
-    clip = core.std.AddBorders(
-        clip,
-        right=right_border,
-        bottom=bottom_border,
-    )
-if output["final_rotate_180"]:
-    clip = core.std.Turn180(clip)
-
-colour_codes = {"709": 1, "170m": 6}
-range_codes = {"limited": 0, "full": 1}
-clip = core.std.SetFrameProps(
-    clip,
-    _Matrix=colour_codes[output["matrix"]],
-    _Transfer=colour_codes[output["transfer"]],
-    _Primaries=colour_codes[output["primaries"]],
-    _Range=range_codes[output["range"]],
-)
+# 输出处理结果，保留颜色属性和精度；设备格式由导出适配层转换。
 clip.set_output(0)

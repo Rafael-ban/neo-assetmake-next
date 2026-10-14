@@ -452,6 +452,15 @@ class MainWindow(QMainWindow):
 
         operations_menu.addAction(
             Action(
+                FluentIcon.DELETE,
+                "清除补帧缓存",
+                triggered=self._on_clear_rife_cache,
+            )
+        )
+        operations_menu.addSeparator()
+
+        operations_menu.addAction(
+            Action(
                 FluentIcon.HELP,
                 "快捷键帮助",
                 shortcut="F1",
@@ -1509,6 +1518,15 @@ class MainWindow(QMainWindow):
             )
             dialog.cancel_requested.connect(service.cancel)
 
+            # Frozen jobs and auxiliary captures are ready; free preview GPU graphs
+            # before the export process builds its own interpolation graph.
+            for preview in (
+                self.video_preview, self.intro_preview, self.frame_capture_preview,
+                self.transition_preview.preview_in, self.transition_preview.preview_loop,
+            ):
+                release = getattr(preview, "release_worker_resources", None)
+                if release is not None:
+                    release()
             service.export_all(
                 output_dir=dir_path,
                 epconfig=self._config,
@@ -3363,8 +3381,49 @@ class MainWindow(QMainWindow):
         self._apply_project_config()
 
     def _on_script_reload(self) -> None:
-        if self._config is not None:
-            self._apply_project_config()
+        if self._config is None:
+            return
+        if self._export_in_progress:
+            self.status_bar.showMessage("请在导出结束后重载预览")
+            return
+        self._ensure_render_state_committed()
+        previews = (
+            self.video_preview, self.intro_preview, self.frame_capture_preview,
+            self.transition_preview.preview_in, self.transition_preview.preview_loop,
+        )
+        try:
+            # Resolve runtime/script only after all old graphs have exited,
+            # even when their fingerprints have not changed.
+            for preview in previews:
+                preview.release_worker_resources()
+            self._configure_preview_render_contexts()
+            for preview in previews:
+                preview.reload_rendering()
+        except Exception as exc:
+            show_error(exc, "重载预览", self)
+
+    def _on_clear_rife_cache(self) -> None:
+        if not self._base_dir:
+            return
+        if self._export_in_progress:
+            self.status_bar.showMessage("请在导出结束后清除补帧缓存")
+            return
+        try:
+            from resources.vapoursynth.python.assetmaker_vs.rife_cache import (
+                clear_rife_cache,
+            )
+
+            self._ensure_render_state_committed()
+            self._pause_all_videos()
+            for preview in (
+                self.video_preview, self.intro_preview, self.frame_capture_preview,
+                self.transition_preview.preview_in, self.transition_preview.preview_loop,
+            ):
+                preview.release_worker_resources()
+            clear_rife_cache(self._base_dir)
+            self.status_bar.showMessage("已清除项目补帧缓存")
+        except Exception as exc:
+            show_error(exc, "清除补帧缓存", self)
 
     def _on_script_open_directory(self) -> None:
         if self._active_script_path:
