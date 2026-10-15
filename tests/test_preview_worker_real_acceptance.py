@@ -287,23 +287,16 @@ class RealPreviewWorkerAcceptanceTests(unittest.TestCase):
 
         # 在 frame request 已送入真实 worker 后立即 clear；取消 epoch 后任何迟到帧
         # 都不得重建 GUI 状态。
+        transport = client.transport
         widget._request_current_frame(coalesce=False)
-        widget.clear()
+        widget.clear(sync_shutdown=True)
         self._pump_for(0.35)
         self.assertIsNone(widget.current_frame)
         self.assertEqual(widget.total_frames, 0)
         self.assertEqual(widget.video_label.text(), "No media loaded")
 
-        stopped = []
-        crashes = []
-        client.worker_stopped.connect(lambda: stopped.append(True))
-        client.worker_crashed.connect(crashes.append)
-        client.shutdown()
-        self.assertTrue(
-            self._wait_until(lambda: stopped), "worker 未以正常 shutdown 路径退出"
-        )
-        self.assertEqual(crashes, [])
-        self.assertFalse(client.transport.alive)
+        self.assertFalse(transport.alive)
+        self.assertFalse(transport.settling)
         self.assertNotIn("vapoursynth", sys.modules)
         self.assertNotIn("core.vs_engine", sys.modules)
 

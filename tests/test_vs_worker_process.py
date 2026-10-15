@@ -1444,7 +1444,8 @@ class WorkerProcessTransportTests(unittest.TestCase):
             command=[str(Path(sys.executable).resolve()), "-B", "-c", "pass"]
         )
         child = mock.Mock()
-        child.poll.return_value = None
+        child.poll.side_effect = lambda: 0 if child.wait.called else None
+        child.wait.return_value = 0
         child.stdin = io.BytesIO()
         child.stdout = io.BytesIO()
         child.stderr = io.BytesIO()
@@ -3268,7 +3269,25 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.response["type"], "request_error")
-        self.assertEqual(raised.exception.code, "contract.matrix")
+        self.assertEqual(raised.exception.code, "contract.frame_props")
+        self.assertEqual(
+            raised.exception.response["expected"],
+            {
+                "matrix": "170m",
+                "transfer": "170m",
+                "primaries": "170m",
+                "range": "limited",
+            },
+        )
+        self.assertEqual(
+            raised.exception.response["actual"],
+            {
+                "matrix": "709",
+                "transfer": "170m",
+                "primaries": "170m",
+                "range": "limited",
+            },
+        )
         self.assertTrue(self.client.transport.alive)
 
     def test_identity_mismatch_is_rejected_before_user_code(self):

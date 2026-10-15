@@ -22,7 +22,10 @@ def _run_probe():
         _QtExportHost,
         _ValidValidator,
     )
-    from tests.test_preview_worker_integration import PreviewWorkerContractTests
+    from tests.test_preview_worker_integration import (
+        FakeWorkerClient,
+        PreviewWorkerContractTests,
+    )
 
     case = unittest.TestCase()
     case.assertIs(sys.excepthook, sys.__excepthook__)
@@ -62,26 +65,47 @@ def _run_probe():
     try:
         fixture.setUp()
         client = fixture.client
-        request_frame = client.request_frame
+        def deliver_frames(worker):
+            request_frame = worker.request_frame
 
-        def request_and_deliver_frame(**kwargs):
-            request_id = request_frame(**kwargs)
-            # 播放保持一个显示请求在途；模拟 worker 异步完成后才可继续取帧。
-            QTimer.singleShot(1, lambda: client.frame_ready.emit(
-                request_id,
-                kwargs["epoch"],
-                kwargs["surface"],
-                kwargs["index"],
-                np.full((8, 8, 3), kwargs["index"] % 256, dtype=np.uint8),
-            ))
-            return request_id
+            def request_and_deliver_frame(**kwargs):
+                request_id = request_frame(**kwargs)
+                QTimer.singleShot(1, lambda: worker.frame_ready.emit(
+                    request_id,
+                    kwargs["epoch"],
+                    kwargs["surface"],
+                    kwargs["index"],
+                    np.full((8, 8, 3), kwargs["index"] % 256, dtype=np.uint8),
+                ))
+                return request_id
 
-        client.request_frame = request_and_deliver_frame
+            worker.request_frame = request_and_deliver_frame
+
+        deliver_frames(client)
         fixture._load_compatible()
         fixture.widget.flush_render_job()
         fixture._resolve_current()
         preview, client = fixture.widget, fixture.client
         window.video_preview = preview
+        resumed_clients = []
+
+        def make_resumed_client(parent):
+            worker = FakeWorkerClient(parent)
+            deliver_frames(worker)
+            resumed_clients.append(worker)
+
+            def complete_load():
+                case.assertEqual(len(worker.loads), 1)
+                worker.emit_metadata(
+                    preview._load_request_id,
+                    fixture._metadata(worker.loads[-1].epoch),
+                )
+
+            worker.ready.connect(lambda: QTimer.singleShot(0, complete_load))
+            QTimer.singleShot(0, worker.ready.emit)
+            return worker
+
+        preview._worker_client_factory = make_resumed_client
         preview.play()
         baseline = len(client.requests)
         wait_for_requests(client, baseline + 3)
@@ -146,13 +170,16 @@ def _run_probe():
         case.assertEqual(observations["paused_requests"], 0)
         case.assertIs(preview.current_render_session(), frozen_session[-1])
         case.assertTrue(preview.is_playing)
-        resumed = len(client.requests)
-        wait_for_requests(client, resumed + 2)
-        observations["resumed_requests"] = len(client.requests) - resumed
+        case.assertEqual(client.closed, 1)
+        case.assertEqual(len(resumed_clients), 1)
+        resumed_client = resumed_clients[0]
+        wait_for_requests(resumed_client, 2)
+        observations["resumed_requests"] = len(resumed_client.requests)
         case.assertGreater(preview._play_displayed_frames, 0)
         preview.close()
-        observations["worker_close_calls"] = client.closed
-        case.assertEqual(client.closed, 1)
+        observations["worker_close_calls"] = resumed_client.closed
+
+        case.assertEqual(resumed_client.closed, 1)
         case.assertFalse(preview.timer.isActive())
         case.assertIs(sys.excepthook, sys.__excepthook__)
     finally:

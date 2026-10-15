@@ -270,7 +270,8 @@ class ExportSessionTests(unittest.TestCase):
             )
             seen = {}
 
-            def load(frozen_session):
+            def load(frozen_session, *, for_export):
+                self.assertTrue(for_export)
                 seen["worker_path"] = frozen_session.job_path
                 seen["worker_payload"] = Path(frozen_session.job_path).read_bytes()
                 # 模拟 UI/文件系统在 snapshot 后改写原 job；本次导出不得受影响。
@@ -333,7 +334,8 @@ class ExportSessionTests(unittest.TestCase):
                 editor=None,
             )
 
-            def replace_job_after_preflight(_session):
+            def replace_job_after_preflight(_session, *, for_export):
+                self.assertTrue(for_export)
                 export_job.write_text('{"replaced": true}', encoding="utf-8")
                 return metadata
 

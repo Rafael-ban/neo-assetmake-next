@@ -72,19 +72,22 @@ class PreviewCacheTests(unittest.TestCase):
         self.assertEqual(legacy.read_text(encoding="utf-8"), "abandoned job")
         self.assertEqual(sentinel.read_bytes(), b"keep")
 
-    def test_cancel_keeps_script_cache_until_unload_then_removes_session_directory(self):
+    def test_clear_closes_worker_before_removing_script_cache(self):
         session = self._load_resolved()
         cache = Path(session.job_path).parent
         script_cache = cache / "decoder" / "index.cache"
         script_cache.parent.mkdir()
         script_cache.write_bytes(b"worker still needs this")
+        close_worker = self.client.close
 
+        def close_after_cache_check():
+            self.assertTrue(script_cache.exists())
+            self.assertTrue(Path(session.job_path).exists())
+            close_worker()
+
+        self.client.close = close_after_cache_check
         self.widget.clear()
-        self.assertTrue(script_cache.exists())
-        self.assertTrue(Path(session.job_path).exists())
-
-        self.client.operation_completed.emit(self.client.unload_request_ids[-1], "unload")
-        QCoreApplication.processEvents()
+        self.assertEqual(self.client.closed, 1)
         self.assertFalse(cache.exists())
 
     def test_retired_job_does_not_remove_current_sessions_script_cache(self):

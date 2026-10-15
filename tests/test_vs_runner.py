@@ -1093,7 +1093,7 @@ class TrustedRunnerTests(unittest.TestCase):
         self.assertIn("job", result.stderr.lower())
         self.assertFalse(sentinel.exists())
 
-    def test_bad_output_contract_makes_real_vspipe_fail(self):
+    def test_wrong_output_geometry_makes_real_vspipe_fail(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             project = Path(temp_dir).resolve() / "素材" / "黍"
             project.mkdir(parents=True)
@@ -1105,7 +1105,14 @@ class TrustedRunnerTests(unittest.TestCase):
             result = _run_vspipe(script=script, job=job, mode="compatible")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("contract.pixel_format", result.stderr)
+        # RGB output is valid before the export adapter; this fixture instead
+        # violates the current display geometry (the old 24 px padding is gone).
+        error, _ = json.JSONDecoder().raw_decode(
+            result.stderr.split("ASSETMAKER_VS_ERROR:", 1)[1]
+        )
+        self.assertEqual(error["code"], "contract.coded_size")
+        self.assertEqual(error["expected"], [360, 640])
+        self.assertEqual(error["actual"], [384, 640])
 
     def test_convertible_noninteger_props_fail_through_fixed_runner(self):
         cases = (
@@ -1152,7 +1159,16 @@ class TrustedRunnerTests(unittest.TestCase):
         stderr = result.stderr.decode("utf-8", errors="replace")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ASSETMAKER_VS_ERROR", stderr)
-        self.assertIn('"field":"matrix"', stderr)
+        error, _ = json.JSONDecoder().raw_decode(
+            stderr.split("ASSETMAKER_VS_ERROR:", 1)[1]
+        )
+        self.assertEqual(error["code"], "contract.frame_props")
+        self.assertEqual(error["expected"]["matrix"], "170m")
+        self.assertEqual(error["actual"]["matrix"], "709")
+        self.assertEqual(
+            error["expected"], dict(error["actual"], matrix="170m")
+        )
+        self.assertIn("Failed to retrieve frame 1", stderr)
 
 
 class RunnerBindingPolicyTests(unittest.TestCase):

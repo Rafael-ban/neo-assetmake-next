@@ -387,6 +387,8 @@ class MediaPackagingTests(unittest.TestCase):
                         "runtime_layout.py",
                         "core_resources.py",
                         "native_plugins.py",
+                        "encoding.py",
+                        "rife_cache.py",
                     )
                 ],
             ],

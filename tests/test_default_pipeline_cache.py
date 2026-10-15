@@ -31,11 +31,11 @@ DEFAULT_PIPELINE = ROOT / "resources" / "vapoursynth" / "default_pipeline.vpy"
 RUNNER = ROOT / "resources" / "vapoursynth" / "assetmaker_runner.vpy"
 TOOLCHAIN = MediaToolchain.discover(str(ROOT))
 REAL_VS_READY = not TOOLCHAIN.missing_for_export()
-MARKER = "DEFAULT_PIPELINE_CACHE_SIZE_16000"
+MARKER = "DEFAULT_PIPELINE_CACHE_SIZE_4096"
 
 
 class DefaultPipelineCacheTests(unittest.TestCase):
-    def test_default_pipeline_sets_explicit_16000_mb_cache_before_job_load(self):
+    def test_default_pipeline_sets_explicit_4096_mb_cache_before_job_load(self):
         """执行脚本到 job 加载边界，观测缓存阈值已覆写。"""
         source = DEFAULT_PIPELINE.read_text(encoding="utf-8")
         fake_vs = types.ModuleType("vapoursynth")
@@ -49,7 +49,7 @@ class DefaultPipelineCacheTests(unittest.TestCase):
             pass
 
         def observe_cache(*args, **kwargs):
-            self.assertEqual(fake_vs.core.max_cache_size, 16000)
+            self.assertEqual(fake_vs.core.max_cache_size, 4096)
             raise JobBoundaryReached
 
         job_api.load_job = observe_cache
@@ -64,7 +64,7 @@ class DefaultPipelineCacheTests(unittest.TestCase):
             })
 
     @unittest.skipUnless(REAL_VS_READY, "bundled VSPipe/x264/muxer unavailable")
-    def test_worker_and_vspipe_keep_default_script_cache_at_16000(self):
+    def test_worker_and_vspipe_keep_default_script_cache_at_4096(self):
         """worker 与 runner 的预设 runtime 值都必须被默认脚本覆写。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -101,11 +101,11 @@ class DefaultPipelineCacheTests(unittest.TestCase):
             self.assertNotEqual(instrumented, source)
             script_path.write_text(
                 instrumented
-                + "\nassert core.max_cache_size == 16000, core.max_cache_size\n"
+                + "\nassert core.max_cache_size == 4096, core.max_cache_size\n"
                 + f"print({MARKER!r})\n"
                 + "_cache_probe_clip = vs.get_output(0).clip\n"
                 + "def _cache_probe_frame(n):\n"
-                + "    assert core.max_cache_size == 16000, core.max_cache_size\n"
+                + "    assert core.max_cache_size == 4096, core.max_cache_size\n"
                 + "    return _cache_probe_clip\n"
                 + "core.std.FrameEval(\n"
                 + "    _cache_probe_clip, eval=_cache_probe_frame\n"
@@ -145,7 +145,7 @@ class DefaultPipelineCacheTests(unittest.TestCase):
                     self.assertIn(MARKER, str(events))
                 except WorkerRequestError as exc:
                     self.fail(
-                        "默认脚本未将 worker cache 覆写为 16000: "
+                        "默认脚本未将 worker cache 覆写为 4096: "
                         f"{exc.response}"
                     )
                 finally:

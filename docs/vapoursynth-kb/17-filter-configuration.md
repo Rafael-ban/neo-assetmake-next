@@ -27,7 +27,7 @@ output 1 与 output 0 共享它。脚本保留处理中的位深与颜色，最�
 | `resources/vapoursynth/default_pipeline.vpy` | `VS_CACHE_SIZE_MB = 4096`，内置默认脚本执行时生效 |
 | `resources/vapoursynth/rife_pipeline.vpy` | `VS_CACHE_SIZE_MB = 16000`，选用 RIFE 脚本时生效 |
 | `config/vs_runtime.json`、`config/vs_runtime.py` | `max_cache_size_mb` 默认仍为 `0`，含义是恢复 VS 原生值；随后可被脚本覆盖 |
-| `tests/test_default_pipeline_cache.py` | 验证默认脚本覆盖运行时初值；当前测试仍断言 16000 MB，与脚本的 4096 MB 不一致，运行该测试会失败，需在测试修复时同步 |
+| `tests/test_default_pipeline_cache.py` | 验证默认脚本将运行时初值覆写为 4096 MB，并检查 preview worker 与 VSPipe 的实际执行结果 |
 | `tests/test_default_pipeline_rife.py` | 检查 RIFE 插帧和输出顺序、模型定位及缺文件诊断 |
 | `tests/test_rife_auto_discovery.py` | 检查独立 DLC 的自动加载、旧路径处理和运行时身份 |
 
