@@ -111,6 +111,41 @@ class RifeDiskCacheTests(unittest.TestCase):
             self.assertTrue(legacy.exists())
             self.assertFalse(raw.exists())
 
+    def test_zero_budget_preserves_existing_frames_even_on_explicit_prune(self):
+        with tempfile.TemporaryDirectory() as temp:
+            writer = cache_module.DiskFrameCache(temp, {}, 2, 2)
+            writer.write(0, Frame())
+            raw = writer.directory / '000000000.rgb'
+            legacy = writer.directory / '000000001.rgb.gz'
+            self._legacy_frame(legacy, Frame())
+
+            disabled = cache_module.DiskFrameCache(temp, {}, 2, 2, max_bytes=0)
+            self.assertTrue(raw.is_file())
+            self.assertTrue(legacy.is_file())
+            self.assertEqual(disabled.read(0)[0], Frame().props)
+            self.assertEqual(disabled.read(1)[0], Frame().props)
+            disabled.prune()
+            disabled.write(2, Frame())
+            self.assertTrue(raw.is_file())
+            self.assertTrue(legacy.is_file())
+            self.assertFalse((disabled.directory / '000000002.rgb').exists())
+
+    def test_malformed_props_are_cache_misses(self):
+        malformed = (
+            {'bad': {'array': False, 'values': []}},
+            [],
+            {'bad': {'array': False, 'values': [{'bytes': 'a'}]}},
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            disk = cache_module.DiskFrameCache(temp, {}, 2, 2)
+            raw = disk.directory / '000000000.rgb'
+            for props in malformed:
+                with self.subTest(props=props):
+                    encoded = json.dumps(props).encode()
+                    raw.write_bytes(struct.pack('<I', len(encoded))
+                                    + encoded + bytes(2 * 2 * 4 * 3))
+                    self.assertIsNone(disk.read(0))
+
     def test_corrupt_raw_falls_back_to_legacy_and_repairs_raw(self):
         with tempfile.TemporaryDirectory() as temp:
             disk = cache_module.DiskFrameCache(temp, {}, 2, 2)

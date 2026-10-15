@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import ctypes
 from fractions import Fraction
 import gzip
@@ -145,7 +146,9 @@ class DiskFrameCache:
             except OSError:
                 pass
             return props, data
-        except (OSError, EOFError, ValueError, KeyError, TypeError, struct.error, zlib.error):
+        except (OSError, EOFError, ValueError, KeyError, TypeError,
+                IndexError, AttributeError, binascii.Error, struct.error,
+                zlib.error):
             return None
 
     def _migrate(self, legacy, path, record):
@@ -237,6 +240,8 @@ class DiskFrameCache:
         return frame
 
     def prune(self):
+        if not self.max_bytes:
+            return
         with self._lock:
             files = []
             total = 0
