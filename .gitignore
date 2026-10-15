@@ -1,0 +1,60 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution
+*.egg-info/
+dist/
+build/
+ArknightsPassMaker/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.claude
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large executables
+ffmpeg.exe
+*.exe
+
+# Test data
+test/
+
+# User settings
+config/user_settings.json
+CLAUDE.md
+
+# Temporary update directory
+temp_update/
+ffmpeg
+ffplay
+ffprobe
+
+tmp/
+
+# Rust build artifacts (Cargo)
+simulator/target/
+cache/a2.6.0/boot_ubi.img
+cache/a2.6.0/rootfs_ubi.img
+bootenv.txt
+tools/innosetup/
+
+AGENTS.md
