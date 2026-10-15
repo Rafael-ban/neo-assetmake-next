@@ -13,10 +13,11 @@ from typing import Optional, Tuple, List, Dict, Callable, TypeVar, Generic
 from dataclasses import dataclass
 from urllib.request import urlopen, Request
 
-from PyQt6.QtCore import QThread, pyqtSignal, QObject
+from PyQt6.QtCore import QCoreApplication, QThread, pyqtSignal, QObject
 
+from config.update_preferences import UpdateChannel, load_update_channel
 from config.constants import (
-    GITHUB_OWNER, GITHUB_REPO,
+    APP_VERSION, APP_VERSION_LABEL, GITHUB_OWNER, GITHUB_REPO,
     SourceType, UpdateSource, UPDATE_API_SOURCES, DOWNLOAD_SOURCES
 )
 from core.file_utils import is_https_url, sha256_file
@@ -44,6 +45,7 @@ class ReleaseInfo:
     checksum_url: str      # Release checksum asset URL
     expected_sha256: str   # Expected SHA-256 for installer
     html_url: str          # Web URL to release page
+    prerelease: bool = False
 
 
 @dataclass
@@ -73,11 +75,16 @@ class VersionComparer:
         Returns:
             Tuple of integers, e.g., (1, 0, 4)
         """
-        # Remove 'v' prefix if present
-        version_str = version_str.lstrip('vV')
-        # Extract only numeric parts
-        parts = re.findall(r'\d+', version_str)
-        return tuple(int(p) for p in parts)
+        match = re.fullmatch(
+            r"[vV]?(\d+)\.(\d+)\.(\d+)(?:-(alpha|beta|rc|dev|preview)[.-]?(\d*))?",
+            version_str, re.IGNORECASE,
+        )
+        if not match:
+            raise ValueError(f"无效的应用版本: {version_str}")
+        major, minor, patch, stage, number = match.groups()
+        rank = {"dev": 0, "preview": 1, "alpha": 2, "beta": 3, "rc": 4}
+        return (int(major), int(minor), int(patch),
+                rank.get((stage or "").lower(), 5), int(number or 0))
 
     @staticmethod
     def is_newer(remote_version: str, local_version: str) -> bool:
@@ -292,9 +299,11 @@ class UpdateCheckWorker(QThread):
         self,
         current_version: str,
         sources: Optional[List[UpdateSource]] = None,
-        parent=None
+        parent=None,
+        channel: UpdateChannel = UpdateChannel.STABLE,
     ):
         super().__init__(parent)
+        self._channel = UpdateChannel(channel)
         self._current_version = current_version
         self._sources = sources or [
             source for source in UPDATE_API_SOURCES
@@ -318,7 +327,7 @@ class UpdateCheckWorker(QThread):
             release_info = result.data
 
             # 检查是否是更新版本
-            if not VersionComparer.is_newer(release_info.version, self._current_version):
+            if release_info is None or not self._is_update(release_info):
                 self.check_completed.emit(None)  # 已是最新版本
                 return
 
@@ -330,22 +339,73 @@ class UpdateCheckWorker(QThread):
         finally:
             self._request_manager.shutdown()
 
-    def _fetch_from_source(self, source: UpdateSource) -> ReleaseInfo:
-        """从指定源获取版本信息"""
-        url = source.url_template.format(owner=GITHUB_OWNER, repo=GITHUB_REPO)
+    def _is_update(self, release: ReleaseInfo) -> bool:
+        remote = VersionComparer.parse_version(release.version)
+        local = VersionComparer.parse_version(self._current_version)
+        if remote[:3] != local[:3]:
+            return remote[:3] > local[:3]
+        local_preview = (
+            self._current_version.lstrip("vV") == APP_VERSION
+            and "开发预览版" in APP_VERSION_LABEL
+        ) or local[3] < 5
+        if not release.prerelease and local_preview:
+            return True
+        if release.prerelease and local[3] == 5:
+            return False
+        return remote > local
 
-        request = Request(url)
-        request.add_header('User-Agent', USER_AGENT)
-        request.add_header('Accept', 'application/vnd.github.v3+json')
+    @staticmethod
+    def _installer_name(tag: str) -> str:
+        return f"ArknightsPassMaker_{tag}_Setup.exe"
 
-        with urlopen(request, timeout=source.timeout) as response:
-            data = json.loads(response.read().decode('utf-8'))
+    @staticmethod
+    def _is_checksum_asset(name: str, download_name: str) -> bool:
+        return name.lower() in {
+            "sha256sums", "sha256sums.txt", "checksums.txt",
+            f"{download_name.lower()}.sha256",
+        }
 
-        release_info = self._parse_release_data(data)
+    def _fetch_from_source(self, source: UpdateSource) -> Optional[ReleaseInfo]:
+        """遍历发布列表；选定候选后再校验，校验失败不能伪装成无更新。"""
+        base_url = source.url_template.format(owner=GITHUB_OWNER, repo=GITHUB_REPO)
+        candidates = []
+        page = 1
+        while True:
+            separator = '&' if '?' in base_url else '?'
+            request = Request(f"{base_url}{separator}per_page=100&page={page}")
+            request.add_header('User-Agent', USER_AGENT)
+            request.add_header('Accept', 'application/vnd.github.v3+json')
+            with urlopen(request, timeout=source.timeout) as response:
+                data = json.loads(response.read().decode('utf-8'))
+            if not isinstance(data, list):
+                raise ValueError("发布列表响应格式无效")
+            for release in data:
+                if release.get('draft'):
+                    continue
+                tag = release.get('tag_name', '')
+                try:
+                    version = VersionComparer.parse_version(tag)
+                except ValueError:
+                    continue
+                preview = bool(release.get('prerelease')) or version[3] < 5
+                if preview and self._channel == UpdateChannel.STABLE:
+                    continue
+                names = {asset.get('name', '') for asset in release.get('assets', [])}
+                if self._installer_name(tag) not in names:
+                    continue
+                if not any(self._is_checksum_asset(name, self._installer_name(tag))
+                           for name in names):
+                    continue
+                candidates.append((version[:3], not preview, version[3:], release))
+            if len(data) < 100:
+                break
+            page += 1
+        if not candidates:
+            return None
+        selected = max(candidates, key=lambda item: item[:3])[3]
+        release_info = self._parse_release_data(selected)
         release_info.expected_sha256 = self._fetch_expected_sha256(
-            release_info.checksum_url,
-            release_info.download_name,
-            source.timeout,
+            release_info.checksum_url, release_info.download_name, source.timeout,
         )
         return release_info
 
@@ -410,21 +470,15 @@ class UpdateCheckWorker(QThread):
 
         for asset in data.get('assets', []):
             name = asset.get('name', '')
-            if name.endswith('_Setup.exe') or name.endswith('.exe'):
+            if name == self._installer_name(tag_name):
                 download_url = asset.get('browser_download_url')
                 download_size = asset.get('size', 0)
                 download_name = name
                 break
 
-        checksum_asset_names = {
-            "sha256sums",
-            "sha256sums.txt",
-            "checksums.txt",
-        }
         for asset in data.get('assets', []):
             name = asset.get('name', '')
-            lower_name = name.lower()
-            if lower_name in checksum_asset_names or lower_name == f"{download_name.lower()}.sha256":
+            if self._is_checksum_asset(name, download_name):
                 checksum_url = asset.get('browser_download_url')
                 break
 
@@ -448,6 +502,8 @@ class UpdateCheckWorker(QThread):
             download_name=download_name,
             checksum_url=checksum_url,
             expected_sha256="",
+            prerelease=(bool(data.get('prerelease'))
+                        or VersionComparer.parse_version(version)[3] < 5),
             html_url=data.get('html_url', '')
         )
 
@@ -630,25 +686,36 @@ class UpdateService(QObject):
         self._check_worker: Optional[UpdateCheckWorker] = None
         self._download_worker: Optional[UpdateDownloadWorker] = None
         self._latest_release: Optional[ReleaseInfo] = None
+        self._check_result = None
+        self._check_error = None
+        self._download_result = None
+        self._download_error = None
 
     @property
     def is_checking(self) -> bool:
-        return self._check_worker is not None and self._check_worker.isRunning()
+        return self._check_worker is not None
 
     @property
     def is_downloading(self) -> bool:
-        return self._download_worker is not None and self._download_worker.isRunning()
+        return self._download_worker is not None
 
     @property
     def latest_release(self) -> Optional[ReleaseInfo]:
         return self._latest_release
 
-    def check_for_updates(self):
+    def check_for_updates(self, channel: Optional[UpdateChannel] = None):
         """开始后台检查更新（多源竞速策略）"""
         if self.is_checking:
             return
 
-        self._check_worker = UpdateCheckWorker(self._current_version, parent=self)
+        self._latest_release = None
+        self._check_result = None
+        self._check_error = None
+        self._check_worker = UpdateCheckWorker(
+            self._current_version, parent=self,
+            channel=load_update_channel() if channel is None else channel,
+        )
+        self._check_worker.finished.connect(self._cleanup_check_worker)
         self._check_worker.check_completed.connect(self._on_check_completed)
         self._check_worker.check_failed.connect(self._on_check_failed)
         self._check_worker.check_progress.connect(self.check_progress.emit)
@@ -666,7 +733,10 @@ class UpdateService(QObject):
             self.download_failed.emit("没有可下载的更新")
             return
 
+        self._download_result = None
+        self._download_error = None
         self._download_worker = UpdateDownloadWorker(release, parent=self)
+        self._download_worker.finished.connect(self._cleanup_download_worker)
         self._download_worker.progress_updated.connect(self.download_progress.emit)
         self._download_worker.download_completed.connect(self._on_download_completed)
         self._download_worker.download_failed.connect(self._on_download_failed)
@@ -679,29 +749,63 @@ class UpdateService(QObject):
         if self._download_worker and self._download_worker.isRunning():
             self._download_worker.cancel()
 
+    def close(self):
+        """断开窗口回调，让在途请求自然结束；不阻塞关闭窗口。"""
+        workers = (
+            (self._check_worker, ("check_completed", "check_failed", "check_progress")),
+            (self._download_worker, ("download_completed", "download_failed", "progress_updated")),
+        )
+        self._check_worker = None
+        self._download_worker = None
+        self._latest_release = None
+        for worker, signals in workers:
+            if worker is None:
+                continue
+            if isinstance(worker, UpdateDownloadWorker):
+                worker.cancel()
+            else:
+                worker._request_manager.cancel()
+            for name in (*signals, "finished"):
+                try:
+                    getattr(worker, name).disconnect()
+                except TypeError:
+                    pass
+            worker.setParent(QCoreApplication.instance())
+            worker.finished.connect(worker.deleteLater)
+            if not worker.isRunning():
+                worker.deleteLater()
+
     def _on_check_completed(self, release_info: Optional[ReleaseInfo]):
-        self._latest_release = release_info
-        self.check_completed.emit(release_info)
-        self._cleanup_check_worker()
+        self._check_result = release_info
 
     def _on_check_failed(self, error_msg: str):
-        self.check_failed.emit(error_msg)
-        self._cleanup_check_worker()
+        self._check_error = error_msg
 
     def _on_download_completed(self, file_path: str):
-        self.download_completed.emit(file_path)
-        self._cleanup_download_worker()
+        self._download_result = file_path
 
     def _on_download_failed(self, error_msg: str):
-        self.download_failed.emit(error_msg)
-        self._cleanup_download_worker()
+        self._download_error = error_msg
 
     def _cleanup_check_worker(self):
-        if self._check_worker:
-            self._check_worker.deleteLater()
-            self._check_worker = None
+        worker = self._check_worker
+        self._check_worker = None
+        if worker:
+            worker.deleteLater()
+        error, release = self._check_error, self._check_result
+        self._latest_release = release if not error else None
+        if error:
+            self.check_failed.emit(error)
+        else:
+            self.check_completed.emit(release)
 
     def _cleanup_download_worker(self):
-        if self._download_worker:
-            self._download_worker.deleteLater()
-            self._download_worker = None
+        worker = self._download_worker
+        self._download_worker = None
+        if worker:
+            worker.deleteLater()
+        error, path = self._download_error, self._download_result
+        if error:
+            self.download_failed.emit(error)
+        else:
+            self.download_completed.emit(path)

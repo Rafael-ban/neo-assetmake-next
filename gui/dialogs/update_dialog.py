@@ -10,7 +10,7 @@ from typing import Optional
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QProgressBar, QTextBrowser, QFrame,
-    QMessageBox, QStackedWidget, QWidget
+    QMessageBox, QStackedWidget, QWidget, QComboBox
 )
 from PyQt6.QtCore import Qt
 from qfluentwidgets import (
@@ -20,6 +20,9 @@ from qfluentwidgets import (
 
 from core.update_service import UpdateService, ReleaseInfo
 from config.constants import APP_VERSION, APP_VERSION_LABEL
+from config.update_preferences import (
+    UpdateChannel, load_update_channel, save_update_channel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,7 @@ class UpdateDialog(QDialog):
 
         self._setup_ui()
         self._connect_signals()
+        self.finished.connect(self._update_service.close)
 
         if auto_check:
             # Auto start check when dialog opens
@@ -49,6 +53,28 @@ class UpdateDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(15)
         layout.setContentsMargins(20, 20, 20, 20)
+
+        channel_layout = QHBoxLayout()
+        channel_layout.addWidget(BodyLabel("更新渠道"))
+        self.combo_channel = QComboBox()
+        self.combo_channel.addItem("正式版", UpdateChannel.STABLE.value)
+        self.combo_channel.addItem("开发预览版", UpdateChannel.PREVIEW.value)
+        self.combo_channel.setCurrentIndex(
+            self.combo_channel.findData(load_update_channel().value)
+        )
+        channel_layout.addWidget(self.combo_channel)
+        channel_layout.addStretch()
+        self.btn_recheck = PushButton("重新检查")
+        self.btn_recheck.clicked.connect(self._start_check)
+        channel_layout.addWidget(self.btn_recheck)
+        layout.addLayout(channel_layout)
+
+        self.label_channel_hint = BodyLabel(
+            "正式版：仅接收正式发布。开发预览版：也接收预览发布。"
+        )
+        self.label_channel_hint.setWordWrap(True)
+        layout.addWidget(self.label_channel_hint)
+        self.combo_channel.currentIndexChanged.connect(self._on_channel_changed)
 
         # Stacked widget for different states
         self.stack = QStackedWidget()
@@ -238,28 +264,48 @@ class UpdateDialog(QDialog):
         self._update_service.check_started.connect(self._on_check_started)
         self._update_service.check_completed.connect(self._on_check_completed)
         self._update_service.check_failed.connect(self._on_check_failed)
+        self._update_service.check_progress.connect(
+            self.label_checking_detail.setText
+        )
 
         self._update_service.download_started.connect(self._on_download_started)
         self._update_service.download_progress.connect(self._on_download_progress)
         self._update_service.download_completed.connect(self._on_download_completed)
         self._update_service.download_failed.connect(self._on_download_failed)
 
+    def _set_channel_controls_enabled(self, enabled: bool):
+        self.combo_channel.setEnabled(enabled)
+        self.btn_recheck.setEnabled(enabled)
+
+    def _on_channel_changed(self, _index: int):
+        channel = UpdateChannel(self.combo_channel.currentData())
+        save_update_channel(channel)
+        self._start_check()
+
     def _start_check(self):
-        """Start checking for updates"""
-        self.stack.setCurrentIndex(0)  # Show checking page
+        """Check the selected channel and discard any previous installer."""
+        self._downloaded_path = None
+        self.stack.setCurrentIndex(0)
         self.btn_close.setEnabled(True)
-        self._update_service.check_for_updates()
+        self._set_channel_controls_enabled(False)
+        self.label_current_version.setText(f"当前版本: v{APP_VERSION_LABEL}")
+        channel = UpdateChannel(self.combo_channel.currentData())
+        self._update_service.check_for_updates(channel=channel)
 
     def _on_check_started(self):
         """Called when check starts"""
+        self._set_channel_controls_enabled(False)
         self.label_checking_detail.setText("连接到 GitHub...")
 
     def _on_check_completed(self, release_info: Optional[ReleaseInfo]):
         """Called when check completes"""
+        self._set_channel_controls_enabled(True)
         if release_info:
             # Update available
+            release_kind = "开发预览版" if release_info.prerelease else "正式版"
             self.label_version_info.setText(
-                f"当前版本: v{APP_VERSION_LABEL}  →  新版本: v{release_info.version}"
+                f"当前版本: v{APP_VERSION_LABEL}  →  "
+                f"新版本: v{release_info.version}（{release_kind}）"
             )
 
             # Convert markdown to simple HTML (basic conversion)
@@ -290,7 +336,8 @@ class UpdateDialog(QDialog):
             self.stack.setCurrentIndex(1)  # Show update available page
         else:
             # No update
-            self.label_status.setText("当前已是最新版本")
+            channel_name = self.combo_channel.currentText()
+            self.label_status.setText(f"{channel_name}渠道暂无可用更新")
             self.label_status.setStyleSheet(
                 "font-size: 16px; font-weight: bold; color: #4CAF50;"
             )
@@ -298,6 +345,7 @@ class UpdateDialog(QDialog):
 
     def _on_check_failed(self, error_msg: str):
         """Called when check fails"""
+        self._set_channel_controls_enabled(True)
         self.label_status.setText("检查更新失败")
         self.label_status.setStyleSheet(
             "font-size: 16px; font-weight: bold; color: #f44336;"
@@ -308,6 +356,7 @@ class UpdateDialog(QDialog):
     def _start_download(self):
         """Start downloading update"""
         self.stack.setCurrentIndex(3)  # Show downloading page
+        self._set_channel_controls_enabled(False)
         self.btn_close.setEnabled(False)
         self._update_service.download_update()
 
@@ -329,11 +378,13 @@ class UpdateDialog(QDialog):
     def _on_download_completed(self, file_path: str):
         """Called when download completes"""
         self._downloaded_path = file_path
+        self._set_channel_controls_enabled(True)
         self.btn_close.setEnabled(True)
         self.stack.setCurrentIndex(4)  # Show download complete page
 
     def _on_download_failed(self, error_msg: str):
         """Called when download fails"""
+        self._set_channel_controls_enabled(True)
         self.btn_close.setEnabled(True)
         QMessageBox.critical(self, "下载失败", error_msg)
         self.stack.setCurrentIndex(1)  # Go back to update available page

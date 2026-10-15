@@ -126,14 +126,14 @@ class UpdateSource:
 UPDATE_API_SOURCES: List[UpdateSource] = [
     UpdateSource(
         name="GitHub API",
-        url_template="https://api.github.com/repos/{owner}/{repo}/releases/latest",
+        url_template="https://api.github.com/repos/{owner}/{repo}/releases",
         source_type=SourceType.GITHUB_API,
         priority=1,
         timeout=10.0
     ),
     UpdateSource(
         name="ghproxy.cc",
-        url_template="https://ghproxy.cc/https://api.github.com/repos/{owner}/{repo}/releases/latest",
+        url_template="https://ghproxy.cc/https://api.github.com/repos/{owner}/{repo}/releases",
         source_type=SourceType.GITHUB_PROXY,
         priority=2,
         timeout=15.0,
@@ -141,7 +141,7 @@ UPDATE_API_SOURCES: List[UpdateSource] = [
     ),
     UpdateSource(
         name="gh.idayer.com",
-        url_template="https://gh.idayer.com/https://api.github.com/repos/{owner}/{repo}/releases/latest",
+        url_template="https://gh.idayer.com/https://api.github.com/repos/{owner}/{repo}/releases",
         source_type=SourceType.GITHUB_PROXY,
         priority=3,
         timeout=15.0,
