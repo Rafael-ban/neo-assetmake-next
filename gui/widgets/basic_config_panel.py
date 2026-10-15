@@ -31,7 +31,7 @@ class BasicConfigPanel(QWidget):
     video_file_selected = pyqtSignal(str)
     validate_requested = pyqtSignal()
     export_requested = pyqtSignal()
-    ssh_upload_requested = pyqtSignal()
+    remote_upload_requested = pyqtSignal()
 
 
     def __init__(self, parent=None):
@@ -121,8 +121,8 @@ class BasicConfigPanel(QWidget):
         self.btn_export = PrimaryPushButton("导出素材")
         actions_layout.addWidget(self.btn_export)
 
-        self.btn_sshUpload = PrimaryPushButton("一键上传")
-        actions_layout.addWidget(self.btn_sshUpload)
+        self.btn_remote_upload = PrimaryPushButton("一键上传")
+        actions_layout.addWidget(self.btn_remote_upload)
 
         group_actions.addLayout(actions_layout)
         layout.addWidget(group_actions)
@@ -141,7 +141,7 @@ class BasicConfigPanel(QWidget):
 
         self.btn_validate.clicked.connect(self.validate_requested.emit)
         self.btn_export.clicked.connect(self.export_requested.emit)
-        self.btn_sshUpload.clicked.connect(self.ssh_upload_requested.emit)
+        self.btn_remote_upload.clicked.connect(self.remote_upload_requested.emit)
 
     def _on_operator_name_changed(self, text: str):
         """干员名称变更处理"""

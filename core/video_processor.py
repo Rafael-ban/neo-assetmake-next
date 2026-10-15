@@ -1,15 +1,22 @@
-"""
-视频处理器 - 32像素对齐和黑边处理
-融合 OpenCV 读取和 FFmpeg 编码
-"""
-import subprocess
-import sys
-import os
-import logging
-from dataclasses import dataclass
-from typing import Optional, Callable, Tuple, Dict, Any
+"""Video metadata helpers and shared x264 parameter defaults."""
 
-from config.constants import RESOLUTION_SPECS, get_resolution_spec
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional, Tuple
+
+from PyQt6.QtCore import QProcess
+from PyQt6.QtNetwork import QLocalSocket
+
+from core.media_tools import MediaToolchain
 from utils.file_utils import get_app_dir
 
 logger = logging.getLogger(__name__)
@@ -26,293 +33,301 @@ X264_PARAMS = (
     ":deblock=1,1:psy-rd=0.4,0"
 )
 
+X264_CLI_ARGS = [
+    "--partitions",
+    "all",
+    "--rc-lookahead",
+    "150",
+    "--bframes",
+    "16",
+    "--b-adapt",
+    "2",
+    "--me",
+    "umh",
+    "--subme",
+    "9",
+    "--merange",
+    "48",
+    "--no-fast-pskip",
+    "--direct",
+    "auto",
+    "--keyint",
+    "300",
+    "--min-keyint",
+    "5",
+    "--ref",
+    "16",
+    "--chroma-qp-offset",
+    "-3",
+    "--aq-mode",
+    "1",
+    "--aq-strength",
+    "0.6",
+    "--trellis",
+    "2",
+    "--deblock",
+    "1:1",
+    "--psy-rd",
+    "0.4:0",
+]
 
-def find_ffmpeg() -> str:
-    """查找安装目录中的ffmpeg（仅限应用自带，避免多版本冲突）"""
-    # 1. 在应用程序目录查找（支持 Nuitka/PyInstaller 打包）
-    if sys.platform == 'win32':
-        app_ffmpeg = os.path.join(get_app_dir(), "ffmpeg.exe")
-    else:
-        app_ffmpeg = os.path.join(get_app_dir(), "ffmpeg")
+MPV_METADATA_PROPERTIES = (
+    "width",
+    "height",
+    "dwidth",
+    "dheight",
+    "duration",
+    "container-fps",
+    "estimated-vf-fps",
+    "fps",
+    "estimated-frame-count",
+    "video-codec",
+)
 
-    if os.path.isfile(app_ffmpeg):
-        return app_ffmpeg
 
-    # 2. 在 ffmpeg 子目录中查找
-    if sys.platform == 'win32':
-        ffmpeg_dir_ffmpeg = os.path.join(get_app_dir(), "ffmpeg", "ffmpeg.exe")
-    else:
-        ffmpeg_dir_ffmpeg = os.path.join(get_app_dir(), "ffmpeg", "ffmpeg")
-    if os.path.isfile(ffmpeg_dir_ffmpeg):
-        return ffmpeg_dir_ffmpeg
-
-    return ""
+def find_mpv() -> str:
+    """Find the bundled or PATH-provided mpv executable."""
+    toolchain = MediaToolchain.discover(get_app_dir())
+    return toolchain.mpv_path
 
 
 @dataclass
 class VideoInfo:
-    """视频信息"""
+    """Basic video stream information."""
+
     width: int
     height: int
-    duration: float  # 秒
+    duration: float
     fps: float
     total_frames: int
     codec: str
 
 
+def parse_mpv_video_info(properties: dict[str, Any]) -> VideoInfo:
+    """Build ``VideoInfo`` from mpv JSON IPC properties."""
+    width = _parse_int(_first_value(properties, "width", "dwidth"))
+    height = _parse_int(_first_value(properties, "height", "dheight"))
+    if width <= 0 or height <= 0:
+        raise ValueError("mpv did not report video dimensions")
+
+    duration = _parse_float(properties.get("duration"))
+    fps = _parse_float(
+        _first_value(properties, "container-fps", "estimated-vf-fps", "fps"),
+        default=30.0,
+    )
+    if fps <= 0:
+        fps = 30.0
+
+    total_frames = _parse_int(properties.get("estimated-frame-count"))
+    if total_frames <= 0 and duration > 0:
+        total_frames = max(1, round(duration * fps))
+    if total_frames <= 0:
+        total_frames = 1
+
+    codec = str(properties.get("video-codec") or "")
+    return VideoInfo(
+        width=width,
+        height=height,
+        duration=duration,
+        fps=fps,
+        total_frames=total_frames,
+        codec=codec,
+    )
+
+
 class VideoProcessor:
-    """
-    视频处理器 - 实现32像素对齐
+    """Probe video metadata through mpv JSON IPC."""
 
-    分辨率处理规则：
-    - 360x640 -> 384x640 (右边加24px黑边)
-    - 480x854 -> 480x864 (下边加10px黑边)
-    - 720x1080 -> 720x1080 (旋转180度)
-    """
+    def __init__(self, mpv_path: str = "") -> None:
+        self.mpv_path = mpv_path or find_mpv() or "mpv"
 
-    def __init__(self, ffmpeg_path: str = "ffmpeg", ffprobe_path: str = "ffprobe"):
-        """
-        初始化视频处理器
-
-        Args:
-            ffmpeg_path: ffmpeg可执行文件路径
-            ffprobe_path: ffprobe可执行文件路径
-        """
-        self.ffmpeg_path = ffmpeg_path
-        self.ffprobe_path = ffprobe_path
-
-    def check_ffmpeg_available(self) -> Tuple[bool, str]:
-        """
-        检查FFmpeg是否可用
-
-        Returns:
-            (是否可用, 错误信息或版本信息)
-        """
-        try:
-            result = subprocess.run(
-                [self.ffmpeg_path, "-version"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            if result.returncode == 0:
-                first_line = result.stdout.split('\n')[0] if result.stdout else ""
-                return True, first_line
-            return False, "FFmpeg返回非零退出码"
-        except FileNotFoundError:
-            return False, "未找到FFmpeg，请确保已安装并添加到系统PATH"
-        except subprocess.TimeoutExpired:
-            return False, "FFmpeg响应超时"
-        except Exception as e:
-            return False, f"检查FFmpeg时出错: {e}"
-
-    def find_ffmpeg(self) -> str:
-        """查找系统中的ffmpeg（支持打包环境）"""
-        return find_ffmpeg()
+    def check_mpv_available(self) -> Tuple[bool, str]:
+        """Return whether mpv is callable."""
+        process = QProcess()
+        process.setProgram(self.mpv_path)
+        process.setArguments(["--version"])
+        process.start()
+        if not process.waitForStarted(5000):
+            return False, "mpv was not found"
+        process.waitForFinished(5000)
+        output = bytes(process.readAllStandardOutput()).decode(
+            "utf-8", errors="replace"
+        )
+        if process.exitCode() != 0:
+            return False, "mpv returned a non-zero exit code"
+        return True, output.splitlines()[0] if output else "mpv"
 
     def get_video_info(self, input_path: str) -> Optional[VideoInfo]:
-        """
-        获取视频信息
-
-        Args:
-            input_path: 视频文件路径
-
-        Returns:
-            视频信息，失败返回None
-        """
-        cmd = [
-            self.ffprobe_path, "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=width,height,duration,r_frame_rate,codec_name,nb_frames",
-            "-of", "csv=p=0",
-            input_path
-        ]
+        """Return metadata for the first video stream in ``input_path``."""
+        if not Path(input_path).exists():
+            logger.error("Video file does not exist: %s", input_path)
+            return None
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True,
-                check=True, timeout=30
+            properties = _MpvMetadataSession(self.mpv_path).probe(input_path)
+            return parse_mpv_video_info(properties)
+        except Exception as exc:
+            logger.error("mpv metadata probe failed for %s: %s", input_path, exc)
+            return None
+
+
+class _MpvMetadataSession:
+    def __init__(self, mpv_path: str) -> None:
+        self.mpv_path = mpv_path
+        self.ipc_server = _make_mpv_ipc_server()
+        self.process: Optional[QProcess] = None
+        self.socket: Optional[QLocalSocket] = None
+        self._request_id = 1
+
+    def probe(self, input_path: str) -> dict[str, Any]:
+        try:
+            self.process = QProcess()
+            self.process.setProgram(self.mpv_path)
+            self.process.setArguments(
+                [
+                    "--no-config",
+                    "--force-window=no",
+                    "--idle=no",
+                    "--pause=yes",
+                    "--keep-open=yes",
+                    "--ao=null",
+                    "--vo=null",
+                    f"--input-ipc-server={self.ipc_server}",
+                    input_path,
+                ]
             )
-            parts = result.stdout.strip().split(',')
-            if len(parts) >= 5:
-                fps_parts = parts[3].split('/')
-                if len(fps_parts) == 2:
-                    fps = float(fps_parts[0]) / float(fps_parts[1])
-                else:
-                    fps = float(fps_parts[0])
-
-                duration_str = parts[2]
-                duration = float(duration_str) if duration_str != 'N/A' else 0
-
-                total_frames = 0
-                if len(parts) >= 6 and parts[5] != 'N/A':
-                    try:
-                        total_frames = int(parts[5])
-                    except ValueError:
-                        pass
-                if total_frames == 0 and duration > 0:
-                    total_frames = round(duration * fps)
-
-                return VideoInfo(
-                    width=int(parts[0]),
-                    height=int(parts[1]),
-                    duration=duration,
-                    fps=fps,
-                    total_frames=total_frames,
-                    codec=parts[4]
+            self.process.start()
+            if not self.process.waitForStarted(5000):
+                raise RuntimeError(
+                    f"mpv failed to start: {self.process.errorString()}"
                 )
-        except subprocess.TimeoutExpired:
-            logger.error("获取视频信息超时")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"获取视频信息失败: {e.stderr}")
-        except Exception as e:
-            logger.error(f"获取视频信息异常: {e}")
+
+            self.socket = QLocalSocket()
+            self._connect_socket()
+            self._wait_for_file_loaded()
+
+            properties = {}
+            for name in MPV_METADATA_PROPERTIES:
+                properties[name] = self._get_property(name)
+            return properties
+        finally:
+            self.close()
+
+    def _connect_socket(self) -> None:
+        time.sleep(0.2)
+        for _ in range(75):
+            if self.socket is None:
+                self.socket = QLocalSocket()
+            self.socket.connectToServer(self.ipc_server)
+            if self.socket.waitForConnected(200):
+                return
+            self.socket.abort()
+            self.socket.deleteLater()
+            self.socket = None
+        raise RuntimeError("mpv JSON IPC connection was not established")
+
+    def _wait_for_file_loaded(self) -> None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            message = self._read_message(deadline)
+            if not message:
+                continue
+            if message.get("event") == "file-loaded":
+                return
+            if message.get("event") == "end-file" and message.get("reason") == "error":
+                raise RuntimeError("mpv failed to load the media file")
+
+    def _get_property(self, name: str) -> Any:
+        assert self.socket is not None
+        request_id = self._request_id
+        self._request_id += 1
+        payload = json.dumps(
+            {"command": ["get_property", name], "request_id": request_id},
+            separators=(",", ":"),
+        )
+        self.socket.write((payload + "\n").encode("utf-8"))
+        self.socket.waitForBytesWritten(500)
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            message = self._read_message(deadline)
+            if message and message.get("request_id") == request_id:
+                if message.get("error") == "success":
+                    return message.get("data")
+                return None
         return None
 
-    def process_video(
-        self,
-        input_path: str,
-        output_path: str,
-        target_resolution: str,
-        progress_callback: Optional[Callable[[float, str], None]] = None
-    ) -> Tuple[bool, str]:
-        """
-        处理视频：添加黑边实现32像素对齐
-
-        Args:
-            input_path: 输入视频路径
-            output_path: 输出视频路径
-            target_resolution: 目标分辨率 ("360x640", "480x854", "720x1080")
-            progress_callback: 进度回调函数(进度0.0-1.0, 状态信息)
-
-        Returns:
-            (处理是否成功, 错误信息)
-        """
-        if not os.path.exists(input_path):
-            return False, f"输入文件不存在: {input_path}"
-
-        spec = get_resolution_spec(target_resolution)
-        orig_w = spec["width"]
-        orig_h = spec["height"]
-        target_w = spec["padded_width"]
-        target_h = spec["padded_height"]
-        pad_dir = spec["padding_side"]
-        rotate_180 = spec["rotate_180"]
-
-        cmd = [self.ffmpeg_path, "-y", "-i", input_path]
-
-        filters = []
-        filters.append(f"scale={orig_w}:{orig_h}")
-
-        if pad_dir:
-            filters.append(f"pad={target_w}:{target_h}:0:0:black")
-
-        if rotate_180:
-            filters.append("rotate=PI")
-
-        if filters:
-            cmd.extend(["-vf", ",".join(filters)])
-
-        cmd.extend([
-            "-c:v", "libx264",
-            "-preset", "veryslow",
-            "-crf", "26",
-            "-pix_fmt", "yuv420p",
-            "-x264-params", X264_PARAMS,
-            "-an",  # 无音频
-            output_path
-        ])
-
-        if progress_callback:
-            progress_callback(0.1, "开始处理视频...")
-
+    def _read_message(self, deadline: float) -> Optional[dict[str, Any]]:
+        assert self.socket is not None
+        if not self.socket.canReadLine():
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            if not self.socket.waitForReadyRead(remaining_ms):
+                return None
+        line = bytes(self.socket.readLine()).decode("utf-8", errors="replace").strip()
+        if not line:
+            return None
         try:
-            popen_kwargs = {
-                'stdout': subprocess.PIPE,
-                'stderr': subprocess.PIPE,
-                'universal_newlines': True
-            }
-            if sys.platform == 'win32':
-                popen_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+            return json.loads(line)
+        except json.JSONDecodeError:
+            return None
 
-            process = subprocess.Popen(cmd, **popen_kwargs)
+    def close(self) -> None:
+        socket = self.socket
+        self.socket = None
+        if socket is not None:
+            try:
+                socket.write(b'{"command":["quit"]}\n')
+                socket.waitForBytesWritten(100)
+                socket.disconnectFromServer()
+            except Exception:
+                pass
 
-            if progress_callback:
-                progress_callback(0.5, "正在编码...")
+        process = self.process
+        self.process = None
+        if process is not None:
+            try:
+                if process.state() != QProcess.ProcessState.NotRunning:
+                    process.waitForFinished(1000)
+                if process.state() != QProcess.ProcessState.NotRunning:
+                    process.kill()
+                    process.waitForFinished(3000)
+            except Exception:
+                pass
 
-            stdout, stderr = process.communicate(timeout=600)
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
-            if process.returncode == 0:
-                if progress_callback:
-                    progress_callback(1.0, "处理完成")
-                return True, ""
-            else:
-                return False, f"FFmpeg错误: {stderr}"
 
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return False, "视频处理超时（超过10分钟）"
-        except Exception as e:
-            return False, f"视频处理异常: {e}"
+def _make_mpv_ipc_server() -> str:
+    name = f"neo_assetmaker_probe_{os.getpid()}_{uuid.uuid4().hex}"
+    if sys.platform == "win32":
+        return name  # Qt QLocalSocket 会自动添加 \\.\pipe\ 前缀
+    return os.path.join(tempfile.gettempdir(), name)
 
-    def generate_ffmpeg_command(
-        self,
-        input_path: str,
-        output_path: str,
-        target_resolution: str
-    ) -> str:
-        """
-        生成FFmpeg命令字符串（用于显示给用户）
 
-        Args:
-            input_path: 输入视频路径
-            output_path: 输出视频路径
-            target_resolution: 目标分辨率
+def _first_value(properties: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        value = properties.get(name)
+        if value not in (None, "", "N/A"):
+            return value
+    return None
 
-        Returns:
-            FFmpeg命令字符串
-        """
-        spec = get_resolution_spec(target_resolution)
-        orig_w = spec["width"]
-        orig_h = spec["height"]
-        target_w = spec["padded_width"]
-        target_h = spec["padded_height"]
-        pad_dir = spec["padding_side"]
-        rotate_180 = spec["rotate_180"]
 
-        filters = [f"scale={orig_w}:{orig_h}"]
+def _parse_float(value: Any, default: float = 0.0) -> float:
+    if value in (None, "", "N/A"):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-        if pad_dir:
-            filters.append(f"pad={target_w}:{target_h}:0:0:black")
 
-        if rotate_180:
-            filters.append("rotate=PI")
-
-        filter_str = ",".join(filters)
-
-        return (f'ffmpeg -i "{input_path}" -vf "{filter_str}" '
-                f'-c:v libx264 -preset veryslow -crf 26 -pix_fmt yuv420p '
-                f'-x264-params "{X264_PARAMS}" '
-                f'-an "{output_path}"')
-
-    def get_resolution_info(self, resolution: str) -> Dict[str, Any]:
-        """
-        获取分辨率处理信息
-
-        Args:
-            resolution: 分辨率字符串
-
-        Returns:
-            包含原始和目标分辨率信息的字典
-        """
-        spec = get_resolution_spec(resolution)
-
-        info = {
-            "original": f"{spec['width']}x{spec['height']}",
-            "target": f"{spec['padded_width']}x{spec['padded_height']}",
-            "pad_direction": spec["padding_side"],
-            "pad_pixels": spec.get("padding_amount", 0),
-            "needs_rotation": spec["rotate_180"],
-            "description": spec.get("description", "")
-        }
-
-        return info
+def _parse_int(value: Any, default: int = 0) -> int:
+    if value in (None, "", "N/A"):
+        return default
+    try:
+        return int(round(float(value)))
+    except (TypeError, ValueError):
+        return default

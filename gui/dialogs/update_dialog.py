@@ -19,7 +19,7 @@ from qfluentwidgets import (
 )
 
 from core.update_service import UpdateService, ReleaseInfo
-from config.constants import APP_VERSION
+from config.constants import APP_VERSION, APP_VERSION_LABEL
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +165,7 @@ class UpdateDialog(QDialog):
         self.label_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.label_status)
 
-        self.label_current_version = BodyLabel(f"当前版本: v{APP_VERSION}")
+        self.label_current_version = BodyLabel(f"当前版本: v{APP_VERSION_LABEL}")
         self.label_current_version.setStyleSheet("font-size: 13px;")
         self.label_current_version.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.label_current_version)
@@ -259,7 +259,7 @@ class UpdateDialog(QDialog):
         if release_info:
             # Update available
             self.label_version_info.setText(
-                f"当前版本: v{APP_VERSION}  →  新版本: v{release_info.version}"
+                f"当前版本: v{APP_VERSION_LABEL}  →  新版本: v{release_info.version}"
             )
 
             # Convert markdown to simple HTML (basic conversion)

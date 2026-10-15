@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "uuid": "00000000-0000-4000-8000-000000000002",
+  "name": "Full Overlay",
+  "description": "Fixture with transitions and Arknights overlay",
+  "icon": "icon.png",
+  "screen": "480x854",
+  "loop": {
+    "file": "loop.mp4"
+  },
+  "intro": {
+    "enabled": true,
+    "file": "intro.mp4",
+    "duration": 5000000
+  },
+  "transition_in": {
+    "type": "fade",
+    "options": {
+      "duration": 500000,
+      "background_color": "#000000"
+    }
+  },
+  "transition_loop": {
+    "type": "move",
+    "options": {
+      "duration": 250000,
+      "image": "transition.png",
+      "background_color": "#111111"
+    }
+  },
+  "overlay": {
+    "type": "arknights",
+    "options": {
+      "appear_time": 100000,
+      "operator_name": "AMIYA",
+      "operator_code": "ARKNIGHTS - AMIY",
+      "barcode_text": "AMIYA - RHODES",
+      "aux_text": "Leader of Rhodes Island",
+      "staff_text": "STAFF",
+      "color": "#101010",
+      "logo": "ark_logo.png",
+      "operator_class_icon": "class_icons/caster.png"
+    }
+  }
+}

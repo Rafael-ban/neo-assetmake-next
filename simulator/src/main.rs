@@ -113,7 +113,10 @@ fn main() -> Result<()> {
     } else {
         Level::INFO
     };
-    let subscriber = FmtSubscriber::builder().with_max_level(level).finish();
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(level)
+        .with_writer(std::io::stderr)
+        .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("Arknights Pass Simulator starting...");

@@ -11,6 +11,12 @@ from typing import Any, Optional
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal as Signal
 
+from _mext.repositories import (
+    CommentRepository,
+    DownloadRepository,
+    MaterialRepository,
+    UserRepository,
+)
 from _mext.services.api_client import ApiClient, ApiError
 
 logger = logging.getLogger(__name__)
@@ -150,14 +156,12 @@ class MaterialsLoadWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = MaterialRepository(api_client)
         self._params = params
 
     def run(self) -> None:
         try:
-            response = self._api.get("materials", params=self._params)
-            items = response.get("items", [])
-            total = response.get("total", 0)
+            items, total = self._repo.list_materials_raw(self._params)
             self.completed.emit(items, total)
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
@@ -191,13 +195,12 @@ class MaterialDetailWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = MaterialRepository(api_client)
         self._material_id = material_id
 
     def run(self) -> None:
         try:
-            response = self._api.get(f"materials/{self._material_id}")
-            self.completed.emit(response)
+            self.completed.emit(self._repo.get_material_raw(self._material_id))
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
         except Exception as exc:
@@ -228,37 +231,19 @@ class DownloadUrlWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = DownloadRepository(api_client)
         self._material_id = material_id
         self._fallback_hash = fallback_hash
         self._fallback_size = fallback_size
 
     def run(self) -> None:
         try:
-            # Step 1: request signed verification URL
-            url_response = self._api.post(
-                "downloads/generate-url",
-                json={"material_id": self._material_id},
+            verified = self._repo.resolve_download(self._material_id)
+            self.completed.emit(
+                verified.presigned_url,
+                verified.file_hash or self._fallback_hash or "",
+                verified.file_size or self._fallback_size,
             )
-            verify_url = url_response.get("url", "")
-            if not verify_url:
-                self.error.emit("Server returned empty download URL")
-                return
-
-            if verify_url.startswith("/"):
-                server_origin = self._api._config.api_base_url.rstrip("/")
-                verify_url = f"{server_origin}{verify_url}"
-
-            # Step 2: verify → get presigned URL
-            verify_response = self._api.get(verify_url)
-            download_url = verify_response.get("presigned_url", "")
-            if not download_url:
-                self.error.emit("Server returned empty presigned URL")
-                return
-
-            file_hash = verify_response.get("file_hash", self._fallback_hash)
-            file_size = verify_response.get("file_size", self._fallback_size)
-            self.completed.emit(download_url, file_hash or "", file_size)
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
         except Exception as exc:
@@ -290,35 +275,16 @@ class LibraryLoadWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = UserRepository(api_client)
 
     def run(self) -> None:
         try:
-            # 1. Fetch download records
-            download_records = self._api.get("users/me/downloads")
-            materials_raw: list[dict] = []
-            if isinstance(download_records, list):
-                seen_ids: set[str] = set()
-                for record in download_records:
-                    mid = str(record.get("material_id", ""))
-                    if mid and mid not in seen_ids:
-                        seen_ids.add(mid)
-                        try:
-                            mat_data = self._api.get(f"materials/{mid}")
-                            materials_raw.append(mat_data)
-                        except ApiError:
-                            pass  # Material may have been deleted
-
-            # 2. Fetch favourites
-            fav_raw: list[dict] = []
+            materials = self._repo.list_downloaded_materials_raw()
             try:
-                fav_items = self._api.get("users/me/favorites")
-                if isinstance(fav_items, list):
-                    fav_raw = fav_items
+                favorites = self._repo.list_favorites_raw()
             except ApiError:
-                pass
-
-            self.completed.emit(materials_raw, fav_raw)
+                favorites = []
+            self.completed.emit(materials, favorites)
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
         except Exception as exc:
@@ -437,19 +403,18 @@ class CommentsLoadWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = CommentRepository(api_client)
         self._material_id = material_id
         self._page = page
         self._per_page = per_page
 
     def run(self) -> None:
         try:
-            response = self._api.get(
-                f"materials/{self._material_id}/comments",
-                params={"page": self._page, "per_page": self._per_page},
+            items, total = self._repo.list_comments_raw(
+                self._material_id,
+                page=self._page,
+                per_page=self._per_page,
             )
-            items = response.get("items", [])
-            total = response.get("total", 0)
             self.completed.emit(items, total)
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
@@ -480,17 +445,13 @@ class CommentPostWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = CommentRepository(api_client)
         self._material_id = material_id
         self._content = content
 
     def run(self) -> None:
         try:
-            response = self._api.post(
-                f"materials/{self._material_id}/comments",
-                json={"content": self._content},
-            )
-            self.completed.emit(response)
+            self.completed.emit(self._repo.post_comment_raw(self._material_id, self._content))
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
         except Exception as exc:
@@ -519,12 +480,12 @@ class CommentDeleteWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = CommentRepository(api_client)
         self._comment_id = comment_id
 
     def run(self) -> None:
         try:
-            self._api.delete(f"comments/{self._comment_id}")
+            self._repo.delete_comment(self._comment_id)
             self.completed.emit(self._comment_id)
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
@@ -559,18 +520,16 @@ class LikeToggleWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = MaterialRepository(api_client)
         self._material_id = material_id
         self._should_like = should_like
 
     def run(self) -> None:
         try:
-            if self._should_like:
-                response = self._api.post(f"materials/{self._material_id}/like")
-            else:
-                response = self._api.delete(f"materials/{self._material_id}/like")
-            is_liked = response.get("is_liked", self._should_like)
-            like_count = response.get("like_count", 0)
+            is_liked, like_count = self._repo.set_like(
+                self._material_id,
+                self._should_like,
+            )
             self.completed.emit(self._material_id, is_liked, like_count)
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
@@ -601,17 +560,16 @@ class FavoriteToggleWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = MaterialRepository(api_client)
         self._material_id = material_id
         self._should_favorite = should_favorite
 
     def run(self) -> None:
         try:
-            if self._should_favorite:
-                response = self._api.post(f"materials/{self._material_id}/favorite")
-            else:
-                response = self._api.delete(f"materials/{self._material_id}/favorite")
-            is_fav = response.get("is_favorited", self._should_favorite)
+            is_fav = self._repo.set_favorite(
+                self._material_id,
+                self._should_favorite,
+            )
             self.completed.emit(self._material_id, is_fav)
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
@@ -645,12 +603,12 @@ class CreatorProfileWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = UserRepository(api_client)
         self._creator_id = creator_id
 
     def run(self) -> None:
         try:
-            response = self._api.get(f"users/{self._creator_id}/profile")
+            response = self._repo.creator_profile(self._creator_id)
             self.completed.emit(response)
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
@@ -682,19 +640,18 @@ class CreatorWorksWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = UserRepository(api_client)
         self._creator_id = creator_id
         self._page = page
         self._per_page = per_page
 
     def run(self) -> None:
         try:
-            response = self._api.get(
-                f"users/{self._creator_id}/materials",
-                params={"page": self._page, "per_page": self._per_page},
+            items, total = self._repo.creator_materials_raw(
+                self._creator_id,
+                page=self._page,
+                per_page=self._per_page,
             )
-            items = response.get("items", [])
-            total = response.get("total", 0)
             self.completed.emit(items, total)
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
@@ -728,17 +685,12 @@ class FeaturedMaterialsWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = MaterialRepository(api_client)
         self._limit = limit
 
     def run(self) -> None:
         try:
-            response = self._api.get(
-                "materials/featured",
-                params={"limit": self._limit},
-            )
-            items = response if isinstance(response, list) else response.get("items", [])
-            self.completed.emit(items)
+            self.completed.emit(self._repo.list_featured_raw(self._limit))
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
         except Exception as exc:
@@ -768,18 +720,13 @@ class RelatedMaterialsWorker(QThread):
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
-        self._api = api_client
+        self._repo = MaterialRepository(api_client)
         self._material_id = material_id
         self._limit = limit
 
     def run(self) -> None:
         try:
-            response = self._api.get(
-                f"materials/{self._material_id}/related",
-                params={"limit": self._limit},
-            )
-            items = response if isinstance(response, list) else response.get("items", [])
-            self.completed.emit(items)
+            self.completed.emit(self._repo.list_related_raw(self._material_id, self._limit))
         except ApiError as exc:
             self.error.emit(exc.detail or str(exc))
         except Exception as exc:

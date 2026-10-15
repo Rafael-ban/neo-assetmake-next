@@ -8,6 +8,8 @@ import uuid as uuid_lib
 import json
 import os
 
+from core.file_utils import atomic_write_json
+
 CONFIG_FILENAME = "epconfig.json"
 
 
@@ -334,12 +336,36 @@ class EPConfig:
         """转换为JSON字符串"""
         return json.dumps(self.to_dict(normalize_paths=normalize_paths), ensure_ascii=False, indent=indent)
 
+    @staticmethod
+    def _detect_invalid_enums(data: dict) -> list:
+        """Return [(field, raw_value)] for any enum value that from_string would
+        silently coerce to a default. Lets the validator report a corrupt config
+        instead of silently exporting at e.g. the wrong resolution."""
+        invalid: list = []
+        screen_vals = {m.value for m in ScreenType}
+        trans_vals = {m.value for m in TransitionType}
+        overlay_vals = {m.value for m in OverlayType}
+
+        screen_raw = data.get("screen")
+        if isinstance(screen_raw, str) and screen_raw and screen_raw not in screen_vals:
+            invalid.append(("screen", screen_raw))
+        for key in ("transition_in", "transition_loop"):
+            section = data.get(key)
+            t_raw = section.get("type") if isinstance(section, dict) else None
+            if isinstance(t_raw, str) and t_raw and t_raw not in trans_vals:
+                invalid.append((f"{key}.type", t_raw))
+        overlay = data.get("overlay")
+        ov_raw = overlay.get("type") if isinstance(overlay, dict) else None
+        if isinstance(ov_raw, str) and ov_raw and ov_raw not in overlay_vals:
+            invalid.append(("overlay.type", ov_raw))
+        return invalid
+
     @classmethod
     def from_dict(cls, data: dict) -> "EPConfig":
         """从字典创建实例"""
         screen = ScreenType.from_string(data.get("screen", "360x640"))
 
-        return cls(
+        config = cls(
             version=data.get("version", 1),
             uuid=data.get("uuid", str(uuid_lib.uuid4())),
             name=data.get("name", ""),
@@ -352,6 +378,10 @@ class EPConfig:
             transition_loop=Transition.from_dict(data.get("transition_loop")),
             overlay=Overlay.from_dict(data.get("overlay"))
         )
+        # from_string above stays lenient (defaults) so the app keeps working; record the
+        # raw invalid values here so validate_config can surface them as errors.
+        config._invalid_fields = cls._detect_invalid_enums(data)
+        return config
 
     @classmethod
     def load_from_file(cls, filepath: str) -> "EPConfig":
@@ -367,8 +397,7 @@ class EPConfig:
             if directory and not os.path.exists(directory):
                 os.makedirs(directory)
 
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(self.to_dict(), f, ensure_ascii=False, indent=4)
+            atomic_write_json(filepath, self.to_dict(), indent=4)
         except PermissionError:
             raise RuntimeError(f"无法保存到 {filepath}，权限不足")
 

@@ -39,12 +39,13 @@ Arknights Pass Material Toolbox — 用于制作明日方舟电子通行证 2.1 
 - 本地素材库管理
 - USB/MTP 设备管理
 
-### SSH 远程管理
+### EPass RNDIS 远程管理
 
 - 侧边栏远程管理入口（WiFi 图标）
-- SSH 连接配置（地址、端口、用户名、密码、远程路径）
-- 远程素材列表刷新，以及下载 / 删除 / 编辑入口
-- 远程文件管理器与 SSH 终端入口
+- 通过 `EPass RNDIS Remote NDIS Compatible Device` 自动连接设备
+- 固定访问 `http://192.168.137.2/` 的设备端 HTTP API
+- 连接时校验 RNDIS 路由和 `/api/v1/health` 设备协议信息
+- 远程素材列表刷新，以及上传 / 下载 / 删除 / 编辑入口
 - 一键上传文件到通行证设备，实时进度显示
 - 上传完毕后可选自动重启通行证程序
 
@@ -63,7 +64,7 @@ Arknights Pass Material Toolbox — 用于制作明日方舟电子通行证 2.1 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/)（包管理器）
 - Rust 工具链（仅编译模拟器时需要）
-- 若需本地编译 `simulator/`，还需要可用的 FFmpeg 开发依赖发现环境（`pkg-config` 或 `vcpkg`）
+- 若需本地编译 `simulator/`，需要可用的 Rust stable 工具链
 
 ## 文档
 
@@ -101,7 +102,7 @@ uv run python main.py
 2. **素材制作** — 核心功能，创建和编辑通行证素材
 3. **素材论坛** — 在线素材资源下载
 4. **项目介绍** — 访问项目官网获取最新信息
-5. **远程管理** — SSH 远程上传文件到通行证设备
+5. **远程管理** — 通过 EPass RNDIS HTTP API 同步文件到通行证设备
 6. **设置** — 主题、界面、视频、导出、网络等配置
 
 ### 创建项目
@@ -227,14 +228,14 @@ neo-assetmaker/
 │   ├── widgets/                     # UI 组件
 │   │   ├── config_panel.py          # 高级配置面板
 │   │   ├── basic_config_panel.py    # 基础配置面板
-│   │   ├── video_preview.py         # 视频预览（OpenGL + QLabel 回退）
+│   │   ├── video_preview.py         # 视频预览（mpv 嵌入 + JSON IPC）
 │   │   ├── gl_video_renderer.py     # OpenGL 视频渲染器
-│   │   ├── frame_reader_thread.py   # 后台视频帧读取线程（PyAV）
+│   │   ├── frame_reader_thread.py   # 旧帧读取接口兼容层
 │   │   ├── drop_overlay.py          # 拖放文件导入覆盖层
 │   │   ├── json_preview.py          # JSON 配置预览
 │   │   ├── timeline.py              # 时间轴控制
 │   │   ├── transition_preview.py    # 过渡效果预览
-│   │   ├── remote_page.py           # SSH 远程上传管理页面
+│   │   ├── remote_page.py           # EPass RNDIS HTTP 远程管理页面
 │   │   └── settings_page.py         # 设置页面
 │   └── dialogs/                     # 对话框
 │       ├── welcome_dialog.py        # 欢迎引导
@@ -290,13 +291,17 @@ uv run python build.py --no-installer
 # 即使本地存在 flasher 目录，也不把它打进安装包
 uv run python build.py --skip-flasher
 
+# 使用 PyArmor 先混淆项目内 Python 源码，再交给 cx_Freeze 打包
+uv pip install "pyarmor>=8,<9"
+uv run python build.py --obfuscate
+
 # 或使用批处理包装器（自动安装依赖）
 build.bat
 ```
 
 ### 编译 Rust 模拟器
 
-先确认本机可以解析 FFmpeg 开发依赖（`pkg-config` 或 `vcpkg` 至少其一可用）：
+先确认本机已安装 Rust stable 工具链：
 
 ```bash
 cd simulator && cargo build --release
@@ -307,9 +312,42 @@ cd simulator && cargo build --release
 GitHub Actions 工作流位于 `.github/workflows/`：
 
 - **build.yml** — push/PR 时触发 CI，并调用 `build-app.yml` 完成 Rust 编译、Python 打包和 Inno Setup 安装包构建
-- **release.yml** — `docs/CHANGELOG.md` 顶部版本号变更时自动创建 GitHub Release
+- **release.yml** — `docs/CHANGELOG.md` 顶部版本号变更时自动创建 GitHub Release，并默认启用 PyArmor 混淆构建
 
-构建环境：Windows Latest, Python 3.11, uv, Rust stable, FFmpeg, Inno Setup
+构建环境：Windows Latest, Python 3.11, uv, Rust stable, optional media tools, Inno Setup
+
+### 媒体工具依赖
+
+应用程序需要以下可选媒体工具用于视频预览和导出：
+
+- **mpv.exe** — 视频预览播放器
+- **VSPipe.exe** — VapourSynth 脚本处理器
+- **x264-7mod.exe** — 视频编码器
+- **mp4box.exe / lsmash-muxer.exe** — MP4 复用器
+
+**CI 构建：** 媒体工具通过 GitHub Actions Cache 自动管理
+- 首次运行：从当前仓库的 release `media-tools-v1.0` 下载并缓存（~2-3 分钟）
+- 后续运行：从缓存恢复（~0.5 秒）
+- 缓存每 7 天无活动后过期，下次运行自动重新下载
+
+**设置 CI 构建（一次性操作）：**
+创建 release 并上传媒体工具压缩包：
+```bash
+gh release create media-tools-v1.0 media-tools-v1.0.7z \
+  --title "Media Tools v1.0" \
+  --notes "媒体工具包：mpv, VSPipe, x264-7mod 等"
+```
+或通过网页：访问 `https://github.com/{你的用户名}/{你的仓库}/releases/new`，tag 填 `media-tools-v1.0`，上传 `media-tools-v1.0.7z` 文件。
+
+**本地开发：**
+1. 从本仓库 [Releases](../../releases/tag/media-tools-v1.0) 下载 `media-tools-v1.0.7z`（如已创建）
+2. 解压到项目根目录（会创建 `tools/media/` 目录）
+3. 验证安装：
+   ```bash
+   uv run python -c "from core.media_tools import MediaToolchain; print(MediaToolchain.discover())"
+   ```
+
+如果不需要视频功能，可以跳过此步骤。应用程序会在需要时提示缺少的工具。
 
 ## 开发说明
 
@@ -321,10 +359,10 @@ GitHub Actions 工作流位于 `.github/workflows/`：
 | 核心逻辑 | 服务模式、数据类模型 | `core/` |
 | 配置系统 | dataclass + Enum + JSON Schema | `config/` |
 | 扩展模块 | OAuth + PKCE、FIDO2、MTP | `_mext/` |
-| 模拟器 | Rust (egui + FFmpeg) | `simulator/` |
+| 模拟器 | Rust (egui) | `simulator/` |
 | IPC | Windows 命名管道 (JSON) | `simulator/src/ipc/` |
-| 视频处理 | PyAV + OpenGL + OpenCV (Python) + FFmpeg (Rust) | `core/`, `gui/widgets/`, `simulator/` |
-| 打包 | cx_Freeze + Inno Setup | `build.py` |
+| 视频处理 | mpv + VapourSynth/VSPipe + x264-7mod | `core/`, `gui/widgets/`, `simulator/` |
+| 打包 | cx_Freeze + Inno Setup + 可选 PyArmor 混淆 | `build.py` |
 | 依赖管理 | uv + pyproject.toml | `pyproject.toml` |
 | CI/CD | GitHub Actions | `.github/workflows/` |
 

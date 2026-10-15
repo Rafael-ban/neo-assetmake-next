@@ -26,7 +26,7 @@ class TimelineSlider(QWidget):
         self._out_point = 100
         self._dragging = False
 
-        # 拖拽节流：防止每像素触发昂贵的 FFmpeg seek
+        # 拖拽节流：防止每像素触发昂贵的 media seek
         self._pending_seek_frame = -1
         self._seek_timer = QTimer(self)
         self._seek_timer.setSingleShot(True)

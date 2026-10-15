@@ -1,13 +1,12 @@
 [project]
 name = "neo-assetmaker"
-version = "2.1.0"
+version = "2.1.5"
 description = "明日方舟通行证素材工具箱"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "PyQt6>=6.5.0",
     "PyQt6-Fluent-Widgets>=1.5.0",
-    "av>=12.0.0",
     "PyOpenGL>=3.1.0",
     "opencv-python>=4.8.0",
     "Pillow>=10.0.0",
@@ -21,8 +20,7 @@ dependencies = [
     "keyring>=25",
     "platformdirs>=4",
     "fido2>=2.1",
-    "scp>=0.15.0",
-    "cx-freeze>=7.2.10",
+    "pyusb>=1.3",
 ]
 
 [dependency-groups]

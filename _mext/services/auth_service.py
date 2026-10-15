@@ -23,6 +23,7 @@ from _mext.core.constants import (
     KEYRING_SERVICE_NAME,
     OAUTH_REDIRECT_HOST,
 )
+from _mext.core.worker_registry import WorkerRegistry
 from _mext.services.api_client import ApiClient, ApiError
 
 logger = logging.getLogger(__name__)
@@ -34,10 +35,20 @@ class _OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
     code: Optional[str] = None
     state: Optional[str] = None
     error: Optional[str] = None
+    expected_host: str = OAUTH_REDIRECT_HOST
+    expected_port: int = 0
+    expected_path: str = "/callback"
 
     def do_GET(self) -> None:  # noqa: N802
         """Handle GET request from the OAuth redirect."""
         parsed = urllib.parse.urlparse(self.path)
+        host = self.headers.get("Host", "")
+        expected_host = f"{_OAuthCallbackHandler.expected_host}:{_OAuthCallbackHandler.expected_port}"
+        if parsed.path != _OAuthCallbackHandler.expected_path or host != expected_host:
+            self.send_response(404)
+            self.end_headers()
+            return
+
         params = urllib.parse.parse_qs(parsed.query)
 
         _OAuthCallbackHandler.code = params.get("code", [None])[0]
@@ -81,11 +92,13 @@ class AuthService(QObject):
         self,
         api_client: ApiClient,
         config: Optional[Config] = None,
+        worker_registry: Optional[WorkerRegistry] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
         self._api = api_client
         self._config = config or get_config()
+        self._worker_registry = worker_registry
 
         self._access_token: Optional[str] = None
         self._user_info: Optional[dict[str, Any]] = None
@@ -241,10 +254,12 @@ class AuthService(QObject):
 
         if error:
             self.login_error.emit(f"OAuth error: {error}")
+            self._oauth_state = None
             return False
 
         if not code or state != self._oauth_state:
             self.login_error.emit("Invalid OAuth callback: state mismatch or missing code")
+            self._oauth_state = None
             return False
 
         # Send code + state to server for token exchange
@@ -257,16 +272,20 @@ class AuthService(QObject):
                 },
             )
             self._handle_token_response(data)
+            self._oauth_state = None
             return True
         except ApiError as exc:
             self.login_error.emit(f"Token exchange failed: {exc.detail}")
+            self._oauth_state = None
             return False
 
     def _start_callback_server(self) -> None:
         """Start the local HTTP server for OAuth callback."""
         self._stop_callback_server()
 
-        #
+        _OAuthCallbackHandler.expected_host = OAUTH_REDIRECT_HOST
+        _OAuthCallbackHandler.expected_port = self._config.oauth_redirect_port
+        _OAuthCallbackHandler.expected_path = "/callback"
         self._callback_server = http.server.HTTPServer(
             (OAUTH_REDIRECT_HOST, self._config.oauth_redirect_port),
             _OAuthCallbackHandler,
@@ -277,16 +296,24 @@ class AuthService(QObject):
             self._callback_server.handle_request()
 
         self._callback_thread = threading.Thread(target=serve, daemon=True)
+        if self._worker_registry is not None:
+            self._worker_registry.register_thread(self._callback_thread)
         self._callback_thread.start()
 
     def _stop_callback_server(self) -> None:
         """Stop the local OAuth callback server if running."""
+        callback_thread = self._callback_thread
         if self._callback_server is not None:
             try:
                 self._callback_server.server_close()
             except Exception:
                 pass
             self._callback_server = None
+
+        if callback_thread is not None and callback_thread is not threading.current_thread():
+            callback_thread.join(timeout=0.2)
+            if not callback_thread.is_alive() and self._worker_registry is not None:
+                self._worker_registry.unregister_thread(callback_thread)
         self._callback_thread = None
 
     # -- Token management --
@@ -355,12 +382,18 @@ class AuthService(QObject):
         """Start a background worker to restore session, avoiding UI freeze."""
         from _mext.services.api_worker import SessionRestoreWorker
 
-        self._restore_worker = SessionRestoreWorker(self, parent=self)
-        self._restore_worker.completed.connect(self._on_session_restored)
-        self._restore_worker.error.connect(
+        worker = SessionRestoreWorker(self, parent=self)
+        self._restore_worker = worker
+        if self._worker_registry is not None:
+            self._worker_registry.register_qthread(worker)
+            worker.finished.connect(
+                lambda: self._worker_registry.unregister_qthread(worker)
+            )
+        worker.completed.connect(self._on_session_restored)
+        worker.error.connect(
             lambda msg: logger.warning("Session restore failed: %s", msg)
         )
-        self._restore_worker.start()
+        worker.start()
 
     def _on_session_restored(self, success: bool) -> None:
         """Handle background session restore completion."""

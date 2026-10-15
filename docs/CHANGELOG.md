@@ -1,4 +1,34 @@
 # 更新日志
+
+### v2.1.5（测试预览版）
+
+**媒体链路预览重构**
+- 运行时移除 PyAV、Rust `ffmpeg-next`、FFmpeg SDK DLL、`ffmpeg.exe` 和 `ffprobe` 打包依赖。
+- 客户端视频预览和媒体元数据探测统一改为嵌入式 `mpv`，通过 JSON IPC 控制播放、暂停、跳帧、旋转并读取宽高、时长、帧率等属性。
+- 导出链路改为 `VSPipe -> x264-7mod -> MP4`，继续输出 `loop.mp4` / `intro.mp4`，EPConfig 文件格式不变。
+- x264-7mod 无法直出 MP4 时自动回退到 raw `.264` + MP4Box / lsmash-muxer 封装，并使用导出 FPS 保持时间轴一致。
+- 构建脚本和 GitHub Actions 改为发现并打包 `mpv.exe`、`VSPipe.exe`、`x264-7mod.exe`、`mp4box.exe`、`lsmash-muxer.exe` 或 `muxer.exe`。
+- 新增媒体打包、工具发现、mux fallback 和旧媒体栈残留扫描测试。
+
+### v2.1.4
+
+**素材论坛客户端接入与构建硬化**
+- 素材论坛 API 地址内置为 `http://192.168.31.199:5669`，不再通过 `MM_API_BASE_URL`、项目 `.env` 或用户配置目录 `.env` 覆盖，避免污染系统环境变量。
+- 设置页中的服务器地址改为只读展示，业务判断统一使用 `_mext.core.constants.API_BASE_URL`。
+- 修复侧边栏打开素材论坛时访问不存在的 `MainWindow._settings` 导致初始化失败的问题，插件上下文改为从当前 `user_settings.json` 读取。
+- 构建脚本新增 `--obfuscate`，发布构建会先使用 PyArmor 混淆 `main.py`、`core/`、`config/`、`utils/` 和 `_mext/`，并校验输出包与 `pyarmor_runtime_*` 存在后再交给 cx_Freeze。
+- GitHub Actions 手动构建支持选择是否混淆，release 构建默认启用混淆。
+- 新增回归测试覆盖论坛上下文、API 内置策略、根目录 `.env` 覆盖防护和 PyArmor 输出校验。
+
+### v2.1.3
+
+**远程管理迁移到 EPass RNDIS HTTP**
+- 远程管理主链路从 SSH/SCP 改为 `EPass RNDIS Remote NDIS Compatible Device` + HTTP API。
+- 不再需要配置远程 IP、端口、用户名、密码或 SSH 远程路径；客户端固定访问 `http://192.168.137.2/`。
+- 新增 RNDIS 网卡检测、设备 health 协议校验、路由 ifIndex 校验和设置页“检测设备”入口。
+- 素材下载改为安全解压，拒绝 zip slip、绝对路径、盘符路径和超限压缩包。
+- 删除旧 SSH 远程管理代码和 `scp` 运行依赖，避免旧远程执行能力继续进入发布包。
+- CI 增加 Python 单元测试、Rust 测试和 `requests` 打包 smoke 检查。
 ### v2.1.2
 - 删除部分无用参数，优化编码使其更贴合使用环境。
 ### v2.1.1

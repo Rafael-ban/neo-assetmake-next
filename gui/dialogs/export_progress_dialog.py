@@ -20,6 +20,7 @@ class ExportProgressDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._is_completed = False
+        self._was_successful = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -61,6 +62,7 @@ class ExportProgressDialog(QDialog):
     def set_completed(self, success: bool, message: str):
         """设置完成状态"""
         self._is_completed = True
+        self._was_successful = success
         self.progress_bar.setValue(100 if success else self.progress_bar.value())
         self.label_status.setText("导出完成!" if success else "导出失败")
         self.label_detail.setText(message)
@@ -71,6 +73,10 @@ class ExportProgressDialog(QDialog):
             self.export_success_signal.emit(success)
         else:
             self.label_status.setStyleSheet("color: red;")
+
+    @property
+    def was_successful(self) -> bool:
+        return self._was_successful
 
     def _on_action_clicked(self):
         """按钮点击"""

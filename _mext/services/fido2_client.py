@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import platform
+import threading
 from typing import Any, Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal as Signal
@@ -38,14 +39,30 @@ class Fido2UserInteraction(QObject):
     pin_required = Signal(int)
     pin_provided = Signal(str)
 
+    # How long request_pin() blocks waiting for the UI to supply a PIN.
+    _PIN_WAIT_TIMEOUT = 120.0
+
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._pending_pin: Optional[str] = None
+        # request_pin() runs inside the fido2 worker's QThread.run(), which has
+        # no Qt event loop, so pin_provided cannot be delivered there. Block on a
+        # threading.Event that provide_pin() sets from the GUI thread instead.
+        self._pin_event = threading.Event()
         self.pin_provided.connect(self._on_pin_provided)
 
     def _on_pin_provided(self, pin: str) -> None:
-        """Slot to receive PIN from the UI."""
+        """Slot for the pin_provided signal (Qt path); delegates to provide_pin."""
+        self.provide_pin(pin)
+
+    def provide_pin(self, pin: Optional[str]) -> None:
+        """Deliver a UI-entered PIN to the blocked request_pin() call.
+
+        Thread-safe: sets the pending value and wakes request_pin() via the
+        threading.Event, independent of any Qt event loop.
+        """
         self._pending_pin = pin
+        self._pin_event.set()
 
     def prompt_up(self) -> None:
         """Called by fido2 library when user presence is needed."""
@@ -53,19 +70,22 @@ class Fido2UserInteraction(QObject):
         self.touch_required.emit()
 
     def request_pin(self, permissions: Any, rp_id: Optional[str] = None) -> Optional[str]:
-        """Called by fido2 library when a PIN is needed.
+        """Called by fido2 when a PIN is needed; blocks until the UI supplies one.
 
-        Emits ``pin_required`` and blocks until ``pin_provided`` delivers
-        the value. In a real integration the UI dialog would call
-        ``pin_provided.emit(pin)`` after the user types the PIN.
+        Emits ``pin_required`` then blocks on a threading.Event until
+        ``provide_pin`` is called (or the timeout elapses). Returning ``None``
+        is fido2's documented "user cancelled" contract.
         """
         logger.info("FIDO2: PIN requested (rp_id=%s)", rp_id)
         self._pending_pin = None
+        self._pin_event.clear()
         self.pin_required.emit(8)  # Default max retries as hint
 
-        # In production this would use QEventLoop or a threading.Event
-        # to block until the UI provides the PIN. For now return the
-        # pending value which the worker thread will wait for.
+        if not self._pin_event.wait(self._PIN_WAIT_TIMEOUT):
+            logger.warning(
+                "FIDO2: PIN entry timed out after %.0fs", self._PIN_WAIT_TIMEOUT
+            )
+            return None
         return self._pending_pin
 
     def request_uv(self, permissions: Any, rp_id: Optional[str] = None) -> bool:
@@ -131,13 +151,17 @@ class Fido2ClientWrapper:
         # Try Windows native client first
         if system == "Windows" and not _is_windows_admin():
             try:
-                from fido2.win_api import WindowsClient
+                # fido2 2.x moved WindowsClient to fido2.client.windows; the old
+                # top-level fido2.win_api module no longer exists.
+                from fido2.client.windows import WindowsClient
+                from fido2.client import DefaultClientDataCollector
 
                 if WindowsClient.is_available():
                     logger.info("Using WindowsClient (native Windows Hello)")
-                    return WindowsClient(self._origin)
-            except ImportError:
-                logger.debug("WindowsClient not available, falling back to HID")
+                    return WindowsClient(DefaultClientDataCollector(self._origin))
+            except ImportError as exc:
+                # Log at warning so a broken native path is not silently invisible.
+                logger.warning("WindowsClient unavailable, falling back to HID: %s", exc)
 
         # HID-based client (macOS, Linux, or Windows admin/fallback)
         devices = self._discover_devices()
@@ -146,7 +170,7 @@ class Fido2ClientWrapper:
                 "No FIDO2 security key detected. Please insert your security key and try again."
             )
 
-        from fido2.client import Fido2Client, UserInteraction
+        from fido2.client import Fido2Client, UserInteraction, DefaultClientDataCollector
 
         # Create a bridge adapter matching the fido2 UserInteraction protocol
         class _InteractionBridge(UserInteraction):
@@ -163,9 +187,12 @@ class Fido2ClientWrapper:
                 return self._handler.request_uv(permissions, rp_id)
 
         device = devices[0]
+        # fido2 2.x: the 2nd argument is a ClientDataCollector, not the origin
+        # string. DefaultClientDataCollector wraps the origin and implements
+        # collect_client_data(), which the client calls internally.
         client = Fido2Client(
             device,
-            self._origin,
+            DefaultClientDataCollector(self._origin),
             user_interaction=_InteractionBridge(self._interaction),
         )
         return client
@@ -229,11 +256,15 @@ class Fido2ClientWrapper:
 
         result = client.make_credential(creation_options)
 
+        # fido2 2.x: make_credential returns a RegistrationResponse; the
+        # attestation payload lives on .response (AuthenticatorAttestationResponse).
+        attestation = result.response
+
         # Serialize for transport back to server
         attestation_object = (
-            base64.urlsafe_b64encode(result.attestation_object).rstrip(b"=").decode("ascii")
+            base64.urlsafe_b64encode(attestation.attestation_object).rstrip(b"=").decode("ascii")
         )
-        client_data = base64.urlsafe_b64encode(result.client_data).rstrip(b"=").decode("ascii")
+        client_data = base64.urlsafe_b64encode(attestation.client_data).rstrip(b"=").decode("ascii")
 
         return {
             "attestationObject": attestation_object,
@@ -291,13 +322,17 @@ class Fido2ClientWrapper:
         result = client.get_assertion(request_options)
         assertion = result.get_response(0)
 
+        # fido2 2.x: get_response returns an AuthenticationResponse; the assertion
+        # payload lives on .response, and the credential id is raw_id (there is no
+        # credential_id attribute).
+        response = assertion.response
         authenticator_data = (
-            base64.urlsafe_b64encode(assertion.authenticator_data).rstrip(b"=").decode("ascii")
+            base64.urlsafe_b64encode(response.authenticator_data).rstrip(b"=").decode("ascii")
         )
-        signature = base64.urlsafe_b64encode(assertion.signature).rstrip(b"=").decode("ascii")
-        client_data = base64.urlsafe_b64encode(assertion.client_data).rstrip(b"=").decode("ascii")
+        signature = base64.urlsafe_b64encode(response.signature).rstrip(b"=").decode("ascii")
+        client_data = base64.urlsafe_b64encode(response.client_data).rstrip(b"=").decode("ascii")
         credential_id = (
-            base64.urlsafe_b64encode(assertion.credential_id).rstrip(b"=").decode("ascii")
+            base64.urlsafe_b64encode(assertion.raw_id).rstrip(b"=").decode("ascii")
         )
 
         return {

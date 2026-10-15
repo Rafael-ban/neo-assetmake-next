@@ -7,7 +7,6 @@ and text content.
 
 from __future__ import annotations
 
-import math
 from typing import Any, Optional
 
 from qfluentwidgets import (
@@ -20,7 +19,6 @@ from qfluentwidgets import (
     PillPushButton,
     ToolButton,
     TransparentTogglePushButton,
-    isDarkTheme,
 )
 from PyQt6.QtCore import (
     QPropertyAnimation,
@@ -32,8 +30,6 @@ from PyQt6.QtGui import QColor, QFont, QPixmap
 from PyQt6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
-    QLabel,
-    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -41,10 +37,17 @@ from PyQt6.QtWidgets import (
 from _mext.models.material import Material
 from _mext.ui.styles import (
     AVATAR_SM,
+    COLOR_BG_ELEVATED,
+    COLOR_BG_SURFACE,
+    COLOR_BORDER,
     COLOR_PLACEHOLDER_BG,
+    COLOR_TEXT_MUTED,
+    COLOR_TEXT_SECONDARY,
     GALLERY_CARD_BORDER_RADIUS,
+    SPACING_MD,
     SPACING_SM,
     SPACING_XS,
+    apply_themed_style,
     pick,
 )
 
@@ -87,12 +90,15 @@ class GalleryCard(ElevatedCardWidget):
         self._hover_overlay: Optional[QWidget] = None
         self._hover_anim: Optional[QPropertyAnimation] = None
 
+        self.setObjectName("MaterialGalleryCard")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedWidth(self._DEFAULT_WIDTH)
         self.setBorderRadius(GALLERY_CARD_BORDER_RADIUS)
 
         self._setup_ui()
         self._populate()
         self._setup_hover_overlay()
+        self._apply_styles()
 
     def _compute_image_height(self, width: int) -> int:
         """Compute preview image height from aspect ratio."""
@@ -105,11 +111,12 @@ class GalleryCard(ElevatedCardWidget):
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, SPACING_SM)
+        layout.setContentsMargins(0, 0, 0, SPACING_MD)
         layout.setSpacing(0)
 
         # Preview image
         self._image_container = QWidget(self)
+        self._image_container.setObjectName("GalleryCardImageContainer")
         self._image_container.setFixedHeight(self._image_height)
         img_layout = QVBoxLayout(self._image_container)
         img_layout.setContentsMargins(0, 0, 0, 0)
@@ -125,13 +132,14 @@ class GalleryCard(ElevatedCardWidget):
 
         # Info area
         info_widget = QWidget(self)
+        info_widget.setObjectName("GalleryCardInfo")
         info_layout = QVBoxLayout(info_widget)
-        info_layout.setContentsMargins(SPACING_SM + 2, SPACING_SM, SPACING_SM + 2, 0)
-        info_layout.setSpacing(SPACING_XS)
+        info_layout.setContentsMargins(SPACING_MD, SPACING_SM, SPACING_MD, 0)
+        info_layout.setSpacing(SPACING_SM)
 
         # Creator row: [avatar 24px] creator_name ... [fav btn]
         creator_row = QHBoxLayout()
-        creator_row.setSpacing(6)
+        creator_row.setSpacing(SPACING_XS + 2)
 
         self._avatar_widget = AvatarWidget(self)
         self._avatar_widget.setRadius(AVATAR_SM // 2)
@@ -140,12 +148,14 @@ class GalleryCard(ElevatedCardWidget):
         creator_row.addWidget(self._avatar_widget)
 
         self._creator_label = CaptionLabel("", self)
+        self._creator_label.setObjectName("GalleryCardCreatorLabel")
         self._creator_label.setCursor(Qt.CursorShape.PointingHandCursor)
         self._creator_label.mousePressEvent = self._on_creator_area_clicked
         creator_row.addWidget(self._creator_label, stretch=1)
 
         self._fav_btn = TransparentTogglePushButton(FluentIcon.HEART, self)
-        self._fav_btn.setFixedSize(24, 24)
+        self._fav_btn.setFixedSize(28, 28)
+        self._fav_btn.setToolTip("喜欢")
         self._fav_btn.setChecked(self._material.is_liked)
         self._fav_btn.toggled.connect(self._on_favorite_toggled)
         creator_row.addWidget(self._fav_btn)
@@ -154,8 +164,10 @@ class GalleryCard(ElevatedCardWidget):
 
         # Title (max 2 lines)
         self._title_label = BodyLabel("", self)
+        self._title_label.setObjectName("GalleryCardTitle")
         self._title_label.setWordWrap(True)
-        self._title_label.setMaximumHeight(40)  # ~2 lines
+        self._title_label.setMinimumHeight(38)
+        self._title_label.setMaximumHeight(42)  # ~2 lines
         font = self._title_label.font()
         font.setWeight(QFont.Weight.DemiBold)
         self._title_label.setFont(font)
@@ -173,6 +185,7 @@ class GalleryCard(ElevatedCardWidget):
         bottom_row.addStretch()
 
         self._stats_label = CaptionLabel("", self)
+        self._stats_label.setObjectName("GalleryCardStats")
         bottom_row.addWidget(self._stats_label)
 
         info_layout.addLayout(bottom_row)
@@ -185,6 +198,7 @@ class GalleryCard(ElevatedCardWidget):
         self._title_label.setText(m.name)
         self._title_label.setToolTip(m.name)
         self._creator_label.setText(m.operator_name or "Unknown")
+        self._creator_label.setToolTip(m.operator_name or "Unknown")
         self._category_pill.setText(m.category.display_name)
 
         # Stats: downloads
@@ -192,11 +206,11 @@ class GalleryCard(ElevatedCardWidget):
         if m.download_count > 0:
             count = m.download_count
             if count >= 1000:
-                stats_parts.append(f"\u2b07{count / 1000:.1f}k")
+                stats_parts.append(f"↓ {count / 1000:.1f}k")
             else:
-                stats_parts.append(f"\u2b07{count}")
+                stats_parts.append(f"↓ {count}")
         if m.like_count > 0:
-            stats_parts.append(f"\u2661{m.like_count}")
+            stats_parts.append(f"♡ {m.like_count}")
         self._stats_label.setText("  ".join(stats_parts))
 
         # Placeholder preview image
@@ -224,24 +238,31 @@ class GalleryCard(ElevatedCardWidget):
         overlay_layout.setSpacing(12)
 
         btn_style = (
-            "ToolButton { background: rgba(255,255,255,0.2); border-radius: 16px; }"
-            "ToolButton:hover { background: rgba(255,255,255,0.35); }"
+            "ToolButton {"
+            " background: rgba(255,255,255,0.22);"
+            " border: 1px solid rgba(255,255,255,0.28);"
+            " border-radius: 17px;"
+            "}"
+            "ToolButton:hover { background: rgba(255,255,255,0.36); }"
         )
 
         preview_btn = ToolButton(FluentIcon.ZOOM, self._hover_overlay)
-        preview_btn.setFixedSize(32, 32)
+        preview_btn.setFixedSize(34, 34)
+        preview_btn.setToolTip("查看详情")
         preview_btn.setStyleSheet(btn_style)
         preview_btn.clicked.connect(lambda: self.clicked.emit(self._material.id))
         overlay_layout.addWidget(preview_btn)
 
         download_btn = ToolButton(FluentIcon.DOWNLOAD, self._hover_overlay)
-        download_btn.setFixedSize(32, 32)
+        download_btn.setFixedSize(34, 34)
+        download_btn.setToolTip("下载")
         download_btn.setStyleSheet(btn_style)
         download_btn.clicked.connect(self._on_download_clicked)
         overlay_layout.addWidget(download_btn)
 
         fav_btn = ToolButton(FluentIcon.HEART, self._hover_overlay)
-        fav_btn.setFixedSize(32, 32)
+        fav_btn.setFixedSize(34, 34)
+        fav_btn.setToolTip("喜欢")
         fav_btn.setStyleSheet(btn_style)
         fav_btn.clicked.connect(lambda: self._fav_btn.toggle())
         overlay_layout.addWidget(fav_btn)
@@ -278,9 +299,9 @@ class GalleryCard(ElevatedCardWidget):
         # image + info padding + creator row + title (~2 lines) + bottom row
         info_height = (
             SPACING_SM           # top margin
-            + AVATAR_SM + 4      # creator row
-            + 40                 # title (2 lines max)
-            + 20 + SPACING_SM    # bottom row + bottom margin
+            + 28                 # creator row
+            + 42                 # title (2 lines max)
+            + 22 + SPACING_MD    # bottom row + bottom margin
         )
         return QSize(w, self._image_height + info_height)
 
@@ -357,11 +378,11 @@ class GalleryCard(ElevatedCardWidget):
         if m.download_count > 0:
             count = m.download_count
             if count >= 1000:
-                parts.append(f"\u2b07{count / 1000:.1f}k")
+                parts.append(f"↓ {count / 1000:.1f}k")
             else:
-                parts.append(f"\u2b07{count}")
+                parts.append(f"↓ {count}")
         if m.like_count > 0:
-            parts.append(f"\u2661{m.like_count}")
+            parts.append(f"♡ {m.like_count}")
         self._stats_label.setText("  ".join(parts))
 
     @property
@@ -373,3 +394,51 @@ class GalleryCard(ElevatedCardWidget):
     def avatar_cache_key(self) -> str:
         """Cache key for the creator avatar."""
         return f"avatar_{self._material.creator_id or self._material.operator_name}"
+
+    def _apply_styles(self) -> None:
+        """Apply stable product surface styling without changing behavior."""
+        light_qss = f"""
+        QWidget#MaterialGalleryCard {{
+            background-color: {COLOR_BG_ELEVATED[0]};
+            border: 1px solid {COLOR_BORDER[0]};
+            border-radius: {GALLERY_CARD_BORDER_RADIUS}px;
+        }}
+        QWidget#MaterialGalleryCard:hover {{
+            border: 1px solid {COLOR_TEXT_MUTED[0]};
+        }}
+        QWidget#GalleryCardImageContainer {{
+            background-color: {COLOR_BG_SURFACE[0]};
+            border-top-left-radius: {GALLERY_CARD_BORDER_RADIUS}px;
+            border-top-right-radius: {GALLERY_CARD_BORDER_RADIUS}px;
+        }}
+        CaptionLabel#GalleryCardCreatorLabel,
+        CaptionLabel#GalleryCardStats {{
+            color: {COLOR_TEXT_SECONDARY[0]};
+        }}
+        BodyLabel#GalleryCardTitle {{
+            color: {COLOR_TEXT_SECONDARY[0]};
+        }}
+        """
+        dark_qss = f"""
+        QWidget#MaterialGalleryCard {{
+            background-color: {COLOR_BG_ELEVATED[1]};
+            border: 1px solid {COLOR_BORDER[1]};
+            border-radius: {GALLERY_CARD_BORDER_RADIUS}px;
+        }}
+        QWidget#MaterialGalleryCard:hover {{
+            border: 1px solid {COLOR_TEXT_MUTED[1]};
+        }}
+        QWidget#GalleryCardImageContainer {{
+            background-color: {COLOR_BG_SURFACE[1]};
+            border-top-left-radius: {GALLERY_CARD_BORDER_RADIUS}px;
+            border-top-right-radius: {GALLERY_CARD_BORDER_RADIUS}px;
+        }}
+        CaptionLabel#GalleryCardCreatorLabel,
+        CaptionLabel#GalleryCardStats {{
+            color: {COLOR_TEXT_SECONDARY[1]};
+        }}
+        BodyLabel#GalleryCardTitle {{
+            color: {COLOR_TEXT_SECONDARY[1]};
+        }}
+        """
+        apply_themed_style(self, light_qss, dark_qss)

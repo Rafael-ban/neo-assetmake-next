@@ -7,13 +7,21 @@ changes.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal as Signal
 
 from _mext.core.config import Config, get_config
+from _mext.core.worker_registry import WorkerRegistry
 
 if TYPE_CHECKING:
+    from _mext.repositories import (
+        AuthRepository,
+        CommentRepository,
+        DownloadRepository,
+        MaterialRepository,
+        UserRepository,
+    )
     from _mext.services.api_client import ApiClient
     from _mext.services.auth_service import AuthService
     from _mext.services.download_engine import DownloadEngine
@@ -55,6 +63,12 @@ class ServiceManager(QObject):
         self._auth_service: Optional[AuthService] = None
         self._download_engine: Optional[DownloadEngine] = None
         self._fido2_client: Optional[Fido2ClientWrapper] = None
+        self._auth_repository: Optional[AuthRepository] = None
+        self._comment_repository: Optional[CommentRepository] = None
+        self._download_repository: Optional[DownloadRepository] = None
+        self._material_repository: Optional[MaterialRepository] = None
+        self._user_repository: Optional[UserRepository] = None
+        self._worker_registry = WorkerRegistry()
 
         self._is_shutdown = False
 
@@ -64,6 +78,22 @@ class ServiceManager(QObject):
     def config(self) -> Config:
         """Return the application configuration."""
         return self._config
+
+    @property
+    def worker_registry(self) -> WorkerRegistry:
+        """Return the extension worker registry."""
+        return self._worker_registry
+
+    def track_qthread(self, thread: Any) -> Any:
+        """Track a QThread-like worker until it emits ``finished``."""
+        self._worker_registry.register_qthread(thread)
+        finished = getattr(thread, "finished", None)
+        if finished is not None:
+            try:
+                finished.connect(lambda: self._worker_registry.unregister_qthread(thread))
+            except Exception:
+                pass
+        return thread
 
     @property
     def api_client(self) -> ApiClient:
@@ -83,6 +113,7 @@ class ServiceManager(QObject):
             self._auth_service = AuthService(
                 api_client=self.api_client,
                 config=self._config,
+                worker_registry=self._worker_registry,
             )
             # Wire auth signals
             self._auth_service.auth_changed.connect(self.auth_state_changed.emit)
@@ -97,6 +128,7 @@ class ServiceManager(QObject):
             self._download_engine = DownloadEngine(
                 api_client=self.api_client,
                 config=self._config,
+                worker_registry=self._worker_registry,
                 parent=self,
             )
             # Wire download signals
@@ -116,31 +148,80 @@ class ServiceManager(QObject):
             self._fido2_client = Fido2ClientWrapper(config=self._config)
         return self._fido2_client
 
+    @property
+    def auth_repository(self) -> AuthRepository:
+        """Return the authentication repository."""
+        if self._auth_repository is None:
+            from _mext.repositories import AuthRepository
+
+            self._auth_repository = AuthRepository(self.api_client)
+        return self._auth_repository
+
+    @property
+    def comment_repository(self) -> CommentRepository:
+        """Return the comment repository."""
+        if self._comment_repository is None:
+            from _mext.repositories import CommentRepository
+
+            self._comment_repository = CommentRepository(self.api_client)
+        return self._comment_repository
+
+    @property
+    def download_repository(self) -> DownloadRepository:
+        """Return the download repository."""
+        if self._download_repository is None:
+            from _mext.repositories import DownloadRepository
+
+            self._download_repository = DownloadRepository(self.api_client)
+        return self._download_repository
+
+    @property
+    def material_repository(self) -> MaterialRepository:
+        """Return the material repository."""
+        if self._material_repository is None:
+            from _mext.repositories import MaterialRepository
+
+            self._material_repository = MaterialRepository(self.api_client)
+        return self._material_repository
+
+    @property
+    def user_repository(self) -> UserRepository:
+        """Return the user repository."""
+        if self._user_repository is None:
+            from _mext.repositories import UserRepository
+
+            self._user_repository = UserRepository(self.api_client)
+        return self._user_repository
 
     # -- Lifecycle --
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_ms: int = 2000) -> bool:
         """Cleanly shut down all initialized services.
 
         Stops background threads, closes connections, and releases resources.
         Safe to call multiple times.
         """
         if self._is_shutdown:
-            return
+            return True
 
         self._is_shutdown = True
+        ok = True
 
         # Cancel active downloads
         if self._download_engine is not None:
-            self._download_engine.cancel_all()
+            ok = self._download_engine.shutdown(timeout_ms=timeout_ms) and ok
 
         # Logout / cleanup auth
         if self._auth_service is not None:
             self._auth_service.cleanup()
 
+        ok = self._worker_registry.shutdown(timeout_ms=timeout_ms) and ok
+
         # Close HTTP client
         if self._api_client is not None:
             self._api_client.close()
+
+        return ok
 
     @property
     def is_shutdown(self) -> bool:

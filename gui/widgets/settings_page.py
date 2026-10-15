@@ -4,11 +4,17 @@
 
 import os
 import logging
-
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QRegularExpressionValidator
+from PyQt6.QtCore import Qt, pyqtSignal, QRegularExpression
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
-
-from qfluentwidgets import ScrollArea, FluentIcon, SubtitleLabel, LineEdit
+from qfluentwidgets import (
+    InfoBar,
+    InfoBarPosition,
+    ScrollArea,
+    FluentIcon,
+    SubtitleLabel,
+    LineEdit,
+)
 from qfluentwidgets.components.settings import (
     SettingCard, SwitchSettingCard,
     PushSettingCard, PrimaryPushSettingCard,
@@ -35,6 +41,7 @@ class SettingsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._loading = False
+        self._rndis_test_worker = None
         self._init_ui()
         self._connect_signals()
 
@@ -134,48 +141,68 @@ class SettingsPage(QWidget):
         self.networkGroup.addSettingCards([
             self.githubAccelCard, self.proxyCard])
 
-        self.autoUploadGroup = SettingCardGroup("自动上传", self.scrollWidget)
-        self.sshIpAddressCard = LineEditSettingCard(
-            FluentIcon.EDIT,
-            "通行证SSH地址",
-            "",
-            defaultText="192.168.137.2",
-            parent=self.autoUploadGroup
+        self.autoUploadGroup = SettingCardGroup("设备远程连接", self.scrollWidget)
+        self.rndisTestCard = PushSettingCard(
+            "检测",
+            FluentIcon.WIFI,
+            "检测设备连接",
+            content="检测 EPass RNDIS 网卡和设备 HTTP health 接口",
+            parent=self.autoUploadGroup,
         )
-        self.sshPortCard = LineEditSettingCard(
-            FluentIcon.EDIT,
-            "通行证SSH端口",
-            "",
-            defaultText="22",
-            parent=self.autoUploadGroup
+        self.rndisInfoCard = SettingCard(
+            FluentIcon.WIFI,
+            "EPass RNDIS HTTP",
+            "通过 EPass RNDIS Remote NDIS Compatible Device 连接 "
+            "http://192.168.137.2/；素材目录固定为 /assets。",
+            parent=self.autoUploadGroup,
         )
-        self.sshUser = LineEditSettingCard(
-            FluentIcon.EDIT,
-            "通行证SSH用户",
-            "",
-            defaultText="root",
-            parent=self.autoUploadGroup
-        )
-        self.sshPassword = LineEditSettingCard(
-            FluentIcon.EDIT,
-            "通行证SSH密码",
-            "",
-            defaultText="toor",
-            parent=self.autoUploadGroup
-        )
-        self.sshDefaultUploadPath = LineEditSettingCard(
-            FluentIcon.FOLDER,
-            "通行证SSH上传路径",
-            "",
-            defaultText="/assets/",
-            parent=self.autoUploadGroup
-        )
-        self.sshAutoRestartProgram = SwitchSettingCard(
+        self.remoteAutoRestartProgram = SwitchSettingCard(
             FluentIcon.SYNC,
-            "上传完毕后自动重启通行证程序",
+            "上传完毕后自动重启 DrmApp",
             parent=self.autoUploadGroup)
-        self.autoUploadGroup.addSettingCards([self.sshIpAddressCard, self.sshPortCard, self.sshUser,
-                                              self.sshPassword, self.sshDefaultUploadPath, self.sshAutoRestartProgram])
+        self.autoUploadGroup.addSettingCards([
+            self.rndisTestCard,
+            self.rndisInfoCard,
+            self.remoteAutoRestartProgram,
+        ])
+
+        self.usbControler = SettingCardGroup(
+            "USB ePass 设备管理器", self.scrollWidget)
+        # USB VID
+        self.usbControlerVID = LineEditSettingCard(
+            FluentIcon.SETTING,
+            "USB VID",
+            "输入 USB Vendor ID（4位HEX，默认1d6b）"
+        )
+        self.usbControlerVID.lineEdit.setPlaceholderText("1d6b")
+        self.usbControlerVID.lineEdit.setText("0203")
+        self.usbControlerVID.lineEdit.setValidator(
+            QRegularExpressionValidator(
+                QRegularExpression("[0-9A-Fa-f]{0,4}")
+            )
+        )
+        # USB PID
+        self.usbControlerPID = LineEditSettingCard(
+            FluentIcon.SETTING,
+            "USB PID",
+            "输入 USB Product ID（4位HEX，默认0203）"
+        )
+        self.usbControlerPID.lineEdit.setPlaceholderText("5678")
+        self.usbControlerPID.lineEdit.setText("5678")
+        self.usbControlerPID.lineEdit.setValidator(
+            QRegularExpressionValidator(
+                QRegularExpression("[0-9A-Fa-f]{0,4}")
+            )
+        )
+        self.usbControlerAutoRestartProgram = SwitchSettingCard(
+            FluentIcon.SYNC,
+            "USB 上传完毕后自动重启 DrmApp",
+            parent=self.usbControler)
+        self.usbControler.addSettingCards([
+            self.usbControlerVID,
+            self.usbControlerPID,
+            self.usbControlerAutoRestartProgram,
+        ])
 
         self.aboutGroup = SettingCardGroup("关于", self.scrollWidget)
 
@@ -186,9 +213,9 @@ class SettingsPage(QWidget):
             "检查更新", FluentIcon.UPDATE, "检查更新",
             content="检查是否有新版本可用", parent=self.aboutGroup)
 
-        from config.constants import APP_NAME, APP_VERSION
+        from config.constants import APP_NAME, APP_VERSION_LABEL
         self.aboutCard = SettingCard(
-            FluentIcon.INFO, f"{APP_NAME} v{APP_VERSION}",
+            FluentIcon.INFO, f"{APP_NAME} v{APP_VERSION_LABEL}",
             "明日方舟通行证素材制作器\n"
             "作者: Rafael_ban & 初微弦音 & 涙不在为你而流 & 蓝屏的此电脑-PULLUP\n"
             "© 2026 罗德岛工程部",
@@ -198,7 +225,7 @@ class SettingsPage(QWidget):
             self.shortcutsCard, self.updateCard, self.aboutCard])
 
         for group in [self.appGroup, self.uiGroup, self.personalGroup,
-                      self.videoGroup, self.networkGroup, self.autoUploadGroup, self.aboutGroup]:
+                      self.videoGroup, self.networkGroup, self.autoUploadGroup, self.usbControler, self.aboutGroup]:
             self.scrollLayout.addWidget(group)
 
         self.scrollLayout.addStretch(1)
@@ -242,18 +269,16 @@ class SettingsPage(QWidget):
         self.proxyCard.checkedChanged.connect(
             lambda v: self._emit('use_proxy', v))
 
-        self.sshIpAddressCard.textChanged.connect(
-            lambda v: self._emit('ssh_ip_address', v))
-        self.sshPortCard.textChanged.connect(
-            lambda v: self._emit('ssh_port', v))
-        self.sshUser.textChanged.connect(
-            lambda v: self._emit('ssh_user', v))
-        self.sshPassword.textChanged.connect(
-            lambda v: self._emit('ssh_password', v))
-        self.sshDefaultUploadPath.textChanged.connect(
-            lambda v: self._emit('ssh_default_upload_path', v))
-        self.sshAutoRestartProgram.checkedChanged.connect(
-            lambda v: self._emit('ssh_auto_restart_program', v))
+        self.remoteAutoRestartProgram.checkedChanged.connect(
+            lambda v: self._emit('remote_auto_restart_program', v))
+        self.rndisTestCard.clicked.connect(self._on_test_rndis_connection)
+
+        self.usbControlerVID.textChanged.connect(
+            lambda v: self._emit('usb_controler_vid', v))
+        self.usbControlerPID.textChanged.connect(
+            lambda v: self._emit('usb_controler_pid', v))
+        self.usbControlerAutoRestartProgram.checkedChanged.connect(
+            lambda v: self._emit('usb_controler_auto_restart_program', v))
 
         self.shortcutsCard.clicked.connect(self.show_shortcuts_requested)
         self.updateCard.clicked.connect(self.check_update_requested)
@@ -302,26 +327,55 @@ class SettingsPage(QWidget):
             self.proxyCard.setChecked(
                 settings.get('use_proxy', False))
 
-            self.sshIpAddressCard.setText(
-                settings.get('ssh_ip_address', "192.168.137.2")
+            self.remoteAutoRestartProgram.setChecked(
+                settings.get(
+                    'remote_auto_restart_program',
+                    settings.get('ssh_auto_restart_program', True),
+                )
             )
-            self.sshPortCard.setText(
-                settings.get('ssh_port', "22")
-            )
-            self.sshUser.setText(
-                settings.get('ssh_user', "root")
-            )
-            self.sshPassword.setText(
-                settings.get('ssh_password', "toor")
-            )
-            self.sshDefaultUploadPath.setText(
-                settings.get('ssh_default_upload_path', "/assets/")
-            )
-            self.sshAutoRestartProgram.setChecked(
-                settings.get('ssh_auto_restart_program', True)
-            )
+
+            self.usbControlerVID.setText(
+                settings.get('usb_controler_vid', False))
+            self.usbControlerPID.setText(
+                settings.get('usb_controler_pid', False))
+            self.usbControlerAutoRestartProgram.setChecked(
+                settings.get('usb_controler_auto_restart_program', False))
         finally:
             self._loading = False
+
+    def _on_test_rndis_connection(self):
+        if self._rndis_test_worker and self._rndis_test_worker.isRunning():
+            return
+
+        from gui.workers.rndis_http_workers import RndisConnectWorker
+
+        self.rndisTestCard.setEnabled(False)
+        self._rndis_test_worker = RndisConnectWorker(parent=self)
+        self._rndis_test_worker.connect_succeeded.connect(
+            self._on_rndis_test_success)
+        self._rndis_test_worker.connect_failed.connect(
+            self._on_rndis_test_failed)
+        self._rndis_test_worker.start()
+
+    def _on_rndis_test_success(self, data: dict):
+        self.rndisTestCard.setEnabled(True)
+        InfoBar.success(
+            "检测成功",
+            f"设备 HTTP API 可用：{data.get('base_url', 'http://192.168.137.2')}",
+            parent=self,
+            position=InfoBarPosition.TOP,
+            duration=4000,
+        )
+
+    def _on_rndis_test_failed(self, error: str):
+        self.rndisTestCard.setEnabled(True)
+        InfoBar.error(
+            "检测失败",
+            str(error),
+            parent=self,
+            position=InfoBarPosition.TOP,
+            duration=6000,
+        )
 
 
 class LineEditSettingCard(SettingCard):

@@ -29,23 +29,34 @@ from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QScrollArea,
-    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from _mext.core.service_manager import ServiceManager
 from _mext.models.comment import Comment
-from _mext.services.api_worker import CommentDeleteWorker, CommentPostWorker, CommentsLoadWorker
+from _mext.services.api_worker import (
+    CommentDeleteWorker,
+    CommentPostWorker,
+    CommentsLoadWorker,
+)
 from _mext.ui.components.thumbnail_loader import ThumbnailLoader
 from _mext.ui.styles import (
     AVATAR_MD,
+    COLOR_BG_ELEVATED,
+    COLOR_BG_INSET,
+    COLOR_BORDER,
+    COLOR_TEXT_MUTED,
+    COLOR_TEXT_SECONDARY,
     COMMENT_BUBBLE_PADDING,
     COMMENT_INPUT_MAX_HEIGHT,
     COMMENT_INPUT_MIN_HEIGHT,
+    GALLERY_CARD_BORDER_RADIUS,
+    SPACING_LG,
     SPACING_MD,
     SPACING_SM,
     SPACING_XS,
+    apply_themed_style,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,11 +70,19 @@ class _CommentBubble(QWidget):
     def __init__(self, comment: Comment, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._comment = comment
+        self.setObjectName("CommentBubble")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._setup_ui()
+        self._apply_styles()
 
     def _setup_ui(self) -> None:
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, COMMENT_BUBBLE_PADDING, 0, COMMENT_BUBBLE_PADDING)
+        layout.setContentsMargins(
+            SPACING_MD,
+            COMMENT_BUBBLE_PADDING,
+            SPACING_MD,
+            COMMENT_BUBBLE_PADDING,
+        )
         layout.setSpacing(SPACING_SM)
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
@@ -81,17 +100,20 @@ class _CommentBubble(QWidget):
         header_row.setSpacing(SPACING_SM)
 
         name_label = StrongBodyLabel(self._comment.username, self)
+        name_label.setObjectName("CommentAuthorLabel")
         header_row.addWidget(name_label)
 
         time_str = self._format_time(self._comment.created_at)
         time_label = CaptionLabel(time_str, self)
+        time_label.setObjectName("CommentTimeLabel")
         header_row.addWidget(time_label)
 
         header_row.addStretch()
 
         if self._comment.is_own:
             delete_btn = ToolButton(FluentIcon.DELETE, self)
-            delete_btn.setFixedSize(20, 20)
+            delete_btn.setFixedSize(28, 28)
+            delete_btn.setToolTip("删除评论")
             delete_btn.clicked.connect(
                 lambda: self.delete_requested.emit(self._comment.id)
             )
@@ -101,10 +123,41 @@ class _CommentBubble(QWidget):
 
         # Comment text
         body = BodyLabel(self._comment.content, self)
+        body.setObjectName("CommentBodyLabel")
         body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         content_col.addWidget(body)
 
         layout.addLayout(content_col, stretch=1)
+
+    def _apply_styles(self) -> None:
+        light_qss = f"""
+        QWidget#CommentBubble {{
+            background-color: {COLOR_BG_ELEVATED[0]};
+            border: 1px solid {COLOR_BORDER[0]};
+            border-radius: {GALLERY_CARD_BORDER_RADIUS - 2}px;
+        }}
+        CaptionLabel#CommentTimeLabel {{
+            color: {COLOR_TEXT_MUTED[0]};
+        }}
+        BodyLabel#CommentBodyLabel {{
+            color: {COLOR_TEXT_SECONDARY[0]};
+        }}
+        """
+        dark_qss = f"""
+        QWidget#CommentBubble {{
+            background-color: {COLOR_BG_ELEVATED[1]};
+            border: 1px solid {COLOR_BORDER[1]};
+            border-radius: {GALLERY_CARD_BORDER_RADIUS - 2}px;
+        }}
+        CaptionLabel#CommentTimeLabel {{
+            color: {COLOR_TEXT_MUTED[1]};
+        }}
+        BodyLabel#CommentBodyLabel {{
+            color: {COLOR_TEXT_SECONDARY[1]};
+        }}
+        """
+        apply_themed_style(self, light_qss, dark_qss)
 
     @staticmethod
     def _format_time(dt: datetime) -> str:
@@ -160,26 +213,37 @@ class CommentSection(QWidget):
         self._thumb_loader = ThumbnailLoader(max_concurrent=3, parent=self)
         self._thumb_loader.thumbnail_ready.connect(self._on_avatar_ready)
 
+        self.setObjectName("CommentSection")
         self._setup_ui()
+        self._apply_styles()
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, SPACING_MD, 0, 0)
-        layout.setSpacing(SPACING_SM)
+        layout.setContentsMargins(0, SPACING_LG, 0, 0)
+        layout.setSpacing(SPACING_MD)
 
         # Header
         header_row = QHBoxLayout()
+        header_row.setSpacing(SPACING_XS)
         self._title = SubtitleLabel("评论", self)
         header_row.addWidget(self._title)
         self._count_label = CaptionLabel("", self)
+        self._count_label.setObjectName("CommentCountLabel")
         header_row.addWidget(self._count_label)
         header_row.addStretch()
         layout.addLayout(header_row)
 
         # Input area
         self._input_area = QWidget(self)
+        self._input_area.setObjectName("CommentInputArea")
+        self._input_area.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         input_layout = QHBoxLayout(self._input_area)
-        input_layout.setContentsMargins(0, 0, 0, 0)
+        input_layout.setContentsMargins(
+            SPACING_MD,
+            SPACING_MD,
+            SPACING_MD,
+            SPACING_MD,
+        )
         input_layout.setSpacing(SPACING_SM)
         input_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
@@ -197,6 +261,7 @@ class CommentSection(QWidget):
         self._send_btn.setIcon(FluentIcon.SEND_FILL)
         self._send_btn.setText("发送")
         self._send_btn.setFixedHeight(34)
+        self._send_btn.setMinimumWidth(76)
         self._send_btn.clicked.connect(self._on_send_clicked)
         input_layout.addWidget(self._send_btn, alignment=Qt.AlignmentFlag.AlignBottom)
 
@@ -210,11 +275,12 @@ class CommentSection(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self._comments_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._comments_scroll.setObjectName("CommentsScroll")
 
         self._comments_container = QWidget()
         self._comments_layout = QVBoxLayout(self._comments_container)
         self._comments_layout.setContentsMargins(0, 0, 0, 0)
-        self._comments_layout.setSpacing(0)
+        self._comments_layout.setSpacing(SPACING_SM)
         self._comments_layout.addStretch()
 
         self._comments_scroll.setWidget(self._comments_container)
@@ -222,15 +288,51 @@ class CommentSection(QWidget):
 
         # Load more button
         self._load_more_btn = PushButton("加载更多", self)
+        self._load_more_btn.setFixedHeight(34)
         self._load_more_btn.setVisible(False)
         self._load_more_btn.clicked.connect(self._load_more)
         layout.addWidget(self._load_more_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Empty state
         self._empty_label = CaptionLabel("暂无评论", self)
+        self._empty_label.setObjectName("CommentEmptyLabel")
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_label.setMinimumHeight(44)
         self._empty_label.setVisible(True)
         layout.addWidget(self._empty_label)
+
+    def _apply_styles(self) -> None:
+        light_qss = f"""
+        QWidget#CommentInputArea {{
+            background-color: {COLOR_BG_INSET[0]};
+            border: 1px solid {COLOR_BORDER[0]};
+            border-radius: {GALLERY_CARD_BORDER_RADIUS}px;
+        }}
+        QScrollArea#CommentsScroll {{
+            background: transparent;
+            border: none;
+        }}
+        CaptionLabel#CommentCountLabel,
+        CaptionLabel#CommentEmptyLabel {{
+            color: {COLOR_TEXT_MUTED[0]};
+        }}
+        """
+        dark_qss = f"""
+        QWidget#CommentInputArea {{
+            background-color: {COLOR_BG_INSET[1]};
+            border: 1px solid {COLOR_BORDER[1]};
+            border-radius: {GALLERY_CARD_BORDER_RADIUS}px;
+        }}
+        QScrollArea#CommentsScroll {{
+            background: transparent;
+            border: none;
+        }}
+        CaptionLabel#CommentCountLabel,
+        CaptionLabel#CommentEmptyLabel {{
+            color: {COLOR_TEXT_MUTED[1]};
+        }}
+        """
+        apply_themed_style(self, light_qss, dark_qss)
 
     # ── Public API ────────────────────────────────────────────
 
@@ -277,6 +379,7 @@ class CommentSection(QWidget):
         )
         self._load_worker.completed.connect(self._on_comments_loaded)
         self._load_worker.error.connect(self._on_comments_error)
+        self._services.track_qthread(self._load_worker)
         self._load_worker.start()
 
     def _load_more(self) -> None:
@@ -355,6 +458,7 @@ class CommentSection(QWidget):
         )
         self._post_worker.completed.connect(self._on_comment_posted)
         self._post_worker.error.connect(self._on_post_error)
+        self._services.track_qthread(self._post_worker)
         self._post_worker.start()
 
     @Slot(dict)
@@ -399,6 +503,7 @@ class CommentSection(QWidget):
             )
             self._delete_worker.completed.connect(self._on_comment_deleted)
             self._delete_worker.error.connect(self._on_delete_error)
+            self._services.track_qthread(self._delete_worker)
             self._delete_worker.start()
 
     @Slot(str)

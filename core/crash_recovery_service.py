@@ -9,6 +9,8 @@ from typing import Optional, List, Dict
 from dataclasses import dataclass
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from core.file_utils import atomic_write_json
+
 logger = logging.getLogger(__name__)
 
 
@@ -94,8 +96,7 @@ class CrashRecoveryService(QObject):
                 'is_temp': is_temp
             }
 
-            with open(recovery_path, 'w', encoding='utf-8') as f:
-                json.dump(recovery_data, f, indent=2, ensure_ascii=False)
+            atomic_write_json(recovery_path, recovery_data, indent=2)
 
             logger.info(f"恢复信息已保存: {recovery_path}")
 
@@ -143,8 +144,7 @@ class CrashRecoveryService(QObject):
             with open(recovery_info.backup_path, 'r', encoding='utf-8') as f:
                 backup_data = json.load(f)
 
-            with open(target_path, 'w', encoding='utf-8') as f:
-                json.dump(backup_data, f, indent=2, ensure_ascii=False)
+            atomic_write_json(target_path, backup_data, indent=2)
 
             logger.info(f"项目已恢复: {target_path}")
             self.recovery_completed.emit(target_path)

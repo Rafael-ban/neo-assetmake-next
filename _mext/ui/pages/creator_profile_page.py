@@ -166,6 +166,7 @@ class CreatorProfilePage(QWidget):
         )
         self._profile_worker.completed.connect(self._on_profile_loaded)
         self._profile_worker.error.connect(self._on_profile_error)
+        self._services.track_qthread(self._profile_worker)
         self._profile_worker.start()
 
         # Load works
@@ -207,6 +208,7 @@ class CreatorProfilePage(QWidget):
         )
         self._works_worker.completed.connect(self._on_works_loaded)
         self._works_worker.error.connect(self._on_works_error)
+        self._services.track_qthread(self._works_worker)
         self._works_worker.start()
 
     @Slot(list, int)

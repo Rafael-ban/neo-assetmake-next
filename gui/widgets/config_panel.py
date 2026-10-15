@@ -74,7 +74,7 @@ class ConfigPanel(QWidget):
     transition_image_changed = pyqtSignal(
         str, str
     )  # 过渡图片变更信号 (trans_type, abs_path)
-    ssh_upload_requested = pyqtSignal()  # SSH上传请求信号
+    remote_upload_requested = pyqtSignal()  # 远程上传请求信号
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -529,8 +529,8 @@ class ConfigPanel(QWidget):
         group_actions.addLayout(actions_layout)
         layout.addWidget(group_actions)
 
-        self.btn_sshUpload = PrimaryPushButton("一键上传")
-        actions_layout.addWidget(self.btn_sshUpload)
+        self.btn_remote_upload = PrimaryPushButton("一键上传")
+        actions_layout.addWidget(self.btn_remote_upload)
 
         layout.addStretch()
         return widget
@@ -597,7 +597,7 @@ class ConfigPanel(QWidget):
 
         self.btn_validate.clicked.connect(self.validate_requested.emit)
         self.btn_export.clicked.connect(self.export_requested.emit)
-        self.btn_sshUpload.clicked.connect(self.ssh_upload_requested.emit)
+        self.btn_remote_upload.clicked.connect(self.remote_upload_requested.emit)
 
     def set_config(self, config: EPConfig, base_dir: str = ""):
         """设置配置"""

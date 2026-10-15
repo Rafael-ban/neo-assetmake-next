@@ -2,14 +2,14 @@
 对话框模块
 """
 from gui.dialogs.export_progress_dialog import ExportProgressDialog
-from gui.dialogs.ssh_upload_progress_dialog import SshUploadProgressDialog
+from gui.dialogs.remote_upload_progress_dialog import RemoteUploadProgressDialog
 from gui.dialogs.welcome_dialog import WelcomeDialog
 from gui.dialogs.shortcuts_dialog import ShortcutsDialog
 from gui.dialogs.update_dialog import UpdateDialog
 
 __all__ = [
     'ExportProgressDialog',
-    'SshUploadProgressDialog',
+    'RemoteUploadProgressDialog',
     'WelcomeDialog',
     'ShortcutsDialog',
     'UpdateDialog',

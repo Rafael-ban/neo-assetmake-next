@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import threading
 from pathlib import Path
 from typing import Optional
@@ -135,7 +136,7 @@ class DownloadWorker(QRunnable):
         import httpx
 
         headers: dict[str, str] = {}
-        if self.api_client.access_token:
+        if self.api_client.access_token and self.api_client.should_send_auth_to(self.url):
             headers["Authorization"] = f"Bearer {self.api_client.access_token}"
         if self._resume_offset > 0:
             headers["Range"] = f"bytes={self._resume_offset}-"
@@ -155,7 +156,7 @@ class DownloadWorker(QRunnable):
 
         mode = "ab" if self._resume_offset > 0 else "wb"
 
-        with httpx.Client(follow_redirects=True) as http_client:
+        with httpx.Client(follow_redirects=True, trust_env=False) as http_client:
             with http_client.stream(
                 "GET",
                 self.url,
@@ -164,6 +165,20 @@ class DownloadWorker(QRunnable):
             ) as response:
                 if response.status_code not in (200, 206):
                     raise RuntimeError(f"Server returned HTTP {response.status_code}")
+
+                # We requested a range (resume) but the server answered 200, which
+                # per RFC 7233 means it ignored Range and is sending the FULL body.
+                # Appending it to the existing partial bytes would corrupt the file,
+                # so restart from scratch: truncate, reset counters and hasher.
+                if self._resume_offset > 0 and response.status_code == 200:
+                    logger.info(
+                        "Download %s: server ignored Range (HTTP 200); restarting from 0",
+                        self.task_id,
+                    )
+                    mode = "wb"
+                    downloaded = 0
+                    hasher = hashlib.sha256()
+                    self._resume_offset = 0
 
                 total_size = int(response.headers.get("content-length", 0))
                 if self._resume_offset > 0 and total_size > 0:
@@ -204,10 +219,8 @@ class DownloadWorker(QRunnable):
                 )
             logger.info("Hash verification passed for download %s", self.task_id)
 
-        # Atomic rename: .tmp -> final
-        if self.final_path.exists():
-            self.final_path.unlink()
-        self.temp_path.rename(self.final_path)
+        # Atomic replace: keep an existing final file until the new file is complete.
+        os.replace(self.temp_path, self.final_path)
 
         logger.info("Download %s completed: %s", self.task_id, self.final_path)
         self.signals.completed.emit(self.task_id, str(self.final_path))

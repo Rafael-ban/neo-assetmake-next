@@ -234,6 +234,7 @@ class ForumPage(QWidget):
         )
         self._materials_worker.completed.connect(self._on_materials_loaded)
         self._materials_worker.error.connect(self._on_materials_error)
+        self._services.track_qthread(self._materials_worker)
         self._materials_worker.start()
 
     @Slot(list, int)
@@ -300,6 +301,7 @@ class ForumPage(QWidget):
         self._pending_download_material = material
         self._download_url_worker.completed.connect(self._on_download_url_ready)
         self._download_url_worker.error.connect(self._on_download_url_error)
+        self._services.track_qthread(self._download_url_worker)
         self._download_url_worker.start()
 
     @Slot(str, str, int)

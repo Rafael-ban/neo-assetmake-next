@@ -3,6 +3,7 @@
 venv/
 ENV/
 env/
+.uv-cache/
 
 # Python cache
 __pycache__/
@@ -15,6 +16,9 @@ __pycache__/
 dist/
 build/
 ArknightsPassMaker/
+.tmp
+.codex_tmp
+tools
 
 # IDE
 .vscode/
@@ -32,7 +36,6 @@ logs/
 Thumbs.db
 
 # Large executables
-ffmpeg.exe
 *.exe
 
 # Test data
@@ -44,9 +47,6 @@ CLAUDE.md
 
 # Temporary update directory
 temp_update/
-ffmpeg
-ffplay
-ffprobe
 
 tmp/
 
@@ -56,5 +56,4 @@ cache/a2.6.0/boot_ubi.img
 cache/a2.6.0/rootfs_ubi.img
 bootenv.txt
 tools/innosetup/
-
 AGENTS.md

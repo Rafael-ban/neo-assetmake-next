@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rhodesepass.local/schemas/epconfig.schema.json",
+  "title": "EPConfig",
+  "type": "object",
+  "required": ["version", "uuid", "screen", "loop"],
+  "additionalProperties": true,
+  "properties": {
+    "version": { "type": "integer", "minimum": 1 },
+    "uuid": { "type": "string", "minLength": 1 },
+    "name": { "type": "string" },
+    "description": { "type": "string" },
+    "icon": { "type": "string" },
+    "screen": { "enum": ["360x640", "480x854", "720x1080"] },
+    "loop": {
+      "type": "object",
+      "required": ["file"],
+      "additionalProperties": true,
+      "properties": {
+        "file": { "type": "string" },
+        "is_image": { "type": "boolean" }
+      }
+    },
+    "intro": {
+      "type": "object",
+      "required": ["enabled", "file", "duration"],
+      "additionalProperties": true,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "file": { "type": "string" },
+        "duration": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "transition_in": { "$ref": "#/$defs/transition" },
+    "transition_loop": { "$ref": "#/$defs/transition" },
+    "overlay": { "$ref": "#/$defs/overlay" }
+  },
+  "$defs": {
+    "transition": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "enum": ["fade", "move", "swipe"] },
+        "options": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "duration": { "type": "integer", "minimum": 0 },
+            "image": { "type": "string" },
+            "background_color": { "type": "string" }
+          }
+        }
+      }
+    },
+    "overlay": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "enum": ["arknights", "image"] },
+        "options": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

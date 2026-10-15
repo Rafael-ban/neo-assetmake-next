@@ -11,6 +11,10 @@ on:
         type: boolean
         default: false
         description: '跳过 epass_flasher/bin 检查'
+      obfuscate:
+        type: boolean
+        default: false
+        description: 'Use PyArmor to obfuscate first-party Python sources'
       uv_sync_mode:
         type: string
         default: "locked"
@@ -19,6 +23,9 @@ on:
         type: string
         default: ""
         description: '非空时在构建前同步版本号到各配置文件'
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -76,31 +83,13 @@ jobs:
         with:
           workspaces: "simulator -> target"
 
-      - name: Cache FFmpeg SDK
-        id: cache-ffmpeg-sdk
-        uses: actions/cache@v4
-        with:
-          path: ffmpeg-sdk
-          key: ffmpeg-sdk-win64-7.1-gyan
-
-      - name: Download FFmpeg SDK (for Rust build)
-        if: steps.cache-ffmpeg-sdk.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          $url = "https://github.com/GyanD/codexffmpeg/releases/download/7.1/ffmpeg-7.1-full_build-shared.7z"
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg-sdk.7z
-          7z x ffmpeg-sdk.7z -offmpeg-temp
-          New-Item -ItemType Directory -Force -Path ffmpeg-sdk
-          Move-Item -Path ffmpeg-temp/ffmpeg-*/* -Destination ffmpeg-sdk/
-          Remove-Item -Recurse -Force ffmpeg-temp, ffmpeg-sdk.7z
-
       - name: Build Rust Simulator
         shell: pwsh
         run: |
-          $env:FFMPEG_DIR = "${{ github.workspace }}\ffmpeg-sdk"
-          Write-Host "FFMPEG_DIR: $env:FFMPEG_DIR"
           cd simulator
-          cargo build --release
+          cargo fmt --check
+          cargo test
+          cargo build --release --locked
           if (Test-Path "target\release\arknights_pass_simulator.exe") {
             Write-Host "Simulator built successfully"
           } else {
@@ -128,29 +117,74 @@ jobs:
           else
             uv sync --locked
           fi
-          uv run --no-sync python -c "import OpenGL, av, cv2, PyQt6, numpy; print('All packages OK')"
+          if [ "${{ inputs.obfuscate }}" = "true" ]; then
+            uv pip install "pyarmor>=8,<9"
+          fi
+          uv run --no-sync python -c "import OpenGL, cv2, PyQt6, numpy, requests; import core.rndis_device_service, core.http_remote_service, gui.workers.rndis_http_workers; print('All packages OK')"
 
-      - name: Cache FFmpeg
-        id: cache-ffmpeg
+      - name: Run Python tests
+        shell: bash
+        run: |
+          uv run --no-sync python -m compileall main.py config core gui utils _mext build.py tests
+          uv run --no-sync python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Cache media tools
         uses: actions/cache@v4
+        id: cache-media-tools
         with:
-          path: |
-            ffmpeg.exe
-            ffprobe.exe
-          key: ffmpeg-win64-n7.1-gpl
+          path: media-tools-v1.0.7z
+          key: media-tools-v1.0.7z
 
-      - name: Download FFmpeg
-        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+      - name: Download media tools on cache miss
+        if: steps.cache-media-tools.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip"
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
-          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_temp
-          $ffmpegExe = Get-ChildItem -Path ffmpeg_temp -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
-          $ffprobeExe = Get-ChildItem -Path ffmpeg_temp -Recurse -Filter "ffprobe.exe" | Select-Object -First 1
-          Copy-Item $ffmpegExe.FullName -Destination "ffmpeg.exe"
-          Copy-Item $ffprobeExe.FullName -Destination "ffprobe.exe"
-          Remove-Item -Recurse -Force ffmpeg_temp, ffmpeg.zip
+          Write-Host "Cache miss — downloading media tools from repository release..."
+          $repo = "${{ github.repository }}"
+          $tag = "media-tools-v1.0"
+          $asset = "media-tools-v1.0.7z"
+          $url = "https://github.com/$repo/releases/download/$tag/$asset"
+
+          Write-Host "Downloading from: $url"
+          try {
+            Invoke-WebRequest -Uri $url -OutFile media-tools-v1.0.7z -MaximumRetryCount 3
+            $fileSize = (Get-Item media-tools-v1.0.7z).Length / 1MB
+            Write-Host "✓ Downloaded successfully: $($fileSize.ToString('F2')) MB"
+          } catch {
+            Write-Error "Failed to download media tools: $_"
+            Write-Host "URL attempted: $url"
+            Write-Host ""
+            Write-Host "请先创建 release 并上传文件："
+            Write-Host "1. 访问 https://github.com/$repo/releases/new"
+            Write-Host "2. Tag: media-tools-v1.0"
+            Write-Host "3. 上传 media-tools-v1.0.7z"
+            exit 1
+          }
+
+      - name: Extract media tools
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "media-tools-v1.0.7z")) {
+            Write-Error "Archive not found after cache restore/download"
+            exit 1
+          }
+
+          Write-Host "Extracting media tools..."
+          7z x media-tools-v1.0.7z -y
+
+          # Verify critical binaries exist
+          $requiredTools = @("mpv.exe", "VSPipe.exe", "x264-7mod.exe")
+          foreach ($tool in $requiredTools) {
+            $path = "tools/media/$tool"
+            if (-not (Test-Path $path)) {
+              Write-Error "Required tool not found: $path"
+              exit 1
+            }
+            Write-Host "✓ Found: $path"
+          }
+
+          $totalSize = (Get-ChildItem tools/media -Recurse | Measure-Object Length -Sum).Sum / 1MB
+          Write-Host "Media tools extracted successfully ($($totalSize.ToString('F2')) MB)"
 
       - name: Install Inno Setup
         shell: pwsh
@@ -162,6 +196,7 @@ jobs:
         run: |
           $buildArgs = @()
           if ("${{ inputs.skip_flasher }}" -eq "true") { $buildArgs += "--skip-flasher" }
+          if ("${{ inputs.obfuscate }}" -eq "true") { $buildArgs += "--obfuscate" }
           uv run --no-sync python build.py @buildArgs
         env:
           # qfluentwidgets 等第三方库触发的 SyntaxWarning

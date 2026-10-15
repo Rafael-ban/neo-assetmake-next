@@ -55,7 +55,10 @@ class Fido2RegisterWorker(QThread):
     def provide_pin(self, pin: str) -> None:
         """Provide the PIN entered by the user (called from UI thread)."""
         self._pin_value = pin
-        self._fido2.interaction.pin_provided.emit(pin)
+        # Deliver via the interaction's thread-safe Event bridge rather than the
+        # pin_provided signal: the worker blocks in request_pin() inside a
+        # QThread.run() that has no event loop to receive a queued signal.
+        self._fido2.interaction.provide_pin(pin)
 
     def run(self) -> None:
         """Execute FIDO2 registration in the background."""
@@ -111,7 +114,10 @@ class Fido2AuthWorker(QThread):
     def provide_pin(self, pin: str) -> None:
         """Provide the PIN entered by the user (called from UI thread)."""
         self._pin_value = pin
-        self._fido2.interaction.pin_provided.emit(pin)
+        # Deliver via the interaction's thread-safe Event bridge rather than the
+        # pin_provided signal: the worker blocks in request_pin() inside a
+        # QThread.run() that has no event loop to receive a queued signal.
+        self._fido2.interaction.provide_pin(pin)
 
     def run(self) -> None:
         """Execute FIDO2 authentication in the background."""

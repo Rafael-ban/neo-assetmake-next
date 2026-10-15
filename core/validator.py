@@ -91,7 +91,15 @@ class EPConfigValidator:
         Returns:
             校验结果列表
         """
-        return self.validate(config.to_dict())
+        self.validate(config.to_dict())
+        # to_dict() has already coerced invalid enum values to defaults, so report the
+        # original invalid source values recorded at load time (EPConfig.from_dict).
+        for field, value in getattr(config, "_invalid_fields", []):
+            self._add_result(
+                ValidationLevel.ERROR, field,
+                f"{field} 值不合法，已回退默认值: {value!r}",
+            )
+        return self.results
 
     def has_errors(self) -> bool:
         """检查是否有错误级别的校验结果"""

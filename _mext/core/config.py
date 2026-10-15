@@ -61,6 +61,19 @@ def _load_env_file(env_path: Path) -> dict[str, str]:
     return env_vars
 
 
+def _safe_download_filename(filename: str) -> str:
+    """Validate that a download filename cannot escape the download directory."""
+    candidate = Path(filename)
+    if (
+        not filename
+        or candidate.is_absolute()
+        or candidate.name != filename
+        or ".." in candidate.parts
+    ):
+        raise ValueError(f"Unsafe download filename: {filename!r}")
+    return filename
+
+
 @dataclass
 class Config:
     """Central configuration object for the asset store client.
@@ -137,10 +150,9 @@ class Config:
         # Merge: local .env < config .env < real env vars
         merged = {**local_vars, **file_vars}
 
-        # Apply overrides
-        self.api_base_url = os.environ.get(
-            "MM_API_BASE_URL", merged.get("MM_API_BASE_URL", self.api_base_url)
-        )
+        # Apply runtime overrides. The API base URL is intentionally not
+        # overrideable through process environment or .env files; release
+        # builds bake it into _mext.core.constants.API_BASE_URL.
         self.api_timeout = int(
             os.environ.get("MM_API_TIMEOUT", merged.get("MM_API_TIMEOUT", str(self.api_timeout)))
         )
@@ -196,10 +208,12 @@ class Config:
         """Return a temporary download path for a file."""
         from _mext.core.constants import DOWNLOAD_TEMP_SUFFIX
 
+        filename = _safe_download_filename(filename)
         return self.download_dir / f"{filename}{DOWNLOAD_TEMP_SUFFIX}"
 
     def get_final_download_path(self, filename: str) -> Path:
         """Return the final download path for a file."""
+        filename = _safe_download_filename(filename)
         return self.download_dir / filename
 
 

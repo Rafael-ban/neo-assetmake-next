@@ -419,4 +419,33 @@ mod tests {
         assert_eq!(ScreenType::S480x854.dimensions(), (480, 854));
         assert_eq!(ScreenType::S720x1080.dimensions(), (720, 1080));
     }
+
+    #[test]
+    fn test_golden_minimal_fixture() {
+        let json = include_str!("../../../tests/fixtures/epconfig/minimal.json");
+        let config: EPConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.uuid, "00000000-0000-4000-8000-000000000001");
+        assert_eq!(config.screen, ScreenType::S360x640);
+        assert_eq!(config.loop_config.file, "loop.mp4");
+    }
+
+    #[test]
+    fn test_golden_full_overlay_fixture() {
+        let json = include_str!("../../../tests/fixtures/epconfig/full_overlay_transition.json");
+        let config: EPConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.screen, ScreenType::S480x854);
+        assert!(config.has_intro());
+        assert_eq!(config.get_transition_in_type(), TransitionType::Fade);
+        assert_eq!(config.get_transition_loop_type(), TransitionType::Move);
+        assert_eq!(config.get_appear_time(), 100000);
+    }
+
+    #[test]
+    fn test_golden_image_loop_fixture() {
+        let json = include_str!("../../../tests/fixtures/epconfig/image_loop_intro_crop.json");
+        let config: EPConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.screen, ScreenType::S720x1080);
+        assert!(config.loop_config.is_image);
+        assert!(config.has_intro());
+    }
 }

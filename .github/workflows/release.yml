@@ -38,6 +38,27 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Current version: $VERSION"
 
+      - name: Validate version consistency
+        run: |
+          CHANGELOG_VERSION=$(grep -oP '### v\K[0-9]+\.[0-9]+\.[0-9]+' docs/CHANGELOG.md | head -1)
+          PYPROJECT_VERSION=$(python - <<'PY'
+          import re
+          print(re.search(r'(?m)^version = "([^"]+)"', open('pyproject.toml', encoding='utf-8').read()).group(1))
+          PY
+          )
+          APP_VERSION=$(python - <<'PY'
+          import re
+          print(re.search(r'APP_VERSION = "([^"]+)"', open('config/constants.py', encoding='utf-8').read()).group(1))
+          PY
+          )
+          INSTALLER_VERSION=$(grep -oP '#define MyAppVersion "\K[^"]+' installer.iss | head -1)
+          SIMULATOR_VERSION=$(grep -oP '^version = "\K[^"]+' simulator/Cargo.toml | head -1)
+          echo "CHANGELOG=$CHANGELOG_VERSION PYPROJECT=$PYPROJECT_VERSION APP=$APP_VERSION INSTALLER=$INSTALLER_VERSION SIMULATOR=$SIMULATOR_VERSION"
+          test "$CHANGELOG_VERSION" = "$PYPROJECT_VERSION"
+          test "$CHANGELOG_VERSION" = "$APP_VERSION"
+          test "$CHANGELOG_VERSION" = "$INSTALLER_VERSION"
+          test "$CHANGELOG_VERSION" = "$SIMULATOR_VERSION"
+
       - name: Check if version changed
         id: check-change
         run: |
@@ -80,7 +101,8 @@ jobs:
     uses: ./.github/workflows/build-app.yml
     with:
       skip_flasher: false
-      uv_sync_mode: "frozen"
+      uv_sync_mode: "locked"
+      obfuscate: true
       version_override: ${{ needs.check-version.outputs.version }}
 
   release:
@@ -99,6 +121,13 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ needs.build.outputs.artifact_run_id }}
 
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          cd dist
+          sha256sum *.exe > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Extract changelog for current version
         id: changelog
         shell: bash
@@ -106,27 +135,37 @@ jobs:
           VERSION="${{ needs.check-version.outputs.version }}"
           # 转义版本号中的 . (正则通配符 → 字面量)
           VERSION_ESC=$(echo "$VERSION" | sed 's/\./\\./g')
+          VERSION_HEADER_RE="^### v${VERSION_ESC}([^0-9.]|$)"
 
           # 使用 awk 状态机精确提取当前版本的更新日志
-          # - 找到精确版本头 → 开始输出
+          # - 找到当前版本头 → 开始输出，允许标题带“测试预览版”等后缀
           # - 遇到下一个版本头 → 立即退出
-          CHANGELOG=$(awk "
-            /^### v${VERSION_ESC}$/ { found=1 }
-            found && /^### v[0-9]/ && !/^### v${VERSION_ESC}$/ { exit }
+          CHANGELOG=$(awk -v header_re="$VERSION_HEADER_RE" '
+            $0 ~ header_re { found=1 }
+            found && /^### v[0-9]/ && $0 !~ header_re { exit }
             found { print }
-          " docs/CHANGELOG.md)
+          ' docs/CHANGELOG.md)
 
           if [ -z "$CHANGELOG" ]; then
             echo "::warning::未能从 CHANGELOG 中提取 v${VERSION} 的内容"
           fi
 
+          CURRENT_HEADER=$(grep -m1 -E "$VERSION_HEADER_RE" docs/CHANGELOG.md || true)
+          if echo "$CURRENT_HEADER" | grep -Eiq '(测试预览版|预览版|preview|pre-release|prerelease|alpha|beta|rc)'; then
+            PRERELEASE=true
+          else
+            PRERELEASE=false
+          fi
+
           echo "Extracted changelog for v${VERSION}:"
           echo "$CHANGELOG"
+          echo "Prerelease: $PRERELEASE"
 
           {
             echo "CHANGELOG<<EOF"
             echo "$CHANGELOG"
             echo "EOF"
+            echo "PRERELEASE=$PRERELEASE"
           } >> $GITHUB_OUTPUT
 
       - name: Create Release
@@ -137,6 +176,8 @@ jobs:
           body: ${{ steps.changelog.outputs.CHANGELOG }}
           files: |
             dist/*.exe
+            dist/SHA256SUMS
           draft: false
+          prerelease: ${{ steps.changelog.outputs.PRERELEASE }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

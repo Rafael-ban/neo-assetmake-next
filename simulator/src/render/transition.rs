@@ -148,8 +148,8 @@ mod tests {
     #[test]
     fn test_move_offset() {
         let config = FirmwareConfig::get_default();
-        let renderer = TransitionRenderer::new(config);
         let width = config.overlay_width() as i32;
+        let renderer = TransitionRenderer::new(config);
 
         // Start: x = width (from right)
         assert_eq!(renderer.calculate_move_offset(0.0), width);

@@ -308,6 +308,6 @@ class MaterialForumWidget(QWidget):
         """Return the service manager instance."""
         return self._services
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_ms: int = 2000) -> bool:
         """Clean up resources before the widget is destroyed."""
-        self._services.shutdown()
+        return self._services.shutdown(timeout_ms=timeout_ms)

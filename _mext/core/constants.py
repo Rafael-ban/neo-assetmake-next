@@ -1,7 +1,5 @@
 """Application-wide constants for the asset store."""
 
-import base64 as _b64
-
 # Application identity
 APP_NAME: str = "AssetStore"
 APP_ID: str = "com.assetstore.app"
@@ -10,8 +8,7 @@ APP_AUTHOR: str = "AssetStore"
 
 # API configuration
 API_VERSION: str = "v1"
-_p = ["aHR0cHM6Ly9hcGk", "ubWF0ZXJpYWwtbW", "Fya2V0LmV4YW1w", "bGUuY29t"]
-API_BASE_URL: str = _b64.b64decode("".join(_p)).decode()
+API_BASE_URL: str = "http://192.168.31.199:5669"
 API_TIMEOUT_SECONDS: int = 30
 API_STREAM_TIMEOUT_SECONDS: int = 300
 
@@ -23,8 +20,7 @@ OAUTH_STATE_LENGTH: int = 32
 OAUTH_CODE_VERIFIER_LENGTH: int = 64
 
 # FIDO2 / WebAuthn
-_r = ["bWF0ZXJpYWwtbW", "Fya2V0LmV4YW1w", "bGUuY29t"]
-FIDO2_RP_ID: str = _b64.b64decode("".join(_r)).decode()
+FIDO2_RP_ID: str = "material-market.example.com"
 FIDO2_RP_NAME: str = "Asset Store"
 FIDO2_ORIGIN: str = "https://" + FIDO2_RP_ID
 

@@ -10,13 +10,12 @@ import logging
 from typing import Optional
 
 from qfluentwidgets import (
+    CaptionLabel,
     ComboBox,
-    FlowLayout,
     InfoBar,
     InfoBarPosition,
     PillPushButton,
     ScrollArea,
-    SearchLineEdit,
     SubtitleLabel,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal as Signal, pyqtSlot as Slot
@@ -27,7 +26,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from _mext.core.constants import GALLERY_CARD_COLUMN_WIDTH, MATERIALS_PER_PAGE, SEARCH_DEBOUNCE_MS
+from _mext.core.constants import (
+    GALLERY_CARD_COLUMN_WIDTH,
+    MATERIALS_PER_PAGE,
+    SEARCH_DEBOUNCE_MS,
+)
 from _mext.core.service_manager import ServiceManager
 from _mext.models.material import Material, MaterialCategory
 from _mext.services.api_worker import (
@@ -41,11 +44,16 @@ from _mext.ui.components.thumbnail_loader import ThumbnailLoader
 from _mext.ui.layouts.waterfall_layout import WaterfallLayout
 from _mext.ui.styles import (
     COMBO_WIDTH_MD,
+    COLOR_BG_ELEVATED,
+    COLOR_BG_INSET,
+    COLOR_BORDER,
+    COLOR_TEXT_MUTED,
     FEATURED_BANNER_HEIGHT,
     FEATURED_CARD_WIDTH,
     GALLERY_GRID_SPACING,
-    SPACING_MD,
+    SPACING_LG,
     SPACING_SM,
+    apply_themed_style,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,27 +103,35 @@ class DiscoverPage(QWidget):
         self._thumb_loader = ThumbnailLoader(parent=self)
         self._thumb_loader.thumbnail_ready.connect(self._on_thumbnail_ready)
 
+        self.setObjectName("DiscoverPage")
         self._setup_ui()
         self._connect_signals()
+        self._apply_styles()
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(SPACING_SM)
+        layout.setSpacing(0)
 
         # ── Category bar (horizontal pills) ───────────────────
         cat_row = QWidget(self)
+        cat_row.setObjectName("DiscoverFilterBar")
+        cat_row.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         cat_layout = QHBoxLayout(cat_row)
-        cat_layout.setContentsMargins(SPACING_MD, SPACING_SM, SPACING_MD, SPACING_SM)
+        cat_layout.setContentsMargins(SPACING_LG, SPACING_SM, SPACING_LG, SPACING_SM)
         cat_layout.setSpacing(8)
 
         self._category_pills: dict[str, PillPushButton] = {}
 
+        filter_label = CaptionLabel("分类", cat_row)
+        filter_label.setObjectName("DiscoverFilterLabel")
+        cat_layout.addWidget(filter_label)
+
         # "All" pill
-        all_pill = PillPushButton("All", cat_row)
+        all_pill = PillPushButton("全部", cat_row)
         all_pill.setCheckable(True)
         all_pill.setChecked(True)
-        all_pill.setFixedHeight(28)
+        all_pill.setFixedHeight(30)
         all_pill.clicked.connect(lambda: self._on_category_clicked(""))
         cat_layout.addWidget(all_pill)
         self._category_pills[""] = all_pill
@@ -124,7 +140,7 @@ class DiscoverPage(QWidget):
             pill = PillPushButton(category.display_name, cat_row)
             pill.setCheckable(True)
             pill.setChecked(False)
-            pill.setFixedHeight(28)
+            pill.setFixedHeight(30)
             pill.clicked.connect(
                 lambda checked, cat=category.value: self._on_category_clicked(cat)
             )
@@ -138,12 +154,15 @@ class DiscoverPage(QWidget):
         self._sort_combo.addItems([label for label, _ in self._SORT_OPTIONS])
         self._sort_combo.setCurrentIndex(0)
         self._sort_combo.setFixedWidth(COMBO_WIDTH_MD)
+        self._sort_combo.setFixedHeight(32)
+        self._sort_combo.setToolTip("排序方式")
         cat_layout.addWidget(self._sort_combo)
 
         layout.addWidget(cat_row)
 
         # ── Featured banner (horizontal scroll) ────────────────
         self._featured_scroll = ScrollArea(self)
+        self._featured_scroll.setObjectName("FeaturedStrip")
         self._featured_scroll.setFixedHeight(FEATURED_BANNER_HEIGHT)
         self._featured_scroll.setWidgetResizable(True)
         self._featured_scroll.setVerticalScrollBarPolicy(
@@ -153,7 +172,7 @@ class DiscoverPage(QWidget):
 
         self._featured_container = QWidget()
         self._featured_layout = QHBoxLayout(self._featured_container)
-        self._featured_layout.setContentsMargins(SPACING_MD, 0, SPACING_MD, 0)
+        self._featured_layout.setContentsMargins(SPACING_LG, SPACING_SM, SPACING_LG, 0)
         self._featured_layout.setSpacing(SPACING_SM)
         self._featured_layout.addStretch()
 
@@ -162,6 +181,7 @@ class DiscoverPage(QWidget):
 
         # ── Waterfall scroll area ─────────────────────────────
         self._scroll_area = ScrollArea(self)
+        self._scroll_area.setObjectName("DiscoverGridScroll")
         self._scroll_area.setWidgetResizable(True)
         self._scroll_area.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
@@ -173,23 +193,30 @@ class DiscoverPage(QWidget):
             column_width=GALLERY_CARD_COLUMN_WIDTH,
             spacing=GALLERY_GRID_SPACING,
         )
-        self._waterfall.setContentsMargins(SPACING_MD, SPACING_SM, SPACING_MD, SPACING_MD)
+        self._waterfall.setContentsMargins(
+            SPACING_LG,
+            SPACING_LG,
+            SPACING_LG,
+            SPACING_LG,
+        )
 
         self._scroll_area.setWidget(self._grid_container)
         layout.addWidget(self._scroll_area, stretch=1)
 
         # ── Empty state ──────────────────────────────────────
         self._empty_label = SubtitleLabel(
-            "\u672a\u627e\u5230\u7d20\u6750", self  # 未找到素材
+            "没有找到匹配的素材", self
         )
+        self._empty_label.setObjectName("DiscoverEmptyLabel")
         self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty_label.setVisible(False)
         layout.addWidget(self._empty_label)
 
         # ── Loading indicator ─────────────────────────────────
         self._loading_label = SubtitleLabel(
-            "\u52a0\u8f7d\u4e2d...", self  # 加载中...
+            "正在加载素材...", self
         )
+        self._loading_label.setObjectName("DiscoverLoadingLabel")
         self._loading_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._loading_label.setVisible(False)
         layout.addWidget(self._loading_label)
@@ -198,6 +225,47 @@ class DiscoverPage(QWidget):
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
         self._search_timer.setInterval(SEARCH_DEBOUNCE_MS)
+
+    def _apply_styles(self) -> None:
+        light_qss = f"""
+        QWidget#DiscoverPage {{
+            background-color: {COLOR_BG_INSET[0]};
+        }}
+        QWidget#DiscoverFilterBar {{
+            background-color: {COLOR_BG_ELEVATED[0]};
+            border-bottom: 1px solid {COLOR_BORDER[0]};
+        }}
+        CaptionLabel#DiscoverFilterLabel,
+        SubtitleLabel#DiscoverEmptyLabel,
+        SubtitleLabel#DiscoverLoadingLabel {{
+            color: {COLOR_TEXT_MUTED[0]};
+        }}
+        QScrollArea#FeaturedStrip,
+        QScrollArea#DiscoverGridScroll {{
+            background: transparent;
+            border: none;
+        }}
+        """
+        dark_qss = f"""
+        QWidget#DiscoverPage {{
+            background-color: {COLOR_BG_INSET[1]};
+        }}
+        QWidget#DiscoverFilterBar {{
+            background-color: {COLOR_BG_ELEVATED[1]};
+            border-bottom: 1px solid {COLOR_BORDER[1]};
+        }}
+        CaptionLabel#DiscoverFilterLabel,
+        SubtitleLabel#DiscoverEmptyLabel,
+        SubtitleLabel#DiscoverLoadingLabel {{
+            color: {COLOR_TEXT_MUTED[1]};
+        }}
+        QScrollArea#FeaturedStrip,
+        QScrollArea#DiscoverGridScroll {{
+            background: transparent;
+            border: none;
+        }}
+        """
+        apply_themed_style(self, light_qss, dark_qss)
 
     def _connect_signals(self) -> None:
         self._sort_combo.currentIndexChanged.connect(self._on_sort_changed)
@@ -310,6 +378,7 @@ class DiscoverPage(QWidget):
         )
         self._materials_worker.completed.connect(self._on_materials_loaded)
         self._materials_worker.error.connect(self._on_materials_error)
+        self._services.track_qthread(self._materials_worker)
         self._materials_worker.start()
 
     @Slot(list, int)
@@ -408,6 +477,7 @@ class DiscoverPage(QWidget):
         self._pending_download_material = material
         self._download_url_worker.completed.connect(self._on_download_url_ready)
         self._download_url_worker.error.connect(self._on_download_url_error)
+        self._services.track_qthread(self._download_url_worker)
         self._download_url_worker.start()
 
     @Slot(str, str, int)
@@ -469,6 +539,7 @@ class DiscoverPage(QWidget):
         worker.completed.connect(self._on_like_result)
         worker.error.connect(self._on_like_error)
         self._current_like_worker = worker
+        self._services.track_qthread(worker)
         worker.start()
 
     @Slot(str, bool, int)
@@ -529,6 +600,7 @@ class DiscoverPage(QWidget):
         )
         self._featured_worker.completed.connect(self._on_featured_loaded)
         self._featured_worker.error.connect(self._on_featured_error)
+        self._services.track_qthread(self._featured_worker)
         self._featured_worker.start()
 
     @Slot(list)

@@ -13,6 +13,7 @@ from typing import Optional
 from PyQt6.QtCore import QObject, QThreadPool, pyqtSignal as Signal
 
 from _mext.core.config import Config, get_config
+from _mext.core.worker_registry import WorkerRegistry
 from _mext.models.download import DownloadStatus, DownloadTask
 from _mext.services.api_client import ApiClient
 from _mext.services.download_worker import DownloadWorker
@@ -47,14 +48,18 @@ class DownloadEngine(QObject):
         self,
         api_client: ApiClient,
         config: Optional[Config] = None,
+        worker_registry: Optional[WorkerRegistry] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
         self._api = api_client
         self._config = config or get_config()
+        self._worker_registry = worker_registry
 
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(self._config.max_concurrent_downloads)
+        if self._worker_registry is not None:
+            self._worker_registry.register_thread_pool(self._pool)
 
         self._tasks: dict[str, DownloadTask] = {}
         self._workers: dict[str, DownloadWorker] = {}
@@ -207,6 +212,15 @@ class DownloadEngine(QObject):
         """Cancel all active and queued downloads."""
         for task_id in list(self._tasks.keys()):
             self.cancel(task_id)
+
+    def shutdown(self, timeout_ms: int = 2000) -> bool:
+        """Cancel downloads and wait for the worker pool to drain."""
+        self.cancel_all()
+        self._pool.clear()
+        ok = self._pool.waitForDone(timeout_ms)
+        if self._worker_registry is not None:
+            self._worker_registry.unregister_thread_pool(self._pool)
+        return ok
 
     def remove_task(self, task_id: str) -> bool:
         """Remove a completed/cancelled/failed task from the list."""

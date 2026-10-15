@@ -7,7 +7,8 @@ from typing import Dict, Any, List
 
 # ===== 应用信息 =====
 APP_NAME = "明日方舟通行证素材工具箱"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.5"
+APP_VERSION_LABEL = f"{APP_VERSION}（测试预览版）"
 
 # ===== 基础尺寸配置 =====
 SCREEN_WIDTH = 360
@@ -180,14 +181,16 @@ UPDATE_API_SOURCES: List[UpdateSource] = [
         url_template="https://ghproxy.cc/https://api.github.com/repos/{owner}/{repo}/releases/latest",
         source_type=SourceType.GITHUB_PROXY,
         priority=2,
-        timeout=15.0
+        timeout=15.0,
+        enabled=False
     ),
     UpdateSource(
         name="gh.idayer.com",
         url_template="https://gh.idayer.com/https://api.github.com/repos/{owner}/{repo}/releases/latest",
         source_type=SourceType.GITHUB_PROXY,
         priority=3,
-        timeout=15.0
+        timeout=15.0,
+        enabled=False
     ),
 ]
 

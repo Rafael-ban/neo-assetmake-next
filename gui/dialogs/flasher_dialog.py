@@ -5,6 +5,7 @@ import os
 import sys
 import json
 import subprocess
+import threading
 import time
 import hashlib
 import shutil
@@ -22,6 +23,7 @@ from PyQt6.QtGui import QFont, QIcon
 from qfluentwidgets import setCustomStyleSheet, PushButton as FluentPushButton, PrimaryPushButton, themeColor
 from gui.widgets.fluent_group_box import FluentGroupBox
 from config.constants import APP_NAME
+from core.file_utils import atomic_write_json
 from utils.file_utils import get_app_dir
 
 import logging
@@ -63,7 +65,7 @@ class DriverInstallWorker(QThread):
     def run(self):
         try:
             result = subprocess.run(
-                [self._drv_bat], shell=True, capture_output=True, text=True, timeout=300
+                ["cmd", "/c", self._drv_bat], capture_output=True, text=True, timeout=300
             )
             self.completed.emit(result.returncode, result.stdout, result.stderr)
         except subprocess.TimeoutExpired:
@@ -130,8 +132,7 @@ class FlasherWorker(QThread):
         config_file = os.path.join(config_dir, "config.json")
         if not os.path.exists(config_file):
             os.makedirs(config_dir, exist_ok=True)
-            with open(config_file, "w") as f:
-                json.dump({"driver_installed": False, "eula_accepted": True}, f)
+            atomic_write_json(config_file, {"driver_installed": False, "eula_accepted": True})
 
         with open(config_file, "r") as f:
             config = json.load(f)
@@ -142,14 +143,13 @@ class FlasherWorker(QThread):
             if not os.path.exists(drv_bat):
                 raise Exception(f"驱动安装文件不存在: {drv_bat}")
 
-            result = subprocess.run([drv_bat], shell=True, capture_output=True, text=True)
+            result = subprocess.run(["cmd", "/c", drv_bat], capture_output=True, text=True)
             if result.returncode != 0:
                 raise Exception(f"驱动安装失败: {result.stderr}")
 
             # 仅在安装成功后标记
             config["driver_installed"] = True
-            with open(config_file, "w") as f:
-                json.dump(config, f)
+            atomic_write_json(config_file, config)
         else:
             self.status_updated.emit("驱动已安装，跳过...")
     
@@ -320,7 +320,7 @@ class FlasherWorker(QThread):
             try:
                 result = subprocess.run(
                     [os.path.join(self.bin_path, "xfel.exe"), "spinand"],
-                    capture_output=True, text=True, timeout=5, shell=True
+                    capture_output=True, text=True, timeout=5
                 )
                 if "Found spi nand flash" in result.stdout:
                     self.status_updated.emit("XFEL spinand检测成功！")
@@ -352,7 +352,7 @@ class FlasherWorker(QThread):
         try:
             result = subprocess.run(
                 [os.path.join(self.bin_path, "dfu-util.exe"), "-l"],
-                capture_output=True, text=True, timeout=5, shell=True
+                capture_output=True, text=True, timeout=5
             )
             return "Found DFU: [1f3a:1010]" in result.stdout
         except Exception:
@@ -393,7 +393,7 @@ class FlasherWorker(QThread):
             cmd_full = [cmd_path] + cmd[1:]
 
             self.status_updated.emit(f"执行: {' '.join(cmd)}")
-            result = subprocess.run(cmd_full, capture_output=True, text=True, shell=True)
+            result = subprocess.run(cmd_full, capture_output=True, text=True)
 
             if result.returncode != 0:
                 self.status_updated.emit(f"警告: {' '.join(cmd)} 返回码 {result.returncode}")
@@ -413,7 +413,7 @@ class FlasherWorker(QThread):
         boot_cmd = [os.path.join(self.bin_path, "dfu-util.exe"),
                      "-d", "1f3a:1010", "-R", "-a", "boot", "-D", files["boot"]]
         self.status_updated.emit(f"烧录boot分区...")
-        subprocess.run(boot_cmd, capture_output=True, text=True, shell=True)
+        subprocess.run(boot_cmd, capture_output=True, text=True)
         self.status_updated.emit("boot分区烧录完成")
         self.progress_updated.emit("boot分区烧录完成", 70)
 
@@ -428,7 +428,7 @@ class FlasherWorker(QThread):
         rootfs_cmd = [os.path.join(self.bin_path, "dfu-util.exe"),
                        "-d", "1f3a:1010", "-R", "-a", "rootfs", "-D", files["rootfs"]]
         self.status_updated.emit(f"烧录rootfs分区...")
-        subprocess.run(rootfs_cmd, capture_output=True, text=True, shell=True)
+        subprocess.run(rootfs_cmd, capture_output=True, text=True)
         self.status_updated.emit("rootfs分区烧录完成")
         self.progress_updated.emit("rootfs分区烧录完成", 95)
     
@@ -828,8 +828,7 @@ class FlasherDialog(QDialog):
             config_file = os.path.join(config_dir, "config.json")
             os.makedirs(config_dir, exist_ok=True)
             config = {"driver_installed": True, "eula_accepted": True}
-            with open(config_file, "w") as f:
-                json.dump(config, f)
+            atomic_write_json(config_file, config)
             QMessageBox.information(self, "成功", "驱动安装成功！")
         else:
             self.status_text.append(f"驱动安装失败: {stderr}")
@@ -1128,8 +1127,8 @@ class FirmwareUpdateWorker(QThread):
     def _cleanup_command(self, temp_path):
         """使用命令行删除"""
         if sys.platform == 'win32':
-            subprocess.run(['cmd', '/c', 'rd', '/s', '/q', temp_path], 
-                         capture_output=True, shell=True)
+            subprocess.run(['cmd', '/c', 'rd', '/s', '/q', temp_path],
+                         capture_output=True)
         else:
             subprocess.run(['rm', '-rf', temp_path], 
                          capture_output=True)
@@ -1146,15 +1145,13 @@ class FirmwareUpdateWorker(QThread):
                 f.write(f'del "%~f0"\n')
             
             # 启动批处理文件
-            subprocess.Popen([bat_path], shell=True)
+            subprocess.Popen(["cmd", "/c", bat_path])
         else:
-            # Linux/Mac: 使用at命令
-            try:
-                subprocess.run(['at', 'now', '+', '1', 'minute', 
-                              f'rm -rf {temp_path}'], 
-                             capture_output=True)
-            except Exception:
-                pass
+            def delayed_cleanup():
+                time.sleep(60)
+                shutil.rmtree(temp_path, ignore_errors=True)
+
+            threading.Thread(target=delayed_cleanup, daemon=True).start()
 
 if __name__ == "__main__":
     import sys

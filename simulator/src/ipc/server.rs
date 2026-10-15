@@ -5,12 +5,27 @@
 use anyhow::Result;
 use std::io::{BufRead, BufReader, Write};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{mpsc, Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
 #[cfg(windows)]
 use interprocess::TryClone;
 
 use super::protocol::IpcMessage;
+
+fn write_stdio_message(stdout: &Arc<Mutex<std::io::Stdout>>, msg: &IpcMessage) {
+    if let Ok(json) = msg.to_json() {
+        match stdout.lock() {
+            Ok(mut writer) => {
+                let _ = writeln!(writer, "{}", json);
+                let _ = writer.flush();
+            }
+            Err(e) => {
+                error!("Failed to lock stdout for IPC write: {}", e);
+            }
+        }
+    }
+}
 
 /// IPC Server for communication with Python editor
 pub struct IpcServer {
@@ -31,15 +46,20 @@ impl IpcServer {
         info!("Starting stdio IPC server");
 
         let stdin = std::io::stdin();
-        let mut stdout = std::io::stdout();
+        let stdout = Arc::new(Mutex::new(std::io::stdout()));
         let reader = BufReader::new(stdin.lock());
+        let writer_stdout = Arc::clone(&stdout);
+        let (_replacement_tx, replacement_rx) = mpsc::channel();
+        let from_app = std::mem::replace(&mut self.from_app, replacement_rx);
+
+        std::thread::spawn(move || {
+            while let Ok(msg) = from_app.recv() {
+                write_stdio_message(&writer_stdout, &msg);
+            }
+        });
 
         // Send ready message
-        let ready_msg = IpcMessage::ready();
-        if let Ok(json) = ready_msg.to_json() {
-            let _ = writeln!(stdout, "{}", json);
-            let _ = stdout.flush();
-        }
+        write_stdio_message(&stdout, &IpcMessage::ready());
 
         // Read messages from stdin
         for line in reader.lines() {
@@ -53,13 +73,14 @@ impl IpcServer {
 
                     match IpcMessage::from_json(&line) {
                         Ok(msg) => {
-                            if matches!(msg, IpcMessage::Shutdown) {
-                                info!("Received shutdown command");
+                            let is_shutdown = matches!(msg, IpcMessage::Shutdown);
+                            if self.to_app.send(msg).is_err() {
+                                error!("Failed to send message to app");
                                 break;
                             }
 
-                            if self.to_app.send(msg).is_err() {
-                                error!("Failed to send message to app");
+                            if is_shutdown {
+                                info!("Received shutdown command");
                                 break;
                             }
                         }
@@ -69,24 +90,13 @@ impl IpcServer {
                                 super::protocol::error_codes::INTERNAL_ERROR,
                                 format!("Parse error: {}", e),
                             );
-                            if let Ok(json) = error_msg.to_json() {
-                                let _ = writeln!(stdout, "{}", json);
-                                let _ = stdout.flush();
-                            }
+                            write_stdio_message(&stdout, &error_msg);
                         }
                     }
                 }
                 Err(e) => {
                     error!("Failed to read from stdin: {}", e);
                     break;
-                }
-            }
-
-            // Check for outgoing messages
-            while let Ok(msg) = self.from_app.try_recv() {
-                if let Ok(json) = msg.to_json() {
-                    let _ = writeln!(stdout, "{}", json);
-                    let _ = stdout.flush();
                 }
             }
         }
@@ -151,13 +161,14 @@ impl IpcServer {
 
                             match IpcMessage::from_json(trimmed) {
                                 Ok(msg) => {
-                                    if matches!(msg, IpcMessage::Shutdown) {
-                                        info!("Received shutdown command");
+                                    let is_shutdown = matches!(msg, IpcMessage::Shutdown);
+                                    if self.to_app.send(msg).is_err() {
+                                        error!("Failed to send message to app");
                                         break;
                                     }
 
-                                    if self.to_app.send(msg).is_err() {
-                                        error!("Failed to send message to app");
+                                    if is_shutdown {
+                                        info!("Received shutdown command");
                                         break;
                                     }
                                 }

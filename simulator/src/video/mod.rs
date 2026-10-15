@@ -1,17 +1,17 @@
 //! Video module
 //!
-//! Provides video decoding and playback functionality using FFmpeg.
+//! Provides placeholder video frame generation and playback management.
 //!
 //! # Usage
 //!
 //! ```rust,ignore
 //! use video::VideoPlayer;
 //!
-//! let mut player = VideoPlayer::new(360, 640, None, 0);
+//! let mut player = VideoPlayer::default();
 //! player.load_from_config(&config, &base_dir);
 //!
 //! // Read frames
-//! if let Some(frame) = player.read_loop_frame() {
+//! if let Some(frame) = player.get_loop_current_frame() {
 //!     // Use the frame
 //! }
 //! ```

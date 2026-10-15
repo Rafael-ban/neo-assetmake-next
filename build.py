@@ -14,6 +14,20 @@ sys.setrecursionlimit(10000)
 PROJECT_NAME = "ArknightsPassMaker"
 MAIN_SCRIPT = "main.py"
 ICON_FILE = "resources/icons/favicon.ico"
+OBFUSCATION_DIR = os.path.join(".tmp", "pyarmor-src")
+# Keep the Qt GUI package in plain source for now: it has legacy encoding and
+# dynamic Qt/plugin patterns that are fragile under source-level obfuscation.
+OBFUSCATABLE_ENTRIES = ["main.py", "core", "config", "utils", "_mext"]
+MEDIA_TOOL_DIR = os.path.join("tools", "media")
+MEDIA_TOOL_SOURCE_DIRS = ("", MEDIA_TOOL_DIR)
+MEDIA_TOOL_CANDIDATES = [
+    ("mpv.exe", os.path.join(MEDIA_TOOL_DIR, "mpv.exe")),
+    ("VSPipe.exe", os.path.join(MEDIA_TOOL_DIR, "VSPipe.exe")),
+    ("x264-7mod.exe", os.path.join(MEDIA_TOOL_DIR, "x264-7mod.exe")),
+    ("mp4box.exe", os.path.join(MEDIA_TOOL_DIR, "mp4box.exe")),
+    ("lsmash-muxer.exe", os.path.join(MEDIA_TOOL_DIR, "lsmash-muxer.exe")),
+    ("muxer.exe", os.path.join(MEDIA_TOOL_DIR, "muxer.exe")),
+]
 
 
 def get_version() -> str:
@@ -38,7 +52,7 @@ ISS_FILE = "installer.iss"
 INNO_SETUP_DIR = "tools/innosetup"
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=f"{PROJECT_NAME} Build Tool")
     parser.add_argument(
         "--no-installer", action="store_true", help="Skip installer packaging"
@@ -49,7 +63,12 @@ def parse_args():
         action="store_true",
         help="Skip packaging epass_flasher/bin even if it exists",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--obfuscate",
+        action="store_true",
+        help="Obfuscate first-party Python sources with PyArmor before packaging",
+    )
+    return parser.parse_args(argv)
 
 
 def get_site_packages():
@@ -153,7 +172,7 @@ def _diagnose_build_env():
     for i, p in enumerate(sys.path):
         print(f"    [{i}] {p}")
     # 关键包定位
-    for pkg in ("OpenGL", "av", "cv2", "PyQt6", "cx_Freeze", "numpy"):
+    for pkg in ("OpenGL", "cv2", "PyQt6", "cx_Freeze", "numpy"):
         spec = importlib.util.find_spec(pkg)
         status = spec.origin if spec else "NOT FOUND"
         print(f"  {pkg}: {status}")
@@ -192,7 +211,7 @@ def _verify_modules(search_paths, project_root):
     # importlib.util.find_spec 使用完整的 sys.meta_path（包括 uv 的自定义 finder）
     # PathFinder.find_spec 只搜索给定的 path 列表
     pip_names = {"OpenGL": "PyOpenGL", "cv2": "opencv-python"}
-    critical_packages = ["OpenGL", "av", "cv2", "PyQt6"]
+    critical_packages = ["OpenGL", "cv2", "PyQt6", "requests"]
     missing = []
 
     for pkg_name in critical_packages:
@@ -249,9 +268,6 @@ def check_requirements():
         print(f"Error: {MAIN_SCRIPT} not found")
         return False
 
-    print(f"  ffmpeg.exe: {'found' if os.path.exists('ffmpeg.exe') else 'not found'}")
-    print(f"  ffprobe.exe: {'found' if os.path.exists('ffprobe.exe') else 'not found'}")
-
     iscc = find_inno_setup()
     if iscc:
         print(f"  Inno Setup: found")
@@ -268,19 +284,125 @@ def clean_build():
         if os.path.exists(d):
             shutil.rmtree(d)
             print(f"  Removed: {d}")
+    if os.path.exists(OBFUSCATION_DIR):
+        shutil.rmtree(OBFUSCATION_DIR)
+        print(f"  Removed: {OBFUSCATION_DIR}")
 
     print("Cleaning __pycache__ directories...")
     _clean_pycache()
 
 
-def run_cxfreeze(skip_flasher=False):
+def _find_pyarmor_executable():
+    """Return a PyArmor executable path if it is available."""
+    candidates = [
+        shutil.which("pyarmor"),
+        os.path.join(os.path.dirname(sys.executable), "pyarmor.exe"),
+        os.path.join(os.path.dirname(sys.executable), "pyarmor"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def prepare_obfuscated_source():
+    """Generate a conservative PyArmor-obfuscated source tree."""
+    pyarmor = _find_pyarmor_executable()
+    if not pyarmor:
+        print("Error: PyArmor not found. Install it before using --obfuscate.")
+        return None
+
+    source_root = os.path.abspath(OBFUSCATION_DIR)
+    if os.path.exists(source_root):
+        shutil.rmtree(source_root)
+    os.makedirs(source_root, exist_ok=True)
+
+    command = [
+        pyarmor,
+        "gen",
+        "-r",
+        "-O",
+        source_root,
+        *OBFUSCATABLE_ENTRIES,
+    ]
+    print("Running PyArmor obfuscation...")
+    print("  " + " ".join(command))
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as exc:
+        print(f"PyArmor failed: {exc}")
+        return None
+
+    missing_entries = [
+        entry
+        for entry in OBFUSCATABLE_ENTRIES
+        if not os.path.exists(os.path.join(source_root, entry))
+    ]
+    if missing_entries:
+        print("PyArmor output is incomplete. Missing:")
+        for entry in missing_entries:
+            print(f"  {entry}")
+        return None
+
+    if not _pyarmor_runtime_packages(source_root):
+        print("PyArmor output missing runtime package: pyarmor_runtime_*")
+        return None
+
+    return source_root
+
+
+def _pyarmor_runtime_packages(source_root):
+    """Return PyArmor runtime package names and paths in a source tree."""
+    if not source_root or not os.path.isdir(source_root):
+        return []
+    result = []
+    for name in sorted(os.listdir(source_root)):
+        path = os.path.join(source_root, name)
+        if name.startswith("pyarmor_runtime") and os.path.isdir(path):
+            result.append((name, path))
+    return result
+
+
+def _collect_media_tool_include_files():
+    """Return optional media tools and their sibling runtime files."""
+    include_files = []
+    if os.path.isdir(MEDIA_TOOL_DIR):
+        for root, dirs, files in os.walk(MEDIA_TOOL_DIR):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
+            for filename in files:
+                if filename.endswith((".pyc", ".pyo")):
+                    continue
+                source_path = os.path.join(root, filename)
+                target_path = os.path.relpath(source_path, ".")
+                include_files.append((source_path, target_path))
+        if include_files:
+            print(f"  Including media tool runtime tree: {MEDIA_TOOL_DIR}")
+            return include_files
+
+    for filename, target_path in MEDIA_TOOL_CANDIDATES:
+        for source_dir in MEDIA_TOOL_SOURCE_DIRS:
+            source_path = os.path.join(source_dir, filename) if source_dir else filename
+            if os.path.exists(source_path):
+                include_files.append((source_path, target_path))
+                print(f"  Including media tool: {source_path} -> {target_path}")
+                break
+    return include_files
+
+
+def run_cxfreeze(skip_flasher=False, source_root=None):
     """执行 cx_Freeze 打包"""
 
     # 确保项目根目录在 Python 路径中（防御性措施，正常应通过 uv sync --group dev 的 editable install 实现）
     project_root = os.path.dirname(os.path.abspath(__file__))
-    if project_root not in sys.path:
-        sys.path.insert(0, project_root)
+    source_root = os.path.abspath(source_root or project_root)
+    for path in (project_root, source_root):
+        if path in sys.path:
+            sys.path.remove(path)
+    sys.path.insert(0, source_root)
+    if project_root != source_root:
+        sys.path.insert(1, project_root)
     print(f"Project root: {project_root}")
+    print(f"Source root: {source_root}")
 
     # 输出构建环境诊断信息
     _diagnose_build_env()
@@ -290,7 +412,7 @@ def run_cxfreeze(skip_flasher=False):
     # 必须显式包含 site-packages，否则 uv/conda 等环境中第三方包可能找不到。
     import sysconfig as _sc
 
-    search_paths = [project_root] + list(sys.path)
+    search_paths = [source_root] + list(sys.path)
     for extra in [_sc.get_path("purelib"), _sc.get_path("platlib")]:
         if extra and os.path.isdir(extra) and extra not in search_paths:
             search_paths.insert(1, extra)
@@ -328,9 +450,6 @@ def run_cxfreeze(skip_flasher=False):
         "PyQt6.QtOpenGLWidgets",
         "PyQt6.QtOpenGL",
         "qfluentwidgets",
-        # av (PyAV) 不放在 packages 中 — cx_Freeze 7.2.10 的 PathFinder.find_spec
-        # 无法定位 PyAV 17+ 的 abi3 C 扩展包（finder.py:383 返回 None）。
-        # 改为通过 include_files 手动复制 av/ 和 av.libs/ 目录。
         # PyOpenGL 不放在 packages 中 — packages 会触发 cx_Freeze 的
         # _import_all_sub_modules() 递归扫描整个 OpenGL/ 目录(2800+ 文件),
         # 任何子模块加载失败都会导致 ImportError 中止构建。
@@ -347,9 +466,15 @@ def run_cxfreeze(skip_flasher=False):
         "httpx",
         "httpcore",
         "httpx._transports",
+        "requests",
+        "urllib3",
+        "certifi",
+        "charset_normalizer",
+        "idna",
         "keyring",
         "keyring.backends",
         "platformdirs",
+        "usb",
         "fido2",
         "fido2.hid",
         "fido2.client",
@@ -361,6 +486,10 @@ def run_cxfreeze(skip_flasher=False):
         "utils",
         "_mext",
     ]
+    pyarmor_runtimes = _pyarmor_runtime_packages(source_root)
+    for runtime_name, _runtime_path in pyarmor_runtimes:
+        if runtime_name not in packages:
+            packages.append(runtime_name)
 
     includes = [
         # ── PyOpenGL: 精确包含，避免 packages 递归发现导致构建失败 ──
@@ -441,25 +570,10 @@ def run_cxfreeze(skip_flasher=False):
             "class_icons",
         ),  # 运行时通过 class_icons/ 相对路径访问
     ]
-    if os.path.exists("ffmpeg.exe"):
-        include_files.append(("ffmpeg.exe", "ffmpeg.exe"))
-    if os.path.exists("ffprobe.exe"):
-        include_files.append(("ffprobe.exe", "ffprobe.exe"))
-
-    # av (PyAV): 手动包含，绕过 cx_Freeze PathFinder（参见 packages 列表中的注释）
-    # include_files 在 freezer.py:117 process_path_specs 中处理，直接复制目录，
-    # 不经过 PathFinder.find_spec，冻结应用的 lib/ 目录在运行时会被加入 sys.path。
-    av_pkg_dir = os.path.join(site_packages, "av")
-    if os.path.isdir(av_pkg_dir):
-        include_files.append((av_pkg_dir, "lib/av"))
-        print(f"  Including av package: {av_pkg_dir}")
-    else:
-        print(f"  WARNING: av package not found at {av_pkg_dir}")
-    # av.libs 包含 FFmpeg DLL（Windows delvewheel 打包，cx_Freeze hooks/av.py:26 原本处理）
-    av_libs_dir = os.path.join(site_packages, "av.libs")
-    if os.path.isdir(av_libs_dir):
-        include_files.append((av_libs_dir, "lib/av.libs"))
-        print(f"  Including av.libs: {av_libs_dir}")
+    for runtime_name, runtime_path in pyarmor_runtimes:
+        include_files.append((runtime_path, runtime_name))
+        print(f"  Including PyArmor runtime: {runtime_path}")
+    include_files.extend(_collect_media_tool_include_files())
 
     # 添加 Rust 模拟器
     simulator_exe = os.path.join(
@@ -470,15 +584,6 @@ def run_cxfreeze(skip_flasher=False):
         target_path = os.path.join("simulator", "arknights_pass_simulator.exe")
         include_files.append((simulator_exe, target_path))
         print(f"  Including simulator: {simulator_exe}")
-
-    # 添加 FFmpeg DLL（模拟器运行时依赖）
-    ffmpeg_sdk_bin = os.path.join("ffmpeg-sdk", "bin")
-    if os.path.exists(ffmpeg_sdk_bin):
-        for dll in os.listdir(ffmpeg_sdk_bin):
-            if dll.endswith(".dll"):
-                src = os.path.join(ffmpeg_sdk_bin, dll)
-                include_files.append((src, dll))
-                print(f"  Including FFmpeg DLL: {dll}")
 
     # flasher_dialog 运行时会直接调用 epass_flasher/bin 下的工具。
     # 缺失时不再中止构建，保留对话框功能，由运行时自行提示或引导下载。
@@ -532,7 +637,7 @@ def run_cxfreeze(skip_flasher=False):
             options={"build_exe": build_options},
             executables=[
                 Executable(
-                    script=MAIN_SCRIPT,
+                    script=os.path.join(source_root, MAIN_SCRIPT),
                     base=base,
                     target_name=f"{PROJECT_NAME}.exe",
                     icon=ICON_FILE if os.path.exists(ICON_FILE) else None,
@@ -635,11 +740,17 @@ def main():
     if args.clean:
         clean_build()
 
+    source_root = None
+    if args.obfuscate:
+        source_root = prepare_obfuscated_source()
+        if not source_root:
+            sys.exit(1)
+
     print("\n" + "=" * 50)
     print("Running cx_Freeze...")
     print("=" * 50)
 
-    if not run_cxfreeze(skip_flasher=args.skip_flasher):
+    if not run_cxfreeze(skip_flasher=args.skip_flasher, source_root=source_root):
         sys.exit(1)
 
     print(f"\ncx_Freeze done: {BUILD_DIR}/")

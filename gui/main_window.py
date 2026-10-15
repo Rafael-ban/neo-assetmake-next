@@ -1,8 +1,8 @@
-#超 级 多 的 屎 山 ciallo~ 啊哈哈.....
-#我就是那个大笨蛋....啊哈哈哈....
-#呜呜呜....果然还是被抛弃了嘛....啊哈哈哈....
-#最喜欢弦音姐姐啦~
-#（以上为自动生成的无意义文本，请忽略）
+# 超 级 多 的 屎 山 ciallo~ 啊哈哈.....
+# 我就是那个大笨蛋....啊哈哈哈....
+# 呜呜呜....果然还是被抛弃了嘛....啊哈哈哈....
+# 最喜欢弦音姐姐啦~
+# （以上为自动生成的无意义文本，请忽略）
 """
 主窗口 - 三栏布局
 """
@@ -15,7 +15,7 @@ from gui.widgets.transition_preview import TransitionPreviewWidget
 from gui.widgets.video_preview import VideoPreviewWidget
 from gui.widgets.config_panel import ConfigPanel
 from config.constants import (
-    APP_NAME, APP_VERSION, get_resolution_spec,
+    APP_NAME, APP_VERSION, APP_VERSION_LABEL, get_resolution_spec,
     SUPPORTED_VIDEO_FORMATS, SUPPORTED_IMAGE_FORMATS
 )
 from gui.widgets.drop_overlay import DropOverlayWidget
@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QMenuBar, QMenu, QStatusBar,
     QFileDialog, QMessageBox, QLabel, QScrollArea,
     QCheckBox, QComboBox, QDoubleSpinBox,
-    QSpinBox, QLineEdit, QTabWidget, QDialog
+    QSpinBox, QLineEdit, QTabWidget, QDialog, QApplication
 )
 from PyQt6.QtCore import Qt, QSettings, QTimer
 import os
@@ -76,9 +76,16 @@ class MainWindow(QMainWindow):
         self._crash_recovery_service = CrashRecoveryService()
         self._crash_recovery_service.initialize(
             os.path.join(self._app_dir, ".recovery"))
+        # Register every autosave with crash-recovery. AutoSaveService writes backups to
+        # <project>/.autosave (or the temp dir) while CrashRecoveryService only scans
+        # <app>/.recovery — without this pointer nothing is recoverable after a crash.
+        self._auto_save_service.saved.connect(self._on_autosave_saved)
 
         self._error_handler = ErrorHandler()
         self._error_handler.error_occurred.connect(self._on_error_occurred)
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._shutdown_runtime_resources)
 
         self._undo_stack = []
         self._redo_stack = []
@@ -124,7 +131,6 @@ class MainWindow(QMainWindow):
         logger.info("主窗口初始化完成")
         self._initializing = False  # 初始化完成
 
-
     def _setup_icon(self):
         """设置窗口图标"""
         icon_path = os.path.join(
@@ -140,7 +146,7 @@ class MainWindow(QMainWindow):
 
     def _setup_ui(self):
         """设置UI"""
-        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION_LABEL}")
         self.setMinimumSize(1200, 900)  # 增大最小高度，确保内容完全显示
         self.menuBar().setVisible(False)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
@@ -173,7 +179,8 @@ class MainWindow(QMainWindow):
         self.header_bar = QWidget()
         self.header_bar.setObjectName("header_bar")
         _header_default_qss = "#header_bar { background-color: rgba(40, 40, 40, 0.7); color: white; border-top-left-radius: 16px; border-top-right-radius: 16px; } #header_bar > QLabel { font-weight: bold; font-size: 16px; }"
-        setCustomStyleSheet(self.header_bar, _header_default_qss, _header_default_qss)
+        setCustomStyleSheet(
+            self.header_bar, _header_default_qss, _header_default_qss)
         header_layout = QHBoxLayout(self.header_bar)
         header_layout.setContentsMargins(20, 8, 20, 8)
         header_layout.setSpacing(24)
@@ -185,7 +192,8 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self.logo_label)
 
         title_label = QLabel(APP_NAME)
-        setCustomStyleSheet(title_label, "font-size: 16px; font-weight: bold;", "font-size: 16px; font-weight: bold;")
+        setCustomStyleSheet(title_label, "font-size: 16px; font-weight: bold;",
+                            "font-size: 16px; font-weight: bold;")
         header_layout.addWidget(title_label)
 
         header_layout.addStretch()
@@ -195,20 +203,20 @@ class MainWindow(QMainWindow):
 
         # 窗口控制按钮 — 文本 PushButton，始终在主题色 header 上
         _ctrl_btn_qss = ("PushButton { background-color: transparent; color: white; "
-            "border: none; border-radius: 18px; font-size: 20px; font-weight: bold; "
-            "padding: 0; margin: 0; } "
-            "PushButton:hover { background-color: rgba(255, 255, 255, 76); } "
-            "PushButton:pressed { background-color: rgba(255, 255, 255, 102); }")
+                         "border: none; border-radius: 18px; font-size: 20px; font-weight: bold; "
+                         "padding: 0; margin: 0; } "
+                         "PushButton:hover { background-color: rgba(255, 255, 255, 76); } "
+                         "PushButton:pressed { background-color: rgba(255, 255, 255, 102); }")
         _max_btn_qss = ("PushButton { background-color: transparent; color: white; "
-            "border: none; border-radius: 18px; font-size: 16px; font-weight: bold; "
-            "padding: 0; margin: 0; } "
-            "PushButton:hover { background-color: rgba(255, 255, 255, 76); } "
-            "PushButton:pressed { background-color: rgba(255, 255, 255, 102); }")
+                        "border: none; border-radius: 18px; font-size: 16px; font-weight: bold; "
+                        "padding: 0; margin: 0; } "
+                        "PushButton:hover { background-color: rgba(255, 255, 255, 76); } "
+                        "PushButton:pressed { background-color: rgba(255, 255, 255, 102); }")
         _close_btn_qss = ("PushButton { background-color: transparent; color: white; "
-            "border: none; border-radius: 18px; font-size: 20px; font-weight: bold; "
-            "padding: 0; margin: 0; } "
-            "PushButton:hover { background-color: rgba(255, 0, 0, 102); } "
-            "PushButton:pressed { background-color: rgba(255, 0, 0, 128); }")
+                          "border: none; border-radius: 18px; font-size: 20px; font-weight: bold; "
+                          "padding: 0; margin: 0; } "
+                          "PushButton:hover { background-color: rgba(255, 0, 0, 102); } "
+                          "PushButton:pressed { background-color: rgba(255, 0, 0, 128); }")
 
         self.btn_minimize = PushButton("−")
         self.btn_minimize.setFixedSize(36, 36)
@@ -261,7 +269,8 @@ class MainWindow(QMainWindow):
         self.btn_material.setToolTip("素材制作")
         self.btn_material.setFixedSize(50, 50)
 
-        self.btn_forum = ToolButton(FluentIcon.PEOPLE if hasattr(FluentIcon, 'PEOPLE') else FluentIcon.CHAT, self.sidebar)
+        self.btn_forum = ToolButton(FluentIcon.PEOPLE if hasattr(
+            FluentIcon, 'PEOPLE') else FluentIcon.CHAT, self.sidebar)
         self.btn_forum.setCheckable(True)
         self.btn_forum.setToolTip("素材论坛")
         self.btn_forum.setFixedSize(50, 50)
@@ -276,6 +285,11 @@ class MainWindow(QMainWindow):
         self.btn_remote.setToolTip("远程管理")
         self.btn_remote.setFixedSize(50, 50)
 
+        self.btn_usbControl = ToolButton(FluentIcon.IOT, self.sidebar)
+        self.btn_usbControl.setCheckable(True)
+        self.btn_usbControl.setToolTip("远程管理")
+        self.btn_usbControl.setFixedSize(50, 50)
+
         buttons_container = QWidget()
         buttons_layout = QVBoxLayout(buttons_container)
         buttons_layout.setContentsMargins(0, 20, 0, 0)
@@ -287,6 +301,7 @@ class MainWindow(QMainWindow):
         buttons_layout.addWidget(self.btn_forum)
         buttons_layout.addWidget(self.btn_about)
         buttons_layout.addWidget(self.btn_remote)
+        buttons_layout.addWidget(self.btn_usbControl)
 
         sidebar_layout.addWidget(buttons_container)
         sidebar_layout.addStretch()
@@ -563,11 +578,16 @@ class MainWindow(QMainWindow):
 
     def _setup_shortcuts(self):
         """设置全局快捷键 - 统一注册到 MainWindow 上，不受子面板可见性影响"""
-        QShortcut(QKeySequence.StandardKey.New, self).activated.connect(self._on_new_project)
-        QShortcut(QKeySequence.StandardKey.Open, self).activated.connect(self._on_open_project)
-        QShortcut(QKeySequence.StandardKey.Save, self).activated.connect(self._on_save_project)
-        QShortcut(QKeySequence("Ctrl+Shift+S"), self).activated.connect(self._on_save_as)
-        QShortcut(QKeySequence.StandardKey.Quit, self).activated.connect(self.close)
+        QShortcut(QKeySequence.StandardKey.New,
+                  self).activated.connect(self._on_new_project)
+        QShortcut(QKeySequence.StandardKey.Open,
+                  self).activated.connect(self._on_open_project)
+        QShortcut(QKeySequence.StandardKey.Save,
+                  self).activated.connect(self._on_save_project)
+        QShortcut(QKeySequence("Ctrl+Shift+S"),
+                  self).activated.connect(self._on_save_as)
+        QShortcut(QKeySequence.StandardKey.Quit,
+                  self).activated.connect(self.close)
 
         self._shortcut_undo = QShortcut(QKeySequence.StandardKey.Undo, self)
         self._shortcut_undo.setEnabled(False)
@@ -576,10 +596,13 @@ class MainWindow(QMainWindow):
         self._shortcut_redo.setEnabled(False)
         self._shortcut_redo.activated.connect(self._on_redo)
 
-        QShortcut(QKeySequence("Ctrl+T"), self).activated.connect(self._on_validate)
-        QShortcut(QKeySequence("Ctrl+E"), self).activated.connect(self._on_export)
+        QShortcut(QKeySequence("Ctrl+T"),
+                  self).activated.connect(self._on_validate)
+        QShortcut(QKeySequence("Ctrl+E"),
+                  self).activated.connect(self._on_export)
 
-        QShortcut(QKeySequence("F1"), self).activated.connect(self._on_shortcuts)
+        QShortcut(QKeySequence("F1"), self).activated.connect(
+            self._on_shortcuts)
 
     def _connect_signals(self):
         """连接信号"""
@@ -612,14 +635,16 @@ class MainWindow(QMainWindow):
             self._on_capture_frame)
         self.advanced_config_panel.transition_image_changed.connect(
             self._on_transition_image_changed)
-        self.advanced_config_panel.ssh_upload_requested.connect(self._on_ssh_upload)
-        
+        self.advanced_config_panel.remote_upload_requested.connect(
+            self._on_remote_upload)
+
         self.basic_config_panel.config_changed.connect(self._on_config_changed)
         self.basic_config_panel.video_file_selected.connect(
             self._on_video_file_selected)
         self.basic_config_panel.validate_requested.connect(self._on_validate)
         self.basic_config_panel.export_requested.connect(self._on_export)
-        self.basic_config_panel.ssh_upload_requested.connect(self._on_ssh_upload)
+        self.basic_config_panel.remote_upload_requested.connect(
+            self._on_remote_upload)
         self.btn_save_icon.clicked.connect(self._on_save_captured_icon)
 
         self.transition_preview.transition_crop_changed.connect(
@@ -639,6 +664,7 @@ class MainWindow(QMainWindow):
         self.btn_forum.clicked.connect(self._on_sidebar_forum)
         self.btn_about.clicked.connect(self._on_sidebar_about)
         self.btn_remote.clicked.connect(self._on_sidebar_remote)
+        self.btn_usbControl.clicked.connect(self._on_sidebar_usbControl)
         self.btn_settings.clicked.connect(self._on_sidebar_settings)
 
         self.intro_preview.video_loaded.connect(self._on_intro_video_loaded)
@@ -673,70 +699,63 @@ class MainWindow(QMainWindow):
 
         self.update()
 
-    def _on_ssh_upload(self):
-        """SSH 上传"""
+    def _on_remote_upload(self):
+        """Export and upload through EPass RNDIS HTTP."""
         try:
             result = self._on_export()
             if not result:
                 return
             export_dialog, dir_path = result
 
-            if not getattr(export_dialog, '_is_completed', False) or \
-                    export_dialog.label_status.text() != "导出完成!":
-                print("导出失败，取消SSH上传")
+            if not getattr(export_dialog, 'was_successful', False):
+                logger.warning("Export failed, cancelling RNDIS HTTP upload")
                 return
 
             if not os.path.exists(dir_path):
-                print("导出目录不存在，取消SSH上传")
+                logger.warning("Export directory does not exist: %s", dir_path)
                 return
 
             settings = self._read_user_settings()
-            host = settings.get('ssh_ip_address', "192.168.137.2")
-            port = settings.get('ssh_port', 22)
-            user = settings.get('ssh_user', "root")
-            password = settings.get('ssh_password', "toor")
-            remote_path = settings.get('ssh_default_upload_path', "/assets/")
-            enableRestart = settings.get('ssh_auto_restart_program', True)
-
-            from core.ssh_upload_service import SshUploadWorker
-            from gui.dialogs.ssh_upload_progress_dialog import SshUploadProgressDialog
-
-            self._ssh_upload_worker = SshUploadWorker(self)
-            self._ssh_upload_dialog = SshUploadProgressDialog(self)
-
-            self._ssh_upload_worker.progress_updated.connect(
-                self._ssh_upload_dialog.update_progress
-            )
-            self._ssh_upload_worker.upload_completed.connect(
-                lambda msg: self._on_ssh_upload_completed(True, msg)
-            )
-            self._ssh_upload_worker.upload_failed.connect(
-                lambda msg: self._on_ssh_upload_completed(False, msg)
-            )
-            self._ssh_upload_dialog.cancel_requested.connect(
-                self._ssh_upload_worker.cancel
+            enable_restart = settings.get(
+                'remote_auto_restart_program',
+                settings.get('ssh_auto_restart_program', True),
             )
 
-            self._ssh_upload_worker.setup(
-                host=host,
-                port=port,
-                user=user,
-                password=password,
-                local_path=dir_path,
-                remote_path=remote_path,
-                enable_restart=enableRestart,
+            from core.rndis_device_service import DEFAULT_BASE_URL
+            from gui.dialogs.remote_upload_progress_dialog import (
+                RemoteUploadProgressDialog,
             )
-            self._ssh_upload_worker.start()
+            from gui.workers.rndis_http_workers import HttpUploadAssetWorker
 
-            self._ssh_upload_dialog.exec()
+            self._remote_upload_worker = HttpUploadAssetWorker(
+                DEFAULT_BASE_URL, dir_path, enable_restart, parent=self
+            )
+            self._remote_upload_dialog = RemoteUploadProgressDialog(self)
+
+            self._remote_upload_worker.progress_updated.connect(
+                self._remote_upload_dialog.update_progress
+            )
+            self._remote_upload_worker.upload_completed.connect(
+                lambda msg: self._on_remote_upload_completed(True, msg)
+            )
+            self._remote_upload_worker.upload_failed.connect(
+                lambda msg: self._on_remote_upload_completed(False, msg)
+            )
+            self._remote_upload_dialog.cancel_requested.connect(
+                self._remote_upload_worker.cancel
+            )
+
+            self._remote_upload_worker.start()
+
+            self._remote_upload_dialog.exec()
 
             # 如果用户取消了对话框，让后台线程尽快结束
-            if self._ssh_upload_worker.isRunning():
-                self._ssh_upload_worker.cancel()
-                self._ssh_upload_worker.wait(2000)
+            if self._remote_upload_worker.isRunning():
+                self._remote_upload_worker.cancel()
+                self._remote_upload_worker.wait(2000)
 
         except Exception as e:
-            print("发生错误:", e)
+            logger.exception("RNDIS HTTP upload failed")
             return
         return
 
@@ -987,6 +1006,18 @@ class MainWindow(QMainWindow):
             settings = QSettings("ArknightsPassMaker", "MainWindow")
             settings.setValue("show_announcement", False)
 
+    def _on_autosave_saved(self, backup_path: str):
+        """Write a crash-recovery pointer for each autosave so it can be found later."""
+        try:
+            project_path = self._project_path or None
+            self._crash_recovery_service.save_recovery_info(
+                backup_path,
+                project_path=project_path,
+                is_temp=not project_path,
+            )
+        except Exception as exc:
+            logger.error(f"注册崩溃恢复信息失败: {exc}")
+
     def _init_temp_project(self):
         """创建临时项目，用户可立即开始编辑"""
         temp_dir = tempfile.mkdtemp(prefix="neo_assetmaker_")
@@ -1051,7 +1082,7 @@ class MainWindow(QMainWindow):
 
     def _update_title(self):
         """更新窗口标题"""
-        title = f"{APP_NAME} v{APP_VERSION}"
+        title = f"{APP_NAME} v{APP_VERSION_LABEL}"
         if self._project_path:
             title = f"{os.path.basename(self._project_path)} - {title}"
         elif self._temp_dir:
@@ -1172,8 +1203,6 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(f"已打开: {self._project_path}")
         self._auto_save_service.start(
             self._config, self._project_path, self._base_dir)
-
-
 
     def _load_project(self, path: str):
         """加载指定路径的项目文件（供最近打开和崩溃恢复调用）"""
@@ -1331,16 +1360,23 @@ class MainWindow(QMainWindow):
             show_error(e, "收集导出数据", self)
             return
 
+        # These write side-car assets (class_icon.png / ark_logo.png / overlay.png) that
+        # the exported epconfig.json references. If they fail we must NOT continue to
+        # export_all, or the run would report "导出成功" while the referenced files are
+        # missing — abort so the failure is visible.
         try:
             self._process_arknights_custom_images(dir_path)
         except Exception as e:
             logger.error(f"处理自定义图片失败: {e}")
             show_error(e, "处理自定义图片", self)
+            return
 
         try:
             self._process_image_overlay(dir_path)
         except Exception as e:
             logger.error(f"处理 ImageOverlay 失败: {e}")
+            show_error(e, "处理 ImageOverlay", self)
+            return
 
         from core.export_service import ExportService
         from gui.dialogs.export_progress_dialog import ExportProgressDialog
@@ -1377,6 +1413,11 @@ class MainWindow(QMainWindow):
     def _on_simulator(self):
         """打开模拟器预览"""
         import subprocess
+        from core.simulator_launcher import (
+            MediaLaunchState,
+            SimulatorLauncher,
+            SimulatorLaunchRequest,
+        )
 
         if not self._config:
             QMessageBox.information(self, "提示", "请先创建或打开项目")
@@ -1390,19 +1431,14 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # 安装模式路径（扁平化）
-        simulator_path = os.path.join(
+        simulator_launcher = SimulatorLauncher(self._app_dir)
+        simulator_path_obj = simulator_launcher.find_simulator()
+        simulator_path = str(simulator_path_obj) if simulator_path_obj else os.path.join(
             self._app_dir,
-            "simulator", "arknights_pass_simulator.exe"
+            "simulator", "target", "release", "arknights_pass_simulator.exe",
         )
-        # 开发模式 fallback：Cargo 默认输出路径
-        if not os.path.exists(simulator_path):
-            simulator_path = os.path.join(
-                self._app_dir,
-                "simulator", "target", "release", "arknights_pass_simulator.exe"
-            )
 
-        if not os.path.exists(simulator_path):
+        if simulator_path_obj is None:
             QMessageBox.information(
                 self, "提示",
                 f"模拟器未找到\n\n"
@@ -1476,7 +1512,7 @@ class MainWindow(QMainWindow):
             config_for_simulator = config_path
             if False and self._config.loop.is_image and loop_file:
                 try:
-                    import av
+                    legacy_media_writer = None
                     import cv2
                     import numpy as np
                     temp_video = os.path.join(
@@ -1488,12 +1524,12 @@ class MainWindow(QMainWindow):
                         raise RuntimeError(
                             f"无法读取图片: {resolved_video_path}")
                     frame_bgr = cv2.resize(frame_bgr, (360, 640))
-                    container = av.open(temp_video, mode='w')
-                    stream = container.add_stream('libx264', rate=30)
+                    container = legacy_media_writer.open(temp_video, mode='w')
+                    stream = container.add_stream('h264', rate=30)
                     stream.width, stream.height = 360, 640
                     stream.pix_fmt = 'yuv420p'
                     for _ in range(30):  # 1 秒循环
-                        av_frame = av.VideoFrame.from_ndarray(
+                        av_frame = legacy_media_writer.frame_from_ndarray(
                             cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB),
                             format='rgb24')
                         for packet in stream.encode(av_frame):
@@ -1534,7 +1570,8 @@ class MainWindow(QMainWindow):
                 is_image=self._config.loop.is_image,
             )
             if loop_state is None:
-                resolved_video_path = self._resolve_media_path(self._config.loop.file)
+                resolved_video_path = self._resolve_media_path(
+                    self._config.loop.file)
                 QMessageBox.warning(
                     self, "视频文件不存在",
                     f"模拟器预览需要的视频文件未找到：\n\n"
@@ -1587,9 +1624,6 @@ class MainWindow(QMainWindow):
 
             cropbox = loop_state["cropbox"]
             rotation = loop_state["rotation"]
-            loop_end_frame = max(
-                loop_state["start_frame"], loop_state["end_frame"] - 1
-            )
 
             logger.info(
                 "启动模拟器: "
@@ -1598,55 +1632,41 @@ class MainWindow(QMainWindow):
                 f"gui_video={self.video_preview.video_path}"
             )
 
-            popen_kwargs = {'stderr': subprocess.PIPE}
-            if sys.platform == 'win32':
-                popen_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
-
-            # 设置工作目录为应用根目录，确保模拟器能找到 FFmpeg DLL
-            # Windows DLL 搜索顺序：exe 所在目录 → system32 → PATH
-            # 模拟器 exe 在 simulator/ 子目录（安装模式）或 simulator/target/release/（开发模式），
-            # 均无法直接找到根目录的 FFmpeg DLL，需要通过 cwd 和 PATH 解决
-            popen_kwargs['cwd'] = self._app_dir
-
-            # 双保险：将 app_dir 加入 PATH 环境变量
-            env = os.environ.copy()
-            env['PATH'] = self._app_dir + os.pathsep + env.get('PATH', '')
-            # 开发模式：FFmpeg DLL 可能在 ffmpeg-sdk/bin/ 子目录
-            ffmpeg_sdk_bin = os.path.join(self._app_dir, 'ffmpeg-sdk', 'bin')
-            if os.path.isdir(ffmpeg_sdk_bin):
-                env['PATH'] = ffmpeg_sdk_bin + os.pathsep + env['PATH']
-            popen_kwargs['env'] = env
-
             # Detect current theme to pass to simulator
             from qfluentwidgets import isDarkTheme
             theme = "dark" if isDarkTheme() else "light"
 
-            command = [
-                simulator_path,
-                "--config", config_for_simulator,
-                "--base-dir", self._base_dir,
-                "--app-dir", self._app_dir,
-                "--loop-cropbox",
-                f"{cropbox[0]},{cropbox[1]},{cropbox[2]},{cropbox[3]}",
-                "--loop-rotation", str(rotation),
-                "--loop-start-frame", str(loop_state["start_frame"]),
-                "--loop-end-frame", str(loop_end_frame),
-                "--theme", theme,
-            ]
+            launch_request = SimulatorLaunchRequest(
+                config_path=config_for_simulator,
+                base_dir=self._base_dir,
+                app_dir=self._app_dir,
+                theme=theme,
+                loop=MediaLaunchState(
+                    cropbox=cropbox,
+                    rotation=rotation,
+                    start_frame=loop_state["start_frame"],
+                    end_frame=loop_state["end_frame"],
+                ),
+            )
             if intro_state is not None:
-                intro_cropbox = intro_state["cropbox"]
-                intro_end_frame = max(
-                    intro_state["start_frame"], intro_state["end_frame"] - 1
+                launch_request = SimulatorLaunchRequest(
+                    config_path=config_for_simulator,
+                    base_dir=self._base_dir,
+                    app_dir=self._app_dir,
+                    theme=theme,
+                    loop=launch_request.loop,
+                    intro=MediaLaunchState(
+                        cropbox=intro_state["cropbox"],
+                        rotation=intro_state["rotation"],
+                        start_frame=intro_state["start_frame"],
+                        end_frame=intro_state["end_frame"],
+                    ),
                 )
-                command.extend([
-                    "--intro-cropbox",
-                    f"{intro_cropbox[0]},{intro_cropbox[1]},{intro_cropbox[2]},{intro_cropbox[3]}",
-                    "--intro-rotation", str(intro_state["rotation"]),
-                    "--intro-start-frame", str(intro_state["start_frame"]),
-                    "--intro-end-frame", str(intro_end_frame),
-                ])
 
-            proc = subprocess.Popen(command, **popen_kwargs)
+            proc = simulator_launcher.launch_cli(
+                launch_request,
+                simulator_path=simulator_path,
+            )
 
             logger.info(f"模拟器已启动: {simulator_path}")
 
@@ -1663,14 +1683,14 @@ class MainWindow(QMainWindow):
                     stderr_output = ""
                     try:
                         stderr_output = self._simulator_proc.stderr.read(
-                            ).decode('utf-8', errors='replace')
+                        ).decode('utf-8', errors='replace')
                     except Exception:
                         pass
                     QMessageBox.warning(
                         self, "模拟器错误",
                         f"模拟器异常退出（返回码: {retcode}）\n\n"
                         f"可能原因：\n"
-                        f"• FFmpeg DLL 缺失或版本不匹配\n"
+                        f"• Media toolchain missing or version mismatch\n"
                         f"• 视频文件损坏或格式不支持\n"
                         f"• 配置文件格式错误\n\n"
                         f"路径: {simulator_path}"
@@ -1718,7 +1738,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self, f"关于 {APP_NAME}",
             f"<h3>{APP_NAME}</h3>"
-            f"<p>版本: {APP_VERSION}</p>"
+            f"<p>版本: {APP_VERSION_LABEL}</p>"
             f"<p>明日方舟通行证素材制作器</p>"
             f"<p>作者: Rafael_ban & 初微弦音 & 涙不在为你而流</p>"
         )
@@ -1884,6 +1904,8 @@ class MainWindow(QMainWindow):
         self.btn_forum.setChecked(False)
         self.btn_about.setChecked(False)
         self.btn_remote.setChecked(False)
+        self.btn_usbControl.setChecked(True)
+        self.btn_usbControl.setChecked(False)
         self.btn_settings.setChecked(False)
 
         self._pause_all_videos()
@@ -1897,6 +1919,8 @@ class MainWindow(QMainWindow):
             self._about_widget.setVisible(False)
         if hasattr(self, '_remote_page'):
             self._remote_page.setVisible(False)
+        if hasattr(self, '_usbControl_page'):
+            self._usbControl_page.setVisible(False)
 
         if not hasattr(self, '_flasher_widget'):
             from gui.dialogs.flasher_dialog import FlasherDialog
@@ -1919,6 +1943,8 @@ class MainWindow(QMainWindow):
         self.btn_forum.setChecked(False)
         self.btn_about.setChecked(False)
         self.btn_remote.setChecked(False)
+        self.btn_usbControl.setChecked(True)
+        self.btn_usbControl.setChecked(False)
         self.btn_settings.setChecked(False)
 
         if hasattr(self, '_forum_widget'):
@@ -1931,7 +1957,8 @@ class MainWindow(QMainWindow):
             self._flasher_widget.setVisible(False)
         if hasattr(self, '_remote_page'):
             self._remote_page.setVisible(False)
-
+        if hasattr(self, '_usbControl_page'):
+            self._usbControl_page.setVisible(False)
         self.splitter.setVisible(True)
         self.status_bar.showMessage("素材制作模式")
 
@@ -1944,6 +1971,8 @@ class MainWindow(QMainWindow):
         self.btn_forum.setChecked(True)
         self.btn_about.setChecked(False)
         self.btn_remote.setChecked(False)
+        self.btn_usbControl.setChecked(True)
+        self.btn_usbControl.setChecked(False)
         self.btn_settings.setChecked(False)
 
         self._pause_all_videos()
@@ -1957,11 +1986,18 @@ class MainWindow(QMainWindow):
             self._flasher_widget.setVisible(False)
         if hasattr(self, '_remote_page'):
             self._remote_page.setVisible(False)
-
+        if hasattr(self, '_usbControl_page'):
+            self._usbControl_page.setVisible(False)
         if not hasattr(self, '_forum_widget'):
             try:
-                from _mext.ui.widget import MaterialForumWidget
-                self._forum_widget = MaterialForumWidget(parent=self)
+                from gui.plugin_host import (
+                    create_material_forum_plugin,
+                )
+                self._forum_plugin_handle = create_material_forum_plugin(
+                    parent=self,
+                    context=self._create_forum_plugin_context(),
+                )
+                self._forum_widget = self._forum_plugin_handle.widget
                 self.content_layout.addWidget(self._forum_widget)
             except ImportError as exc:
                 logger.error("素材论坛模块加载失败，缺少必要依赖", exc_info=True)
@@ -1985,6 +2021,12 @@ class MainWindow(QMainWindow):
         self._forum_widget.setVisible(True)
         self.status_bar.showMessage("素材论坛模式")
 
+    def _create_forum_plugin_context(self):
+        """Create plugin context from the current user settings."""
+        from gui.plugin_host import default_plugin_context
+
+        return default_plugin_context(self._read_user_settings())
+
     def _on_sidebar_about(self):
         """侧边栏：项目介绍"""
         self.btn_firmware.setChecked(False)
@@ -1992,6 +2034,8 @@ class MainWindow(QMainWindow):
         self.btn_forum.setChecked(False)
         self.btn_about.setChecked(True)
         self.btn_remote.setChecked(False)
+        self.btn_usbControl.setChecked(True)
+        self.btn_usbControl.setChecked(False)
         self.btn_settings.setChecked(False)
 
         self._pause_all_videos()
@@ -2005,7 +2049,8 @@ class MainWindow(QMainWindow):
             self._flasher_widget.setVisible(False)
         if hasattr(self, '_remote_page'):
             self._remote_page.setVisible(False)
-
+        if hasattr(self, '_usbControl_page'):
+            self._usbControl_page.setVisible(False)
         if not hasattr(self, '_about_widget'):
             self._about_widget = QWidget()
             self._about_widget.setVisible(False)
@@ -2073,7 +2118,7 @@ class MainWindow(QMainWindow):
             sw_specs = [
                 ("系统", "Buildroot 构建，Linux 主线 5.4.77 内核"),
                 ("协议", "完全开源（硬件 / 软件资料）"),
-                ("版本", f"素材制作器 v{APP_VERSION}"),
+                ("版本", f"素材制作器 v{APP_VERSION_LABEL}"),
             ]
             for key, value in sw_specs:
                 row = QHBoxLayout()
@@ -2181,7 +2226,8 @@ class MainWindow(QMainWindow):
                 self.basic_config_panel.setVisible(True)
 
                 if self._config:
-                    self.basic_config_panel.set_config(self._config, self._base_dir)
+                    self.basic_config_panel.set_config(
+                        self._config, self._base_dir)
 
                 self.status_bar.showMessage("基础设置模式 - 简化界面")
                 self._show_loop_tab_only()
@@ -2194,7 +2240,8 @@ class MainWindow(QMainWindow):
                 self.basic_config_panel.setVisible(False)
 
                 if self._config:
-                    self.advanced_config_panel.set_config(self._config, self._base_dir)
+                    self.advanced_config_panel.set_config(
+                        self._config, self._base_dir)
 
                 self.status_bar.showMessage("高级设置模式 - 完整界面")
                 self._show_all_tabs()
@@ -2208,6 +2255,7 @@ class MainWindow(QMainWindow):
         self.btn_forum.setChecked(False)
         self.btn_about.setChecked(False)
         self.btn_remote.setChecked(True)
+        self.btn_usbControl.setChecked(False)
         self.btn_settings.setChecked(False)
 
         self._pause_all_videos()
@@ -2221,7 +2269,8 @@ class MainWindow(QMainWindow):
             self._about_widget.setVisible(False)
         if hasattr(self, '_flasher_widget'):
             self._flasher_widget.setVisible(False)
-
+        if hasattr(self, '_usbControl_page'):
+            self._usbControl_page.setVisible(False)
         if not hasattr(self, '_remote_page'):
             from gui.widgets.remote_page import RemotePage
             self._remote_page = RemotePage(parent=self)
@@ -2241,6 +2290,45 @@ class MainWindow(QMainWindow):
         self._remote_page.setVisible(True)
         self.status_bar.showMessage("远程管理模式")
 
+    def _on_sidebar_usbControl(self):
+        """侧边栏：USB控制"""
+        self.btn_firmware.setChecked(False)
+        self.btn_material.setChecked(False)
+        self.btn_forum.setChecked(False)
+        self.btn_about.setChecked(False)
+        self.btn_remote.setChecked(False)
+        self.btn_usbControl.setChecked(True)
+        self.btn_settings.setChecked(False)
+        self._pause_all_videos()
+        if hasattr(self, '_forum_widget'):
+            self._forum_widget.setVisible(False)
+        self.splitter.setVisible(False)
+        if hasattr(self, '_about_widget'):
+            self._about_widget.setVisible(False)
+        if hasattr(self, '_flasher_widget'):
+            self._flasher_widget.setVisible(False)
+        if hasattr(self, '_remote_page'):
+            self._remote_page.setVisible(False)
+        if hasattr(self, '_settings_page'):
+            self._settings_page.setVisible(False)
+        if not hasattr(self, '_usbControl_page'):
+            from gui.widgets.usb_control_page import UsbControlPage
+            self._usbControl_page = UsbControlPage(parent=self)
+            self.content_layout.addWidget(self._usbControl_page)
+            try:
+                import json
+                config_file = os.path.join(self._app_dir, "config",
+                                           "user_settings.json")
+                if os.path.exists(config_file):
+                    with open(config_file, "r", encoding="utf-8") as f:
+                        settings = json.load(f)
+                    self._usbControl_page.load_settings(settings)
+            except Exception:
+                pass
+
+        self._usbControl_page.setVisible(True)
+        self.status_bar.showMessage("USB管理器模式")
+
     def _on_sidebar_settings(self):
         """侧边栏：设置"""
         self.btn_firmware.setChecked(False)
@@ -2248,6 +2336,7 @@ class MainWindow(QMainWindow):
         self.btn_forum.setChecked(False)
         self.btn_about.setChecked(False)
         self.btn_remote.setChecked(False)
+        self.btn_usbControl.setChecked(False)
         self.btn_settings.setChecked(True)
 
         self._pause_all_videos()
@@ -2261,7 +2350,8 @@ class MainWindow(QMainWindow):
             self._flasher_widget.setVisible(False)
         if hasattr(self, '_remote_page'):
             self._remote_page.setVisible(False)
-
+        if hasattr(self, '_usbControl_page'):
+            self._usbControl_page.setVisible(False)
         if not hasattr(self, '_settings_page'):
             from gui.widgets.settings_page import SettingsPage
             self._settings_page = SettingsPage(parent=self)
@@ -2477,7 +2567,7 @@ class MainWindow(QMainWindow):
             result = QMessageBox.information(
                 self, "发现新版本",
                 f"发现新版本 v{release_info.version}\n\n"
-                f"当前版本: v{APP_VERSION}\n\n"
+                f"当前版本: v{APP_VERSION_LABEL}\n\n"
                 f"是否立即查看更新详情？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
@@ -2620,10 +2710,16 @@ class MainWindow(QMainWindow):
         elif setting_name == 'scale':
             logger.info(f"界面缩放已设置为: {value}")
 
-        elif setting_name.startswith('ssh_'):
-            # SSH 设置变更后同步到 RemotePage 的内存缓存
+        elif setting_name in {'remote_auto_restart_program'} or \
+                setting_name.startswith('ssh_'):
+            # Keep RemotePage's in-memory settings synchronized.
             if hasattr(self, '_remote_page'):
-                self._remote_page._ssh_config[setting_name] = value
+                self._remote_page._settings[setting_name] = value
+
+        elif setting_name.startswith('usb_controler_'):
+            # Keep RemotePage's in-memory settings synchronized.
+            if hasattr(self, '_usbControl_page'):
+                self._usbControl_page._settings[setting_name] = value
 
         elif setting_name == 'auto_save':
             if value:
@@ -2705,7 +2801,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'content_stack'):
             content_light = "#content_stack { background-color: rgba(255, 255, 255, 0.95); }"
             content_dark = "#content_stack { background-color: rgba(30, 30, 30, 0.95); }"
-            setCustomStyleSheet(self.content_stack, content_light, content_dark)
+            setCustomStyleSheet(self.content_stack,
+                                content_light, content_dark)
 
         nav_buttons = [
             'btn_nav_file',
@@ -2716,9 +2813,9 @@ class MainWindow(QMainWindow):
             if hasattr(self, btn_name):
                 btn = getattr(self, btn_name)
                 nav_qss = ("PushButton { background-color: transparent; color: white; "
-                    "border: none; padding: 10px 20px; font-size: 14px; border-radius: 6px; } "
-                    "PushButton:hover { background-color: rgba(255, 255, 255, 0.3); } "
-                    "PushButton:pressed, PushButton:checked { background-color: rgba(255, 255, 255, 0.4); }")
+                           "border: none; padding: 10px 20px; font-size: 14px; border-radius: 6px; } "
+                           "PushButton:hover { background-color: rgba(255, 255, 255, 0.3); } "
+                           "PushButton:pressed, PushButton:checked { background-color: rgba(255, 255, 255, 0.4); }")
                 setCustomStyleSheet(btn, nav_qss, nav_qss)
 
         for btn in [
@@ -2726,6 +2823,7 @@ class MainWindow(QMainWindow):
                 self.btn_material,
                 self.btn_forum,
                 self.btn_about,
+                self.btn_usbControl,
                 self.btn_remote,
                 self.btn_settings]:
             light_qss = (
@@ -2748,6 +2846,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'logo_label'):
             logo_qss = f"#logo_label {{ background-color: white; color: {color_hex}; border-radius: 16px; padding: 8px 12px; font-size: 14px; font-weight: bold; }}"
             setCustomStyleSheet(self.logo_label, logo_qss, logo_qss)
+
+        if hasattr(self, '_forum_plugin_handle'):
+            self._forum_plugin_handle.apply_theme()
 
         logger.info(f"应用主题颜色: {color_hex}")
 
@@ -2811,7 +2912,8 @@ class MainWindow(QMainWindow):
                 }
             """
 
-            self.setStyleSheet(style % (content_bg, theme_color, theme_color, status_bg, status_color, status_border))
+            self.setStyleSheet(style % (
+                content_bg, theme_color, theme_color, status_bg, status_color, status_border))
             self.update()
 
             logger.info("图片模式样式已应用")
@@ -2932,28 +3034,14 @@ class MainWindow(QMainWindow):
     def _probe_video_metadata(
         self, video_path: str
     ) -> tuple[int, int, int, float]:
-        import av
+        from core.video_processor import VideoProcessor
+        from core.media_tools import MediaToolchain
 
-        container = av.open(video_path)
-        try:
-            stream = container.streams.video[0]
-            fps = float(stream.average_rate) if stream.average_rate else 30.0
-            width = stream.width
-            height = stream.height
-            total_frames = stream.frames
-            if total_frames == 0 and stream.duration and stream.time_base:
-                total_frames = max(
-                    1, int(float(stream.duration * stream.time_base) * fps)
-                )
-            if total_frames == 0 and container.duration is not None:
-                total_frames = max(
-                    1, int((container.duration / av.time_base) * fps)
-                )
-            if total_frames == 0:
-                total_frames = 1
-            return width, height, total_frames, fps
-        finally:
-            container.close()
+        toolchain = MediaToolchain.discover()
+        info = VideoProcessor(toolchain.mpv_path).get_video_info(video_path)
+        if info is None:
+            raise RuntimeError(f"Unable to probe video metadata: {video_path}")
+        return info.width, info.height, max(1, info.total_frames), info.fps or 30.0
 
     def _probe_image_size(self, image_path: str) -> tuple[int, int]:
         import cv2
@@ -3008,10 +3096,12 @@ class MainWindow(QMainWindow):
 
         if is_image:
             width, height = self._probe_image_size(resolved_path)
-            total_frames = max(1, int(getattr(preview, "total_frames", 0) or 150))
+            total_frames = max(
+                1, int(getattr(preview, "total_frames", 0) or 150))
             fps = float(getattr(preview, "video_fps", 0) or 30.0)
         else:
-            width, height, total_frames, fps = self._probe_video_metadata(resolved_path)
+            width, height, total_frames, fps = self._probe_video_metadata(
+                resolved_path)
 
         start_frame, end_frame = self._get_trim_bounds(
             preview,
@@ -3031,9 +3121,11 @@ class MainWindow(QMainWindow):
         }
 
     def _bake_loop_image_for_simulator(self, loop_state: dict) -> tuple[str, dict]:
-        import av
         import cv2
         import numpy as np
+        from core.export_service import VideoExportParams
+        from core.media_pipeline import MediaEncoder, write_vpy_script
+        from core.media_tools import MediaToolchain
 
         image_path = loop_state["path"]
         img_data = np.fromfile(image_path, dtype=np.uint8)
@@ -3060,33 +3152,49 @@ class MainWindow(QMainWindow):
         target_w, target_h = self._get_target_resolution()
         baked_frame = cv2.resize(cropped, (target_w, target_h))
 
-        stream_fps = max(1, int(round(float(loop_state.get("fps", 30.0) or 30.0))))
+        stream_fps = max(
+            1, int(round(float(loop_state.get("fps", 30.0) or 30.0))))
         total_frames = max(
             1, int(loop_state.get("total_frames", stream_fps) or stream_fps)
         )
 
+        temp_image = os.path.join(self._base_dir, "_sim_temp_source.png")
+        temp_script = os.path.join(self._base_dir, "_sim_temp.vpy")
         temp_video = os.path.join(self._base_dir, "_sim_temp.mp4")
-        container = av.open(temp_video, mode="w")
-        try:
-            stream = container.add_stream("libx264", rate=stream_fps)
-            stream.width = target_w
-            stream.height = target_h
-            stream.pix_fmt = "yuv420p"
+        success, encoded = cv2.imencode(".png", baked_frame)
+        if not success:
+            raise RuntimeError("Unable to encode simulator preview image")
+        with open(temp_image, "wb") as fh:
+            fh.write(encoded.tobytes())
 
-            rgb_frame = cv2.cvtColor(baked_frame, cv2.COLOR_BGR2RGB)
-            for _ in range(total_frames):
-                av_frame = av.VideoFrame.from_ndarray(rgb_frame, format="rgb24")
-                for packet in stream.encode(av_frame):
-                    container.mux(packet)
-            for packet in stream.encode():
-                container.mux(packet)
+        resolution = self._config.screen.value if self._config else "360x640"
+        params = VideoExportParams(
+            video_path=temp_image,
+            cropbox=(0, 0, target_w, target_h),
+            start_frame=0,
+            end_frame=total_frames,
+            fps=float(stream_fps),
+            resolution=resolution,
+            is_image=True,
+            rotation=0,
+        )
+        write_vpy_script(temp_script, params)
+        try:
+            MediaEncoder(MediaToolchain.discover()).encode_vpy_to_mp4(
+                temp_script,
+                temp_video,
+                float(stream_fps),
+            )
         finally:
-            container.close()
+            for temp_path in (temp_script, temp_image):
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
 
         temp_config = self._config.copy()
         temp_config.loop.file = os.path.basename(temp_video)
         temp_config.loop.is_image = False
-        temp_config_path = os.path.join(self._base_dir, "_sim_temp_config.json")
+        temp_config_path = os.path.join(
+            self._base_dir, "_sim_temp_config.json")
         temp_config.save_to_file(temp_config_path)
 
         baked_state = dict(loop_state)
@@ -3111,7 +3219,8 @@ class MainWindow(QMainWindow):
                 from gui.widgets.video_preview import VideoPreviewWidget
                 frame = frame.copy()
                 rotation = source_preview.get_rotation()
-                frame = VideoPreviewWidget.apply_rotation_to_frame(frame, rotation)
+                frame = VideoPreviewWidget.apply_rotation_to_frame(
+                    frame, rotation)
                 self.frame_capture_preview.update_static_frame(frame)
                 logger.info(
                     f"更新截取帧编辑页面，帧: {source_preview.current_frame_index}")
@@ -3182,7 +3291,7 @@ class MainWindow(QMainWindow):
             self.timeline.set_rotation(rotation)
 
     def _on_loop_rotation_changed(self, rotation: int):
-        """寰幆瑙嗛鏃嬭浆鍙樻洿"""
+        """循环视频旋转变更"""
         if self._is_timeline_bound_to(self.video_preview):
             self.timeline.set_rotation(rotation)
 
@@ -3572,10 +3681,18 @@ class MainWindow(QMainWindow):
             if loop_image_path and os.path.exists(loop_image_path):
                 data['loop_image_path'] = loop_image_path
                 data['is_loop_image'] = True
+            else:
+                # The loop asset is required. Fail loudly (caught by _on_export's
+                # try/except -> show_error + return) instead of silently dropping it and
+                # exporting an epconfig.json that references a loop.mp4 that never gets made.
+                raise FileNotFoundError(
+                    f"循环素材(图片)缺失或不存在: {loop_image_path or self._config.loop.file!r}"
+                )
         elif self._config.loop.file:
             loop_state = self._collect_preview_media_state(
                 self.video_preview,
                 self._config.loop.file,
+                default_to_full=True,
             )
             if loop_state:
                 data['loop_video_params'] = VideoExportParams(
@@ -3721,17 +3838,17 @@ class MainWindow(QMainWindow):
             self.status_bar.showMessage("导出失败")
             logger.error(f"导出失败: {message}")
 
-    def _on_ssh_upload_completed(self, success: bool, message: str):
-        """SSH 上传完成回调"""
-        if hasattr(self, '_ssh_upload_dialog') and self._ssh_upload_dialog:
-            self._ssh_upload_dialog.set_completed(success, message)
+    def _on_remote_upload_completed(self, success: bool, message: str):
+        """Remote HTTP upload completion callback."""
+        if hasattr(self, '_remote_upload_dialog') and self._remote_upload_dialog:
+            self._remote_upload_dialog.set_completed(success, message)
 
         if success:
             self.status_bar.showMessage(message)
-            logger.info(f"SSH 上传成功: {message}")
+            logger.info(f"RNDIS HTTP upload succeeded: {message}")
         else:
-            self.status_bar.showMessage("SSH 上传失败")
-            logger.error(f"SSH 上传失败: {message}")
+            self.status_bar.showMessage("远程上传失败")
+            logger.error(f"RNDIS HTTP upload failed: {message}")
 
     def _check_save(self) -> bool:
         """检查是否需要保存"""
@@ -3813,17 +3930,44 @@ class MainWindow(QMainWindow):
             self._save_settings()
             self._cleanup_temp_dir()
 
-            self._auto_save_service.stop()
-
-            if hasattr(self, '_forum_widget'):
-                self._forum_widget.shutdown()
-
-            if hasattr(self, '_remote_page'):
-                self._remote_page.shutdown()
+            self._shutdown_runtime_resources()
 
             event.accept()
         else:
             event.ignore()
+
+    def _shutdown_runtime_resources(self):
+        """Stop media previews and auxiliary pages during close or app quit."""
+        try:
+            self._auto_save_service.stop()
+        except Exception as exc:
+            logger.debug("auto-save shutdown failed: %s", exc)
+
+        for preview in (
+            getattr(self, "video_preview", None),
+            getattr(self, "intro_preview", None),
+            getattr(self, "frame_capture_preview", None),
+        ):
+            if preview is None:
+                continue
+            try:
+                preview.clear()
+            except Exception as exc:
+                logger.debug("preview shutdown failed: %s", exc)
+
+        try:
+            if hasattr(self, '_forum_plugin_handle'):
+                self._forum_plugin_handle.shutdown()
+            elif hasattr(self, '_forum_widget'):
+                self._forum_widget.shutdown()
+        except Exception as exc:
+            logger.debug("forum shutdown failed: %s", exc)
+
+        try:
+            if hasattr(self, '_remote_page'):
+                self._remote_page.shutdown()
+        except Exception as exc:
+            logger.debug("remote page shutdown failed: %s", exc)
 
     def _on_maximize(self):
         """最大化/还原窗口"""

@@ -219,6 +219,7 @@ class SettingsPage(QWidget):
         api_url_layout.setSpacing(12)
         api_url_layout.addWidget(BodyLabel("服务器地址：", content))
         self._api_url_edit = LineEdit(content)
+        self._api_url_edit.setReadOnly(True)
         self._api_url_edit.setText(self._services.config.api_base_url)
         api_url_layout.addWidget(self._api_url_edit, stretch=1)
         layout.addLayout(api_url_layout)
@@ -330,6 +331,7 @@ class SettingsPage(QWidget):
         )
         self._creds_worker.completed.connect(self._on_credentials_loaded)
         self._creds_worker.error.connect(self._on_credentials_error)
+        self._services.track_qthread(self._creds_worker)
         self._creds_worker.start()
 
     @Slot(list)
@@ -377,6 +379,7 @@ class SettingsPage(QWidget):
                 duration=5000,
             )
         )
+        self._services.track_qthread(self._register_begin_worker)
         self._register_begin_worker.start()
 
     @Slot(object)
@@ -403,6 +406,7 @@ class SettingsPage(QWidget):
         )
         worker.error.connect(lambda msg: self._on_register_error(msg, touch_dialog))
 
+        self._services.track_qthread(worker)
         worker.start()
 
     def _show_pin_dialog(self, worker: Any, retries: int) -> None:
@@ -441,6 +445,7 @@ class SettingsPage(QWidget):
                 duration=5000,
             )
         )
+        self._services.track_qthread(self._register_complete_worker)
         self._register_complete_worker.start()
 
     @Slot(object)
@@ -484,6 +489,7 @@ class SettingsPage(QWidget):
                 duration=5000,
             )
         )
+        self._services.track_qthread(self._delete_cred_worker)
         self._delete_cred_worker.start()
 
     @Slot(object)

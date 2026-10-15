@@ -26,13 +26,11 @@ from qfluentwidgets import (
     TitleLabel,
     ToolButton,
     TransparentTogglePushButton,
-    isDarkTheme,
 )
-from PyQt6.QtCore import Qt, QSize, pyqtSignal as Signal, pyqtSlot as Slot
+from PyQt6.QtCore import Qt, pyqtSignal as Signal, pyqtSlot as Slot
 from PyQt6.QtGui import QColor, QFont, QPixmap
 from PyQt6.QtWidgets import (
     QHBoxLayout,
-    QLabel,
     QSizePolicy,
     QSpacerItem,
     QVBoxLayout,
@@ -41,16 +39,25 @@ from PyQt6.QtWidgets import (
 
 from _mext.core.service_manager import ServiceManager
 from _mext.models.material import Material
-from _mext.services.api_worker import DownloadUrlWorker, LikeToggleWorker, MaterialDetailWorker, RelatedMaterialsWorker
+from _mext.services.api_worker import (
+    LikeToggleWorker,
+    MaterialDetailWorker,
+    RelatedMaterialsWorker,
+)
 from _mext.ui.components.comment_section import CommentSection
 from _mext.ui.components.gallery_card import GalleryCard
 from _mext.ui.components.thumbnail_loader import ThumbnailLoader
 from _mext.ui.styles import (
     AVATAR_LG,
+    COLOR_BG_ELEVATED,
+    COLOR_BG_INSET,
+    COLOR_BG_SURFACE,
+    COLOR_BORDER,
     COLOR_PLACEHOLDER_BG,
+    COLOR_TEXT_MUTED,
+    COLOR_TEXT_SECONDARY,
     DETAIL_IMAGE_MAX_HEIGHT,
     DETAIL_MAX_WIDTH,
-    DETAIL_SIDEBAR_WIDTH,
     GALLERY_CARD_BORDER_RADIUS,
     RELATED_CARD_WIDTH,
     RELATED_SECTION_HEIGHT,
@@ -58,6 +65,7 @@ from _mext.ui.styles import (
     SPACING_MD,
     SPACING_SM,
     SPACING_XL,
+    apply_themed_style,
     pick,
 )
 
@@ -94,8 +102,10 @@ class MaterialDetailPage(QWidget):
         self._thumb_loader.thumbnail_ready.connect(self._on_thumbnail_ready)
         self._related_cards: dict = {}
 
+        self.setObjectName("MaterialDetailPage")
         self._setup_ui()
         self._connect_signals()
+        self._apply_styles()
 
     def _setup_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -104,6 +114,8 @@ class MaterialDetailPage(QWidget):
 
         # ── Top bar ───────────────────────────────────────────
         header = QWidget(self)
+        header.setObjectName("DetailTopBar")
+        header.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         header.setFixedHeight(52)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(SPACING_MD, 0, SPACING_MD, 0)
@@ -111,6 +123,7 @@ class MaterialDetailPage(QWidget):
 
         self._back_btn = ToolButton(FluentIcon.LEFT_ARROW, header)
         self._back_btn.setFixedSize(36, 36)
+        self._back_btn.setToolTip("返回")
         header_layout.addWidget(self._back_btn)
 
         self._header_title = SubtitleLabel("", header)
@@ -120,10 +133,12 @@ class MaterialDetailPage(QWidget):
         self._download_btn = PrimaryPushButton("\u4e0b\u8f7d", header)  # 下载
         self._download_btn.setFixedHeight(34)
         self._download_btn.setIcon(FluentIcon.DOWNLOAD)
+        self._download_btn.setToolTip("下载素材")
         header_layout.addWidget(self._download_btn)
 
         self._fav_btn = TransparentTogglePushButton(FluentIcon.HEART, header)
         self._fav_btn.setFixedSize(36, 36)
+        self._fav_btn.setToolTip("喜欢")
         header_layout.addWidget(self._fav_btn)
 
         root.addWidget(header)
@@ -157,7 +172,11 @@ class MaterialDetailPage(QWidget):
         split.addLayout(left, stretch=6)
 
         # Right: metadata sidebar
-        right = QVBoxLayout()
+        sidebar = QWidget(body)
+        sidebar.setObjectName("DetailSidebar")
+        sidebar.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        right = QVBoxLayout(sidebar)
+        right.setContentsMargins(SPACING_LG, SPACING_LG, SPACING_LG, SPACING_LG)
         right.setSpacing(SPACING_MD)
 
         self._title_label = TitleLabel("", body)
@@ -170,13 +189,14 @@ class MaterialDetailPage(QWidget):
         self._creator_row.addWidget(by_label)
         self._creator_name = BodyLabel("", body)
         self._creator_name.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._creator_name.setToolTip("查看创作者主页")
         self._creator_row.addWidget(self._creator_name)
         self._creator_row.addStretch()
         right.addLayout(self._creator_row)
 
         # Meta fields
         self._category_pill = PillPushButton("", body)
-        self._category_pill.setFixedHeight(22)
+        self._category_pill.setFixedHeight(24)
         self._category_pill.setCheckable(False)
         right.addWidget(self._category_pill, alignment=Qt.AlignmentFlag.AlignLeft)
 
@@ -206,8 +226,15 @@ class MaterialDetailPage(QWidget):
 
         # Creator card
         creator_card = QWidget(body)
+        creator_card.setObjectName("DetailCreatorCard")
+        creator_card.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         creator_card_layout = QHBoxLayout(creator_card)
-        creator_card_layout.setContentsMargins(0, 0, 0, 0)
+        creator_card_layout.setContentsMargins(
+            SPACING_MD,
+            SPACING_MD,
+            SPACING_MD,
+            SPACING_MD,
+        )
         creator_card_layout.setSpacing(SPACING_MD)
 
         self._creator_avatar = AvatarWidget(creator_card)
@@ -228,7 +255,7 @@ class MaterialDetailPage(QWidget):
         right.addWidget(creator_card)
         right.addStretch()
 
-        split.addLayout(right, stretch=4)
+        split.addWidget(sidebar, stretch=4)
         body_layout.addLayout(split)
 
         # ── Description ───────────────────────────────────────
@@ -237,6 +264,9 @@ class MaterialDetailPage(QWidget):
 
         self._description = BodyLabel("", body)
         self._description.setWordWrap(True)
+        self._description.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         body_layout.addWidget(self._description)
 
         # ── Comment section ──────────────────────────────────────
@@ -251,6 +281,7 @@ class MaterialDetailPage(QWidget):
         body_layout.addWidget(self._related_title)
 
         self._related_scroll = ScrollArea(body)
+        self._related_scroll.setObjectName("RelatedMaterialsScroll")
         self._related_scroll.setFixedHeight(RELATED_SECTION_HEIGHT)
         self._related_scroll.setWidgetResizable(True)
         self._related_scroll.setVerticalScrollBarPolicy(
@@ -260,7 +291,7 @@ class MaterialDetailPage(QWidget):
 
         self._related_container = QWidget()
         self._related_layout = QHBoxLayout(self._related_container)
-        self._related_layout.setContentsMargins(0, 0, 0, 0)
+        self._related_layout.setContentsMargins(0, SPACING_SM, 0, 0)
         self._related_layout.setSpacing(SPACING_MD)
         self._related_layout.addStretch()
 
@@ -319,7 +350,7 @@ class MaterialDetailPage(QWidget):
                 w.deleteLater()
         for tag in m.tags:
             pill = PillPushButton(tag, self._tags_container)
-            pill.setFixedHeight(20)
+            pill.setFixedHeight(22)
             pill.setCheckable(False)
             self._tags_layout.addWidget(pill)
         self._tags_layout.addStretch()
@@ -367,6 +398,7 @@ class MaterialDetailPage(QWidget):
         )
         self._detail_worker.completed.connect(self._on_detail_loaded)
         self._detail_worker.error.connect(self._on_detail_error)
+        self._services.track_qthread(self._detail_worker)
         self._detail_worker.start()
 
     @Slot(dict)
@@ -414,6 +446,7 @@ class MaterialDetailPage(QWidget):
         )
         self._like_worker.completed.connect(self._on_like_completed)
         self._like_worker.error.connect(self._on_like_error)
+        self._services.track_qthread(self._like_worker)
         self._like_worker.start()
 
     @Slot(str, bool, int)
@@ -452,6 +485,7 @@ class MaterialDetailPage(QWidget):
         )
         self._related_worker.completed.connect(self._on_related_loaded)
         self._related_worker.error.connect(self._on_related_error)
+        self._services.track_qthread(self._related_worker)
         self._related_worker.start()
 
     @Slot(list)
@@ -510,3 +544,64 @@ class MaterialDetailPage(QWidget):
         self._comment_section.clear()
         self._related_title.setVisible(False)
         self._related_scroll.setVisible(False)
+
+    def _apply_styles(self) -> None:
+        light_qss = f"""
+        QWidget#MaterialDetailPage {{
+            background-color: {COLOR_BG_INSET[0]};
+        }}
+        QWidget#DetailTopBar {{
+            background-color: {COLOR_BG_ELEVATED[0]};
+            border-bottom: 1px solid {COLOR_BORDER[0]};
+        }}
+        QWidget#DetailSidebar {{
+            background-color: {COLOR_BG_ELEVATED[0]};
+            border: 1px solid {COLOR_BORDER[0]};
+            border-radius: {GALLERY_CARD_BORDER_RADIUS}px;
+        }}
+        QWidget#DetailCreatorCard {{
+            background-color: {COLOR_BG_SURFACE[0]};
+            border: 1px solid {COLOR_BORDER[0]};
+            border-radius: {GALLERY_CARD_BORDER_RADIUS - 2}px;
+        }}
+        BodyLabel {{
+            color: {COLOR_TEXT_SECONDARY[0]};
+        }}
+        CaptionLabel {{
+            color: {COLOR_TEXT_MUTED[0]};
+        }}
+        QScrollArea#RelatedMaterialsScroll {{
+            background: transparent;
+            border: none;
+        }}
+        """
+        dark_qss = f"""
+        QWidget#MaterialDetailPage {{
+            background-color: {COLOR_BG_INSET[1]};
+        }}
+        QWidget#DetailTopBar {{
+            background-color: {COLOR_BG_ELEVATED[1]};
+            border-bottom: 1px solid {COLOR_BORDER[1]};
+        }}
+        QWidget#DetailSidebar {{
+            background-color: {COLOR_BG_ELEVATED[1]};
+            border: 1px solid {COLOR_BORDER[1]};
+            border-radius: {GALLERY_CARD_BORDER_RADIUS}px;
+        }}
+        QWidget#DetailCreatorCard {{
+            background-color: {COLOR_BG_SURFACE[1]};
+            border: 1px solid {COLOR_BORDER[1]};
+            border-radius: {GALLERY_CARD_BORDER_RADIUS - 2}px;
+        }}
+        BodyLabel {{
+            color: {COLOR_TEXT_SECONDARY[1]};
+        }}
+        CaptionLabel {{
+            color: {COLOR_TEXT_MUTED[1]};
+        }}
+        QScrollArea#RelatedMaterialsScroll {{
+            background: transparent;
+            border: none;
+        }}
+        """
+        apply_themed_style(self, light_qss, dark_qss)

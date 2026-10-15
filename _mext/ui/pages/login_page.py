@@ -167,6 +167,7 @@ class LoginPage(QWidget):
         )
         self._auth_worker.completed.connect(self._on_auth_result)
         self._auth_worker.error.connect(self._on_auth_worker_error)
+        self._services.track_qthread(self._auth_worker)
         self._auth_worker.start()
 
     @Slot(bool)
@@ -195,6 +196,7 @@ class LoginPage(QWidget):
         )
         self._drm_init_worker.completed.connect(self._on_drm_init_done)
         self._drm_init_worker.error.connect(self._on_drm_init_error)
+        self._services.track_qthread(self._drm_init_worker)
         self._drm_init_worker.start()
 
     @Slot()
@@ -212,19 +214,27 @@ class LoginPage(QWidget):
         import threading
 
         def _wait_for_callback() -> None:
-            success = self._services.auth_service.handle_callback()
-            from PyQt6.QtCore import QMetaObject
+            try:
+                success = self._services.auth_service.handle_callback()
+                from PyQt6.QtCore import QMetaObject
 
-            if success:
-                QMetaObject.invokeMethod(
-                    self, "_on_drm_login_success", Qt.ConnectionType.QueuedConnection
-                )
-            else:
-                QMetaObject.invokeMethod(
-                    self, "_on_drm_login_failure", Qt.ConnectionType.QueuedConnection
-                )
+                if success:
+                    QMetaObject.invokeMethod(
+                        self,
+                        "_on_drm_login_success",
+                        Qt.ConnectionType.QueuedConnection,
+                    )
+                else:
+                    QMetaObject.invokeMethod(
+                        self,
+                        "_on_drm_login_failure",
+                        Qt.ConnectionType.QueuedConnection,
+                    )
+            finally:
+                self._services.worker_registry.unregister_thread(threading.current_thread())
 
         thread = threading.Thread(target=_wait_for_callback, daemon=True)
+        self._services.worker_registry.register_thread(thread)
         thread.start()
 
     @Slot(str)
@@ -276,6 +286,7 @@ class LoginPage(QWidget):
         self._fido2_challenge_worker.error.connect(
             lambda msg: (self._show_error(f"Could not start FIDO2 authentication: {msg}"), self._set_loading(False))
         )
+        self._services.track_qthread(self._fido2_challenge_worker)
         self._fido2_challenge_worker.start()
 
     @Slot(object)
@@ -302,6 +313,7 @@ class LoginPage(QWidget):
         )
         worker.error.connect(lambda msg: self._on_fido2_auth_error(msg, touch_dialog))
 
+        self._services.track_qthread(worker)
         worker.start()
 
     def _on_fido2_auth_complete(
@@ -332,6 +344,7 @@ class LoginPage(QWidget):
         self._fido2_complete_worker.error.connect(
             lambda msg: (self._show_error(f"FIDO2 verification failed: {msg}"), self._set_loading(False))
         )
+        self._services.track_qthread(self._fido2_complete_worker)
         self._fido2_complete_worker.start()
 
     @Slot(object)

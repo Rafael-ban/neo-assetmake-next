@@ -3,7 +3,7 @@
 #define MyAppName "ArknightsPassMaker"
 #define MyAppNameCN "明日方舟通行证素材工具箱"
 #ifndef MyAppVersion
-  #define MyAppVersion "2.1.0"
+  #define MyAppVersion "2.1.5"
 #endif
 #define MyAppPublisher "Rafael-ban"
 #define MyAppURL "https://github.com/rhodesepass/neo-assetmaker"
@@ -162,9 +162,7 @@ begin
     AppDir := ExpandConstant('{app}');
     if DirExists(AppDir) then
     begin
-      Log('=== Upgrade cleanup: scanning ' + AppDir + ' ===');
-      CleanAppDirectory(AppDir, AppDir);
-      Log('=== Upgrade cleanup completed ===');
+      Log('Broad upgrade cleanup disabled; using [InstallDelete] targeted cleanup only: ' + AppDir);
     end
     else
       Log('App directory does not exist, skipping cleanup (fresh install)');

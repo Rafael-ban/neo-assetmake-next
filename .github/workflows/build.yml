@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main, master, dev]
   workflow_dispatch:
+    inputs:
+      obfuscate:
+        description: 'Use PyArmor obfuscation for this manual build'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -13,3 +19,4 @@ jobs:
     with:
       skip_flasher: true
       uv_sync_mode: "locked"
+      obfuscate: ${{ github.event_name == 'workflow_dispatch' && inputs.obfuscate }}

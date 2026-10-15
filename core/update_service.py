@@ -17,8 +17,9 @@ from PyQt6.QtCore import QThread, pyqtSignal, QObject
 
 from config.constants import (
     GITHUB_OWNER, GITHUB_REPO,
-    UpdateSource, UPDATE_API_SOURCES, DOWNLOAD_SOURCES
+    SourceType, UpdateSource, UPDATE_API_SOURCES, DOWNLOAD_SOURCES
 )
+from core.file_utils import is_https_url, sha256_file
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,9 @@ class ReleaseInfo:
     published_at: str      # ISO timestamp
     download_url: str      # Direct download URL for .exe installer
     download_size: int     # File size in bytes
+    download_name: str     # Installer asset filename
+    checksum_url: str      # Release checksum asset URL
+    expected_sha256: str   # Expected SHA-256 for installer
     html_url: str          # Web URL to release page
 
 
@@ -292,7 +296,10 @@ class UpdateCheckWorker(QThread):
     ):
         super().__init__(parent)
         self._current_version = current_version
-        self._sources = sources or UPDATE_API_SOURCES
+        self._sources = sources or [
+            source for source in UPDATE_API_SOURCES
+            if source.source_type == SourceType.GITHUB_API
+        ]
         self._request_manager = MultiSourceRequestManager(max_workers=len(self._sources))
 
     def run(self):
@@ -334,7 +341,61 @@ class UpdateCheckWorker(QThread):
         with urlopen(request, timeout=source.timeout) as response:
             data = json.loads(response.read().decode('utf-8'))
 
-        return self._parse_release_data(data)
+        release_info = self._parse_release_data(data)
+        release_info.expected_sha256 = self._fetch_expected_sha256(
+            release_info.checksum_url,
+            release_info.download_name,
+            source.timeout,
+        )
+        return release_info
+
+    def _is_repo_release_asset_url(self, url: str) -> bool:
+        """Return True for direct release asset URLs from this repository."""
+        expected_prefix = (
+            f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/download/"
+        )
+        return url.startswith(expected_prefix)
+
+    def _fetch_expected_sha256(
+        self,
+        checksum_url: str,
+        download_name: str,
+        timeout: float,
+    ) -> str:
+        """Fetch and parse the release checksum file for a specific asset."""
+        request = Request(checksum_url)
+        request.add_header('User-Agent', USER_AGENT)
+
+        with urlopen(request, timeout=timeout) as response:
+            checksum_text = response.read().decode('utf-8')
+
+        return self._parse_checksum_text(checksum_text, download_name)
+
+    def _parse_checksum_text(self, checksum_text: str, download_name: str) -> str:
+        """Parse SHA256SUMS-style text and return the digest for download_name."""
+        candidate_without_name = ""
+        for raw_line in checksum_text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            match = re.search(r'\b([A-Fa-f0-9]{64})\b(?:\s+\*?(.+))?', line)
+            if not match:
+                continue
+
+            digest = match.group(1).lower()
+            filename = (match.group(2) or "").strip()
+            filename = filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+            if filename == download_name:
+                return digest
+            if not filename:
+                candidate_without_name = digest
+
+        if candidate_without_name:
+            return candidate_without_name
+
+        raise ValueError(f"校验文件中未找到 {download_name} 的 SHA-256")
 
     def _parse_release_data(self, data: dict) -> ReleaseInfo:
         """解析 GitHub API 响应"""
@@ -344,16 +405,37 @@ class UpdateCheckWorker(QThread):
         # 查找 Windows 安装包
         download_url = None
         download_size = 0
+        download_name = ""
+        checksum_url = ""
 
         for asset in data.get('assets', []):
             name = asset.get('name', '')
             if name.endswith('_Setup.exe') or name.endswith('.exe'):
                 download_url = asset.get('browser_download_url')
                 download_size = asset.get('size', 0)
+                download_name = name
+                break
+
+        checksum_asset_names = {
+            "sha256sums",
+            "sha256sums.txt",
+            "checksums.txt",
+        }
+        for asset in data.get('assets', []):
+            name = asset.get('name', '')
+            lower_name = name.lower()
+            if lower_name in checksum_asset_names or lower_name == f"{download_name.lower()}.sha256":
+                checksum_url = asset.get('browser_download_url')
                 break
 
         if not download_url:
             raise ValueError("未找到Windows安装包")
+        if not is_https_url(download_url) or not self._is_repo_release_asset_url(download_url):
+            raise ValueError("安装包下载地址不是可信的 GitHub Release asset")
+        if not checksum_url:
+            raise ValueError("Release 缺少 SHA-256 校验文件")
+        if not is_https_url(checksum_url) or not self._is_repo_release_asset_url(checksum_url):
+            raise ValueError("校验文件下载地址不是可信的 GitHub Release asset")
 
         return ReleaseInfo(
             version=version,
@@ -363,6 +445,9 @@ class UpdateCheckWorker(QThread):
             published_at=data.get('published_at', ''),
             download_url=download_url,
             download_size=download_size,
+            download_name=download_name,
+            checksum_url=checksum_url,
+            expected_sha256="",
             html_url=data.get('html_url', '')
         )
 
@@ -454,6 +539,7 @@ class UpdateDownloadWorker(QThread):
         temp_dir = tempfile.gettempdir()
         filename = f"ArknightsPassMaker_v{self._release_info.version}_Setup.exe"
         output_path = os.path.join(temp_dir, filename)
+        partial_path = f"{output_path}.part"
 
         self._current_source_name = source.name
 
@@ -467,12 +553,12 @@ class UpdateDownloadWorker(QThread):
                 downloaded = 0
                 chunk_size = 8192  # 8KB chunks
 
-                with open(output_path, 'wb') as f:
+                with open(partial_path, 'wb') as f:
                     while True:
                         if self._cancelled.is_set():
                             f.close()
-                            if os.path.exists(output_path):
-                                os.remove(output_path)
+                            if os.path.exists(partial_path):
+                                os.remove(partial_path)
                             raise InterruptedError("下载已取消")
 
                         chunk = response.read(chunk_size)
@@ -494,13 +580,27 @@ class UpdateDownloadWorker(QThread):
 
                         self.progress_updated.emit(percent, msg)
 
+            if total_size > 0 and downloaded != total_size:
+                raise RuntimeError(
+                    f"下载大小不匹配: expected {total_size}, got {downloaded}"
+                )
+
+            self.progress_updated.emit(98, "正在校验下载文件...")
+            actual_sha256 = sha256_file(partial_path)
+            expected_sha256 = self._release_info.expected_sha256.lower()
+            if actual_sha256 != expected_sha256:
+                raise RuntimeError(
+                    f"SHA-256 校验失败: expected {expected_sha256}, got {actual_sha256}"
+                )
+
+            os.replace(partial_path, output_path)
             return output_path
 
         except Exception as e:
             # 清理部分下载的文件
-            if os.path.exists(output_path):
+            if os.path.exists(partial_path):
                 try:
-                    os.remove(output_path)
+                    os.remove(partial_path)
                 except Exception:
                     pass
             raise

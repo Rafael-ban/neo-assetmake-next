@@ -1,14 +1,12 @@
-"""
-SSH 上传进度对话框 
-"""
+"""Remote upload progress dialog."""
 
-from PyQt6.QtWidgets import QDialog, QVBoxLayout
 from PyQt6.QtCore import Qt, pyqtSignal
-from qfluentwidgets import PushButton, SubtitleLabel, BodyLabel, ProgressBar
+from PyQt6.QtWidgets import QDialog, QVBoxLayout
+from qfluentwidgets import BodyLabel, ProgressBar, PushButton, SubtitleLabel
 
 
-class SshUploadProgressDialog(QDialog):
-    """SSH 上传进度对话框"""
+class RemoteUploadProgressDialog(QDialog):
+    """Progress dialog for RNDIS HTTP asset uploads."""
 
     cancel_requested = pyqtSignal()
 
@@ -18,11 +16,9 @@ class SshUploadProgressDialog(QDialog):
         self._setup_ui()
 
     def _setup_ui(self):
-        """设置UI"""
-        self.setWindowTitle("SSH 上传")
+        self.setWindowTitle("远程上传")
         self.setMinimumSize(400, 150)
         self.setModal(True)
-        # 禁用关闭按钮
         self.setWindowFlags(
             self.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint
         )
@@ -31,7 +27,7 @@ class SshUploadProgressDialog(QDialog):
         layout.setSpacing(15)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        self.label_status = SubtitleLabel("准备上传...")
+        self.label_status = SubtitleLabel("准备远程上传...")
         self.label_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.label_status)
 
@@ -49,35 +45,27 @@ class SshUploadProgressDialog(QDialog):
         layout.addWidget(self.btn_action)
 
     def update_progress(self, value: int, message: str):
-        """更新进度"""
         self.progress_bar.setValue(value)
         self.label_detail.setText(message)
 
     def set_completed(self, success: bool, message: str):
-        """完成"""
         self._is_completed = True
         self.progress_bar.setValue(100 if success else self.progress_bar.value())
-        self.label_status.setText("上传完成!" if success else "上传失败")
+        self.label_status.setText("远程上传完成" if success else "远程上传失败")
         self.label_detail.setText(message)
         self.btn_action.setText("确定")
-
-        if success:
-            self.label_status.setStyleSheet("color: green;")
-        else:
-            self.label_status.setStyleSheet("color: red;")
+        self.label_status.setStyleSheet("color: green;" if success else "color: red;")
 
     def _on_action_clicked(self):
-        """按钮点击"""
         if self._is_completed:
             self.accept()
-        else:
-            self.cancel_requested.emit()
-            self.label_status.setText("正在取消...")
-            self.btn_action.setEnabled(False)
+            return
+        self.cancel_requested.emit()
+        self.label_status.setText("正在取消...")
+        self.btn_action.setEnabled(False)
 
     def closeEvent(self, event):
-        """关闭事件"""
         if self._is_completed:
             event.accept()
         else:
-            event.ignore()  # 上传过程中禁止关闭
+            event.ignore()

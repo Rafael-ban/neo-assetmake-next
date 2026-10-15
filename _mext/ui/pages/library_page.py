@@ -248,6 +248,7 @@ class LibraryPage(QWidget):
         )
         self._library_worker.completed.connect(self._on_library_loaded)
         self._library_worker.error.connect(self._on_library_error)
+        self._services.track_qthread(self._library_worker)
         self._library_worker.start()
 
     @Slot(list, list)

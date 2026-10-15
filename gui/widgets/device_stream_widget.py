@@ -1,47 +1,35 @@
-"""
-设备实时画面显示组件
-
-显示从设备 mjpg-streamer 接收的 MJPEG 流画面，
-提供开始/停止串流控制和状态信息显示。
-"""
+"""Widget for displaying the device HTTP MJPEG live view."""
 
 import logging
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QImage, QPixmap
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel
+from PyQt6.QtWidgets import QLabel, QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
-    PrimaryPushButton,
-    PushButton,
     CaptionLabel,
     FluentIcon,
     InfoBar,
     InfoBarPosition,
+    PrimaryPushButton,
+    PushButton,
     setCustomStyleSheet,
 )
 
-from core.device_stream_service import DeviceStreamThread
-from gui.styles import COLOR_TEXT_SECONDARY, COLOR_TEXT_MUTED, COLOR_SUCCESS, COLOR_ERROR
+from gui.styles import COLOR_ERROR, COLOR_SUCCESS, COLOR_TEXT_MUTED, COLOR_TEXT_SECONDARY
+from gui.workers.device_stream_worker import DeviceStreamThread
 
 logger = logging.getLogger(__name__)
 
 
 class DeviceStreamWidget(QWidget):
-    """
-    设备实时画面显示组件
-    """
+    """Display and control the RNDIS HTTP MJPEG stream."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._stream_thread: DeviceStreamThread | None = None
-        self._is_streaming: bool = False
-
-        # SSH 连接参数（由 RemotePage 设置）
-        self._host: str = "192.168.137.2"
-        self._ssh_port: int = 22
-        self._ssh_user: str = "root"
-        self._ssh_password: str = "toor"
+        self._is_streaming = False
+        self._host = "192.168.137.2"
 
         self._init_ui()
         self._connect_signals()
@@ -51,11 +39,10 @@ class DeviceStreamWidget(QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        # ── 控制栏 ──
         control_layout = QHBoxLayout()
         control_layout.setSpacing(8)
 
-        self.btnStart = PrimaryPushButton("开始串流")
+        self.btnStart = PrimaryPushButton("开始预览")
         self.btnStart.setIcon(FluentIcon.PLAY)
         self.btnStop = PushButton("停止")
         self.btnStop.setIcon(FluentIcon.CLOSE)
@@ -66,7 +53,6 @@ class DeviceStreamWidget(QWidget):
         control_layout.addStretch()
         layout.addLayout(control_layout)
 
-        # ── 画面显示区 ──
         self.displayLabel = QLabel()
         self.displayLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.displayLabel.setMinimumSize(320, 240)
@@ -81,7 +67,6 @@ class DeviceStreamWidget(QWidget):
         )
         layout.addWidget(self.displayLabel, stretch=1)
 
-        # ── 状态栏 ──
         self.statusLabel = CaptionLabel("未连接")
         setCustomStyleSheet(
             self.statusLabel,
@@ -94,20 +79,12 @@ class DeviceStreamWidget(QWidget):
         self.btnStart.clicked.connect(self._on_start_stream)
         self.btnStop.clicked.connect(self._on_stop_stream)
 
-    # ─── 串流控制 ─────────────────────────────────────
-
     def _on_start_stream(self):
         if self._is_streaming:
             return
 
         self._stream_thread = DeviceStreamThread(parent=self)
-        self._stream_thread.setup(
-            host=self._host,
-            ssh_port=self._ssh_port,
-            ssh_user=self._ssh_user,
-            ssh_password=self._ssh_password,
-        )
-
+        self._stream_thread.setup(host=self._host)
         self._stream_thread.frame_ready.connect(self._on_frame_ready)
         self._stream_thread.stream_started.connect(self._on_stream_started)
         self._stream_thread.stream_stopped.connect(self._on_stream_stopped)
@@ -122,12 +99,10 @@ class DeviceStreamWidget(QWidget):
         self.displayLabel.setText("连接中...")
 
     def _on_stop_stream(self):
-        if not self._is_streaming:
-            return
-        self._stop_thread()
+        if self._is_streaming:
+            self._stop_thread()
 
     def _stop_thread(self):
-        """停止流线程并清理"""
         if self._stream_thread is not None:
             self._stream_thread.stop()
             self._stream_thread.wait(3000)
@@ -138,10 +113,7 @@ class DeviceStreamWidget(QWidget):
         self.btnStart.setEnabled(True)
         self.btnStop.setEnabled(False)
 
-    # ─── 信号槽 ─────────────────────────────────────
-
     def _on_frame_ready(self, qimage: QImage):
-        """收到解码帧，缩放显示"""
         pixmap = QPixmap.fromImage(qimage)
         scaled = pixmap.scaled(
             self.displayLabel.size(),
@@ -170,15 +142,15 @@ class DeviceStreamWidget(QWidget):
         )
 
     def _on_stream_error(self, msg: str):
-        logger.warning("流错误: %s", msg)
-        self.statusLabel.setText(f"错误: {msg[:60]}")
+        logger.warning("Stream error: %s", msg)
+        self.statusLabel.setText(f"错误：{msg[:60]}")
         setCustomStyleSheet(
             self.statusLabel,
             f"CaptionLabel {{ color: {COLOR_ERROR[0]}; }}",
             f"CaptionLabel {{ color: {COLOR_ERROR[1]}; }}",
         )
         InfoBar.warning(
-            "串流异常",
+            "实时画面异常",
             msg,
             parent=self,
             position=InfoBarPosition.TOP,
@@ -186,23 +158,15 @@ class DeviceStreamWidget(QWidget):
         )
 
     def _on_fps_updated(self, fps: float):
-        """更新状态栏帧率和分辨率"""
         pixmap = self.displayLabel.pixmap()
         if pixmap and not pixmap.isNull():
-            w, h = pixmap.width(), pixmap.height()
-            self.statusLabel.setText(f"已连接 | FPS: {fps} | {w}x{h}")
+            width, height = pixmap.width(), pixmap.height()
+            self.statusLabel.setText(f"已连接 | FPS: {fps} | {width}x{height}")
         else:
             self.statusLabel.setText(f"已连接 | FPS: {fps}")
 
-    # ─── 公共接口 ─────────────────────────────────────
-
-    def set_ssh_params(self, host: str, port: int, user: str, password: str):
-        """从 RemotePage 传入 SSH 参数"""
+    def set_device_host(self, host: str):
         self._host = host
-        self._ssh_port = port
-        self._ssh_user = user
-        self._ssh_password = password
 
     def shutdown(self):
-        """停止线程，清理资源"""
         self._stop_thread()
