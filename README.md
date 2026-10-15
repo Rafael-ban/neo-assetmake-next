@@ -6,8 +6,6 @@ Arknights Pass Material Toolbox 是一个面向明日方舟电子通行证 2.1 �
 
 本仓库延续 VapourSynth 重构开发；[旧仓库 `neo-assetmaker-dev`](https://github.com/Rafael-ban/neo-assetmaker-dev) 已回退并保留在 `e590d8d`，停止维护。后续开发和更新均在本仓库进行。
 
-新仓库保留 `e999a59` 起的开发历史，并保留初微弦音（[momovlink](https://github.com/momovlink)）的四条旧版贡献记录。历史边界、导入基线与提交 SHA 对应关系见[仓库历史说明](docs/REPOSITORY_HISTORY.md)。
-
 ## 核心能力
 
 - **素材制作**：编辑 `epconfig.json`、循环/入场素材、过渡、图标和叠加层。
