@@ -1,13 +1,13 @@
 # 用户手册
 
-本手册对应当前仓库中的 `v2.2.0（测试预览版）` 代码。版本变更和功能增量请查看 [CHANGELOG.md](CHANGELOG.md)。
+本手册对应当前仓库中的 `v2.2.1（开发预览版）` 代码。版本变更和功能增量请查看 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 快速开始
 
 ### 运行环境
 
 - Windows
-- Python 3.10+
+- Python 3.12+
 - `uv`
 - Rust 工具链仅在编译模拟器或完整打包时需要
 
@@ -210,7 +210,7 @@ uv run python main.py
 
 - 检查输入文件格式是否受支持
 - 确认视频文件未损坏
-- 若使用打包版本，检查 `VapourSynth`（含 `portable.vs` 与 `vs-plugins/`）、`VSPipe`、`x264-7mod` 等媒体工具是否随安装包完整分发
+- 若使用打包版本，检查 `tools/media/runtime/` 下的 R79 VapourSynth/VSPipe，以及 `tools/media/x264-7mod.exe` 等基础媒体工具是否随安装包完整分发；可选 `tools/vs-plugins/` 不属于基础包
 - 预览与导出都依赖 VapourSynth 解码：若某文件无法建立索引，会在**加载时**直接报错（而非预览正常、导出失败）
 
 ### RNDIS 远程上传失败

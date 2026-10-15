@@ -1322,9 +1322,8 @@ class VideoPreviewWidget(QWidget):
 
         Single ratio guard for every crop-box write. The export resizes the
         cropped region straight to the target with `core.resize.<kernel>(clip,
-        width=..., height=...)` — the VS R73 API has no aspect-preserving
-        parameter (stub `resize.Bicubic` takes independent width/height; no
-        keep_aspect/pad), so ANY box whose ratio != target is scaled
+        width=..., height=...)`. These dimensions are independent, so a crop
+        box whose ratio differs from the target is scaled
         anisotropically, i.e. geometrically distorted, in the exported mp4.
 
         The old `_bound_cropbox` clamped w and h INDEPENDENTLY against the
@@ -1335,7 +1334,8 @@ class VideoPreviewWidget(QWidget):
         the box shrinks proportionally instead of collapsing on one axis.
 
         Keeps the box centred on its original centre, as large as fits, and
-        even-sized-safe (>= 2px) for the YUV420 crop downstream.
+        at least 2px per axis. The script applies any alignment required by
+        its source format; the export adapter chooses the encoding format.
         """
         rotated_w, rotated_h = self._get_rotated_video_size()
         ar = self.target_aspect_ratio if self.target_aspect_ratio > 0 else 1.0

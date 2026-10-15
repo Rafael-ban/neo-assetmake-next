@@ -27,7 +27,7 @@ output 1 与 output 0 共享它。脚本保留处理中的位深与颜色，最�
 | `resources/vapoursynth/default_pipeline.vpy` | `VS_CACHE_SIZE_MB = 4096`，内置默认脚本执行时生效 |
 | `resources/vapoursynth/rife_pipeline.vpy` | `VS_CACHE_SIZE_MB = 16000`，选用 RIFE 脚本时生效 |
 | `config/vs_runtime.json`、`config/vs_runtime.py` | `max_cache_size_mb` 默认仍为 `0`，含义是恢复 VS 原生值；随后可被脚本覆盖 |
-| `tests/test_default_pipeline_cache.py` | 验证默认脚本覆盖运行时初值；本次按要求未修改测试，旧断言仍是 16000，与当前默认脚本不一致，执行时会失败，需另行同步 |
+| `tests/test_default_pipeline_cache.py` | 验证默认脚本覆盖运行时初值；当前测试仍断言 16000 MB，与脚本的 4096 MB 不一致，运行该测试会失败，需在测试修复时同步 |
 | `tests/test_default_pipeline_rife.py` | 检查 RIFE 插帧和输出顺序、模型定位及缺文件诊断 |
 | `tests/test_rife_auto_discovery.py` | 检查独立 DLC 的自动加载、旧路径处理和运行时身份 |
 
@@ -193,6 +193,9 @@ uv run python plugin_distribution.py clean --app-dir .
 未压缩文件更大，同样预算下可保留的帧数减少；具体比例取决于素材。
 这是按需缓存，不会导入时等待整片算完；再次访问已完成帧时不重新推理。
 默认项目磁盘预算 8 GiB，由 RIFE 模板的 `RIFE_DISK_CACHE_BYTES` 设置。
+缓存节点位于源分辨率的补帧结果上，在 trim/crop 之前；每帧约 `宽 × 高 × 12` 字节。
+3840×2160 约 94.9 MiB/帧，8 GiB 约容纳 86 帧（60 fps 下约 1.4 秒，未计属性开销）。
+高分辨率长循环可能因淘汰而反复推理，640×360 样本的命中效果不可直接外推。
 容量不足会淘汰旧帧，之后访问时重算；它不是永久素材归档。
 
 RIFE 的 VS 工作缓存保持 16000 MB，默认脚本保持 4096 MB。磁盘结果节点关闭重复的
