@@ -1440,10 +1440,14 @@ class VideoPreviewWidget(QWidget):
         if frame is None:
             return
         display_frame = self._make_display_frame(frame)
-        rgb = self._to_rgb(display_frame)
-        rgb = np.ascontiguousarray(rgb)
-        h, w = rgb.shape[:2]
-        qimage = QImage(rgb.data, w, h, rgb.strides[0], QImage.Format.Format_RGB888)
+        if display_frame.ndim == 3 and display_frame.shape[2] == 3:
+            pixels = np.ascontiguousarray(display_frame)
+            image_format = QImage.Format.Format_BGR888
+        else:
+            pixels = np.ascontiguousarray(self._to_rgb(display_frame))
+            image_format = QImage.Format.Format_RGB888
+        h, w = pixels.shape[:2]
+        qimage = QImage(pixels.data, w, h, pixels.strides[0], image_format)
         # Build the pixmap at the device pixel ratio so the preview is sharp on HiDPI
         # displays (scaling only to the logical size renders at half resolution).
         dpr = self.video_label.devicePixelRatioF()
@@ -1454,11 +1458,14 @@ class VideoPreviewWidget(QWidget):
         target = QSize(min(w, physical.width()), min(h, physical.height())) if (
             self._vs_active
         ) else physical
-        pixmap = QPixmap.fromImage(qimage.copy()).scaled(
-            target,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        # QImage wraps the NumPy buffer; detach before the source frame can change.
+        pixmap = QPixmap.fromImage(qimage.copy())
+        if pixmap.size() != target:
+            pixmap = pixmap.scaled(
+                target,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
         pixmap.setDevicePixelRatio(dpr)
         self.video_label.setPixmap(pixmap)
         self._update_display_geometry(
