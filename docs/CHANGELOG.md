@@ -40,7 +40,7 @@
 - 发布前的基础代码已通过 864 项 Windows 自动测试；真实解压后的 EXE 在中文/空格路径及其他工作目录下完成 worker 取帧、12 帧 360×640 MP4 导出与解码回读，并清理临时目录。
 - 本次发布构建继续执行测试、基础媒体树校验与迁移目录下的真实渲染/导出验收；已收到人工测试完成的反馈。
 - 自动渲染样本使用 PNG，不能据此推定全部 MP4 解码器、GPU 硬件或目标设备场景均已覆盖。
-- [RIFE DLC 安装与脚本选择教程](https://github.com/Rafael-ban/neo-assetmaker-dev/blob/v2.2.1/docs/vapoursynth-kb/17-filter-configuration.md#可选-rife-插帧到-60-fps)。下载基础绿色包后解压到新目录；DLC 内容解压到含 ArknightsPassMaker.exe 的应用目录并保持层级。
+- [RIFE DLC 安装与脚本选择教程](https://github.com/Rafael-ban/neo-assetmake-next/blob/v2.2.1/docs/vapoursynth-kb/17-filter-configuration.md#可选-rife-插帧到-60-fps)。下载基础绿色包后解压到新目录；DLC 内容解压到含 ArknightsPassMaker.exe 的应用目录并保持层级。
 
 ### v2.2.0（测试预览版）
 

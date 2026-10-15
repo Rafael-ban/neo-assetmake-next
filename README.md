@@ -4,6 +4,8 @@ Arknights Pass Material Toolbox 是一个面向明日方舟电子通行证 2.1 �
 
 > 本仓库是**源代码**。用户实际运行的是由 `build.py` 生成的 `ArknightsPassMaker` 构建目录或安装包；修改源代码后，必须重新构建或发布，变更才会进入可运行程序。
 
+本仓库延续 VapourSynth 重构开发；旧仓库 `neo-assetmaker-dev` 计划保留为 `e590d8d` 对应的旧版，目前尚未回退。
+
 ## 核心能力
 
 - **素材制作**：编辑 `epconfig.json`、循环/入场素材、过渡、图标和叠加层。
@@ -42,15 +44,15 @@ Arknights Pass Material Toolbox 是一个面向明日方舟电子通行证 2.1 �
 `git clone` 和 `uv sync` 不会下载媒体二进制，不能跳过媒体部署后直接预览/导出。
 
 ```powershell
-git clone https://github.com/Rafael-ban/neo-assetmaker-dev.git
-cd neo-assetmaker-dev
+git clone https://github.com/Rafael-ban/neo-assetmake-next.git
+cd neo-assetmake-next
 uv sync --locked --no-install-project
 if ($LASTEXITCODE -ne 0) { throw "Python 依赖安装失败" }
 
 $mediaArchive = "media-tools-r79-v1.zip"
 $mediaSha256 = "50f86a516fbfc97812e2c6ea500ba1a06937d4cda5e2bc211c071309a6ce7dd4"
 if (-not (Test-Path $mediaArchive)) {
-    Invoke-WebRequest -Uri "https://github.com/Rafael-ban/neo-assetmaker-dev/releases/download/media-tools-r79-v1/media-tools-r79-v1.zip" -OutFile $mediaArchive
+    Invoke-WebRequest -Uri "https://github.com/Rafael-ban/neo-assetmake-next/releases/download/media-tools-r79-v1/media-tools-r79-v1.zip" -OutFile $mediaArchive
 }
 if (-not (Test-Path "tools/media")) {
     uv run --no-sync python media_distribution.py extract-archive --archive $mediaArchive --sha256 $mediaSha256 --manifest resources/packaging/media-tools-r79-v1.json --app-dir .

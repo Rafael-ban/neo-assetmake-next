@@ -1039,7 +1039,7 @@ class MainWindow(QMainWindow):
 
         <h3>七、联系我们</h3>
         <p>如果您在使用过程中遇到任何问题，或有任何建议和反馈，欢迎联系我们。</p>
-        <p>项目地址：<a href="https://github.com/rhodesepass/neo-assetmaker">https://github.com/rhodesepass/neo-assetmaker</a></p>
+        <p>项目地址：<a href="https://github.com/Rafael-ban/neo-assetmake-next">https://github.com/Rafael-ban/neo-assetmake-next</a></p>
         <p>官方网站：<a href="https://ep.iccmc.cc">https://ep.iccmc.cc</a></p>
 
         <p style="text-align: center; color: #666; margin-top: 30px;">

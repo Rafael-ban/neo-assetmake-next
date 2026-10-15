@@ -95,8 +95,8 @@ def seconds_to_microseconds(s: float) -> int:
 
 
 # ===== GitHub 更新配置 =====
-GITHUB_OWNER = "rhodesepass"
-GITHUB_REPO = "neo-assetmaker"
+GITHUB_OWNER = "Rafael-ban"
+GITHUB_REPO = "neo-assetmake-next"
 UPDATE_CHECK_INTERVAL_HOURS = 24
 
 

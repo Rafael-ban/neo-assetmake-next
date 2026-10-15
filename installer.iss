@@ -6,7 +6,7 @@
   #define MyAppVersion "2.2.1"
 #endif
 #define MyAppPublisher "Rafael-ban"
-#define MyAppURL "https://github.com/rhodesepass/neo-assetmaker"
+#define MyAppURL "https://github.com/Rafael-ban/neo-assetmake-next"
 #define MyAppExeName "ArknightsPassMaker.exe"
 #define MyAppIcon "resources\icons\favicon.ico"
 

@@ -10,7 +10,7 @@ from _mext.services.download_worker import DownloadWorker
 from core.update_service import UpdateCheckWorker
 
 
-RELEASE_URL = "https://github.com/rhodesepass/neo-assetmaker/releases/download/v2.1.3"
+RELEASE_URL = "https://github.com/Rafael-ban/neo-assetmake-next/releases/download/v2.1.3"
 INSTALLER_NAME = "ArknightsPassMaker_v2.1.3_Setup.exe"
 
 
