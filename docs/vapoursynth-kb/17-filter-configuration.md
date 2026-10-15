@@ -187,7 +187,10 @@ uv run python plugin_distribution.py clean --app-dir .
 
 ## 补帧结果磁盘缓存与资源回收
 
-当前源码在项目 `.assetmaker-vs/rife-cache/` 保存无损压缩的 RGBS float32 帧和颜色属性。
+当前源码在项目 `.assetmaker-vs/rife-cache/` 保存未压缩的 RGBS float32 帧和颜色属性，
+避免每次命中都执行 gzip 解压。浮点位模式和帧属性保持不变；旧 `.rgb.gz` 帧在命中时
+逐帧原子转换为 `.rgb`，成功后移除旧文件，转换失败时保留原缓存。
+未压缩文件更大，同样预算下可保留的帧数减少；具体比例取决于素材。
 这是按需缓存，不会导入时等待整片算完；再次访问已完成帧时不重新推理。
 默认项目磁盘预算 8 GiB，由 RIFE 模板的 `RIFE_DISK_CACHE_BYTES` 设置。
 容量不足会淘汰旧帧，之后访问时重算；它不是永久素材归档。

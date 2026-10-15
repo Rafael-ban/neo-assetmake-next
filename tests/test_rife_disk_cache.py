@@ -1,5 +1,8 @@
 """Lossless disk cache and hit graph isolation tests without native VS."""
 import ctypes
+import gzip
+import json
+import struct
 import importlib.util
 import inspect
 from pathlib import Path
@@ -41,7 +44,9 @@ class RifeDiskCacheTests(unittest.TestCase):
             self.assertEqual(original.props, restored.props)
             for left, right in zip(original.planes, restored.planes):
                 self.assertEqual(bytes(left), bytes(right))
-            (disk.directory / '000000003.rgb.gz').write_bytes(b'broken')
+            raw = disk.directory / '000000003.rgb'
+            self.assertTrue(raw.is_file())
+            raw.write_bytes(b'broken')
             self.assertIsNone(disk.read(3))
 
     def test_budget_and_clear(self):
@@ -49,7 +54,7 @@ class RifeDiskCacheTests(unittest.TestCase):
             root = cache_module.cache_root(temp)
             disk = cache_module.DiskFrameCache(root, {}, 2, 2, max_bytes=1)
             disk.write(0, Frame())
-            self.assertFalse(list(root.glob('*/*.rgb.gz')))
+            self.assertFalse(list(root.glob('*/*.rgb')))
             cache_module.clear_rife_cache(temp)
             cache_module.clear_rife_cache(temp)
             self.assertFalse(root.exists())
@@ -63,13 +68,88 @@ class RifeDiskCacheTests(unittest.TestCase):
     def test_write_failure_is_reported_once(self):
         with tempfile.TemporaryDirectory() as temp:
             disk = cache_module.DiskFrameCache(temp, {}, 2, 2)
-            with patch.object(cache_module.gzip, 'open',
+            with patch.object(cache_module.Path, 'open',
                               side_effect=OSError('disk full')):
                 with self.assertLogs(cache_module._LOG, level='WARNING') as logs:
                     disk.write(0, Frame())
                     disk.write(1, Frame())
             self.assertEqual(len(logs.output), 1)
             self.assertIn('剩余磁盘空间', logs.output[0])
+
+    @staticmethod
+    def _legacy_frame(path, frame):
+        props = json.dumps(cache_module._encode_props(frame.props),
+                           separators=(',', ':')).encode()
+        with gzip.open(path, 'wb', compresslevel=1) as stream:
+            stream.write(struct.pack('<I', len(props)))
+            stream.write(props)
+            for plane in frame.planes:
+                stream.write(bytes(plane))
+
+    def test_legacy_hit_migrates_atomically_and_preserves_bits_and_props(self):
+        with tempfile.TemporaryDirectory() as temp:
+            disk = cache_module.DiskFrameCache(temp, {}, 2, 2)
+            legacy = disk.directory / '000000003.rgb.gz'
+            raw = disk.directory / '000000003.rgb'
+            original = Frame()
+            self._legacy_frame(legacy, original)
+            restored = disk.restore(Frame(), disk.read(3))
+            self.assertEqual(original.props, restored.props)
+            for left, right in zip(original.planes, restored.planes):
+                self.assertEqual(bytes(left), bytes(right))
+            self.assertTrue(raw.is_file())
+            self.assertFalse(legacy.exists())
+            self.assertEqual(disk.read(3)[0], original.props)
+
+    def test_disabled_cache_reads_legacy_without_migrating(self):
+        with tempfile.TemporaryDirectory() as temp:
+            disk = cache_module.DiskFrameCache(temp, {}, 2, 2, max_bytes=0)
+            legacy = disk.directory / '000000003.rgb.gz'
+            raw = disk.directory / '000000003.rgb'
+            self._legacy_frame(legacy, Frame())
+            self.assertEqual(disk.read(3)[0], Frame().props)
+            self.assertTrue(legacy.exists())
+            self.assertFalse(raw.exists())
+
+    def test_corrupt_raw_falls_back_to_legacy_and_repairs_raw(self):
+        with tempfile.TemporaryDirectory() as temp:
+            disk = cache_module.DiskFrameCache(temp, {}, 2, 2)
+            legacy = disk.directory / '000000003.rgb.gz'
+            raw = disk.directory / '000000003.rgb'
+            self._legacy_frame(legacy, Frame())
+            raw.write_bytes(b'broken')
+            self.assertEqual(disk.read(3)[0], Frame().props)
+            self.assertFalse(legacy.exists())
+            self.assertEqual(disk.read(3)[0], Frame().props)
+            raw.unlink()
+            legacy.write_bytes(b'broken')
+            self.assertIsNone(disk.read(3))
+
+    def test_migration_failure_preserves_legacy_hit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            disk = cache_module.DiskFrameCache(temp, {}, 2, 2)
+            legacy = disk.directory / '000000003.rgb.gz'
+            raw = disk.directory / '000000003.rgb'
+            self._legacy_frame(legacy, Frame())
+            with patch.object(cache_module.os, 'replace',
+                              side_effect=OSError('locked')):
+                self.assertEqual(disk.read(3)[0], Frame().props)
+            self.assertTrue(legacy.exists())
+            self.assertFalse(raw.exists())
+            self.assertFalse(list(disk.directory.glob('*.tmp')))
+
+    def test_prune_counts_raw_and_legacy_frames_together(self):
+        with tempfile.TemporaryDirectory() as temp:
+            disk = cache_module.DiskFrameCache(temp, {}, 2, 2)
+            disk.write(0, Frame())
+            legacy = disk.directory / '000000001.rgb.gz'
+            self._legacy_frame(legacy, Frame())
+            raw = disk.directory / '000000000.rgb'
+            disk.max_bytes = raw.stat().st_size + legacy.stat().st_size - 1
+            disk.prune()
+            remaining = list(disk.directory.glob('*.rgb'))
+            remaining += list(disk.directory.glob('*.rgb.gz'))
+            self.assertEqual(len(remaining), 1)
 
     def test_hit_does_not_construct_or_reference_rife(self):
         with tempfile.TemporaryDirectory() as temp:

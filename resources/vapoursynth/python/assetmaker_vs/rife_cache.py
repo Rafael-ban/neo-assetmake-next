@@ -118,9 +118,20 @@ class DiskFrameCache:
                 pass
 
     def read(self, n):
-        path = self.directory / f'{n:09d}.rgb.gz'
+        path = self.directory / f'{n:09d}.rgb'
+        record = self._read_record(path, compressed=False)
+        if record is not None:
+            return record
+        legacy = self.directory / f'{n:09d}.rgb.gz'
+        record = self._read_record(legacy, compressed=True)
+        if record is not None:
+            self._migrate(legacy, path, record)
+        return record
+
+    def _read_record(self, path, *, compressed):
         try:
-            with gzip.open(path, 'rb') as stream:
+            opener = gzip.open if compressed else Path.open
+            with opener(path, 'rb') as stream:
                 size = struct.unpack('<I', stream.read(4))[0]
                 if size > 1024 * 1024:
                     return None
@@ -137,15 +148,40 @@ class DiskFrameCache:
         except (OSError, EOFError, ValueError, KeyError, TypeError, struct.error, zlib.error):
             return None
 
+    def _migrate(self, legacy, path, record):
+        if not self.max_bytes:
+            return
+        props, data = record
+        temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+        try:
+            encoded = json.dumps(_encode_props(props), separators=(',', ':')).encode()
+            with temp.open('wb') as stream:
+                stream.write(struct.pack('<I', len(encoded)))
+                stream.write(encoded)
+                stream.write(data)
+            os.replace(temp, path)
+        except OSError:
+            return
+        finally:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            legacy.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self.prune()
+
     def write(self, n, frame):
         if not self.max_bytes:
             return
-        path = self.directory / f'{n:09d}.rgb.gz'
+        path = self.directory / f'{n:09d}.rgb'
         temp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
         try:
             self.directory.mkdir(parents=True, exist_ok=True)
             props = json.dumps(_encode_props(frame.props), separators=(',', ':')).encode()
-            with gzip.open(temp, 'wb', compresslevel=1) as stream:
+            with temp.open('wb') as stream:
                 stream.write(struct.pack('<I', len(props)))
                 stream.write(props)
                 for plane in range(3):
@@ -163,6 +199,10 @@ class DiskFrameCache:
                                 for row in range(start, min(start + 64, self.height))
                             ))
             os.replace(temp, path)
+            try:
+                path.with_suffix('.rgb.gz').unlink(missing_ok=True)
+            except OSError:
+                pass
             self.prune()
         except OSError as exc:
             with self._lock:
@@ -205,7 +245,7 @@ class DiskFrameCache:
                     stat = path.stat()
                     if path.suffix == '.tmp' and time.time() - stat.st_mtime > 3600:
                         path.unlink(missing_ok=True)
-                    elif path.name.endswith('.rgb.gz'):
+                    elif path.name.endswith(('.rgb', '.rgb.gz')):
                         total += stat.st_size
                         files.append((stat.st_mtime_ns, stat.st_size, path))
                 except OSError:
