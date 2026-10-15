@@ -64,6 +64,7 @@ import sys
 import logging
 import tempfile
 import shutil
+import filecmp
 from pathlib import Path
 from typing import Optional
 
@@ -1114,37 +1115,47 @@ class MainWindow(QMainWindow):
                 logger.warning(f"清理临时目录失败: {e}")
         self._temp_dir = None
 
-    def _migrate_temp_to_permanent(self, dest_dir: str):
-        """将临时项目中的工作文件迁移到永久目录"""
-        if not self._temp_dir or not os.path.exists(self._temp_dir):
-            return
-
-        try:
-            for filename in os.listdir(self._temp_dir):
-                src = os.path.join(self._temp_dir, filename)
-                dst = os.path.join(dest_dir, filename)
-                if not os.path.isfile(src):
+    def _migrate_temp_to_permanent(self, dest_dir: str) -> None:
+        """Copy project files before saving; retain the temp project on failure."""
+        if not self._temp_dir or not os.path.isdir(self._temp_dir):
+            raise FileNotFoundError("临时项目目录不存在，无法另存为")
+        source = Path(self._temp_dir).resolve()
+        destination = Path(dest_dir).resolve()
+        if destination == source or source in destination.parents:
+            raise ValueError("请将项目保存到临时目录之外")
+        excluded = {".assetmaker-vs", ".autosave", ".recovery"}
+        for current, directories, files in os.walk(source):
+            current_path = Path(current)
+            if current_path == source:
+                directories[:] = [name for name in directories if name not in excluded]
+            for filename in files:
+                if current_path == source and (
+                    filename == CONFIG_FILENAME
+                    or filename.startswith("autosave_") and filename.endswith(".json")
+                ):
                     continue
-                if os.path.exists(dst):
-                    # Don't bind the project to a pre-existing foreign file when
-                    # the temp source is the intended one: overwrite only when
-                    # the temp file is newer, otherwise log the skip so a stale
-                    # destination doesn't silently win.
-                    if os.path.getmtime(src) <= os.path.getmtime(dst):
-                        logger.warning(
-                            "迁移跳过(目标已存在且不更旧): %s", filename)
+                source_file = current_path / filename
+                target_file = destination / source_file.relative_to(source)
+                target_file.parent.mkdir(parents=True, exist_ok=True)
+                if target_file.exists():
+                    if target_file.is_file() and filecmp.cmp(
+                        source_file, target_file, shallow=False
+                    ):
                         continue
-                shutil.copy2(src, dst)
-                logger.debug(f"已迁移文件: {filename}")
+                    raise FileExistsError(
+                        f"目标项目文件与临时项目冲突：{target_file}"
+                    )
+                with tempfile.NamedTemporaryFile(
+                    dir=target_file.parent, prefix=f".{filename}.", delete=False
+                ) as staging:
+                    staged_path = Path(staging.name)
+                try:
+                    shutil.copy2(source_file, staged_path)
+                    os.replace(staged_path, target_file)
+                finally:
+                    staged_path.unlink(missing_ok=True)
 
-            self._cleanup_temp_dir()
-            logger.info(f"已将临时项目迁移到: {dest_dir}")
-        except Exception as e:
-            logger.warning(f"迁移临时项目失败: {e}")
-            # 迁移失败时保留临时目录作为备份
-
-    def _rebase_saved_media_paths(self, old_base_dir: str) -> None:
-        """Keep relative media references valid when Save As changes project root."""
+    def _saved_media_path_fields(self):
         config = self._config
         paths = [
             (config, "icon"),
@@ -1161,10 +1172,34 @@ class MainWindow(QMainWindow):
             ))
         if config.overlay.image_options is not None:
             paths.append((config.overlay.image_options, "image"))
-        for owner, attr in paths:
+        return paths
+
+    def _rebase_saved_media_paths(self, old_base_dir: str):
+        """Keep relative media references valid when Save As changes root."""
+        changes = []
+        for owner, attr in self._saved_media_path_fields():
             value = getattr(owner, attr)
             if value and not os.path.isabs(value):
+                changes.append((owner, attr, value))
                 setattr(owner, attr, os.path.abspath(os.path.join(old_base_dir, value)))
+        return changes
+
+    def _rebase_temp_media_paths(self, old_base_dir: str, new_base_dir: str):
+        """Move absolute references into the copied temporary project."""
+        changes = []
+        for owner, attr in self._saved_media_path_fields():
+            value = getattr(owner, attr)
+            if not value or not os.path.isabs(value):
+                continue
+            try:
+                relative = os.path.relpath(value, old_base_dir)
+            except ValueError:
+                continue
+            if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+                continue
+            changes.append((owner, attr, value))
+            setattr(owner, attr, os.path.abspath(os.path.join(new_base_dir, relative)))
+        return changes
 
     def _refresh_saved_preview_sessions(
         self, old_base_dir: str, new_base_dir: str, was_temp: bool
@@ -1429,12 +1464,20 @@ class MainWindow(QMainWindow):
             )
             was_temp = bool(self._temp_dir and old_base_dir == self._temp_dir)
 
-            if was_temp:
-                self._migrate_temp_to_permanent(new_base_dir)
-            elif root_changed:
-                self._rebase_saved_media_paths(old_base_dir)
-
-            self._config.save_to_file(path)
+            rebased_paths = []
+            try:
+                if was_temp:
+                    self._migrate_temp_to_permanent(new_base_dir)
+                    rebased_paths = self._rebase_temp_media_paths(
+                        old_base_dir, new_base_dir
+                    )
+                elif root_changed:
+                    rebased_paths = self._rebase_saved_media_paths(old_base_dir)
+                self._config.save_to_file(path)
+            except Exception:
+                for owner, attr, original in rebased_paths:
+                    setattr(owner, attr, original)
+                raise
             self._project_path = path
             self._base_dir = new_base_dir
             self._is_modified = False
@@ -1446,6 +1489,8 @@ class MainWindow(QMainWindow):
                 self._refresh_saved_preview_sessions(
                     old_base_dir, new_base_dir, was_temp
                 )
+            if was_temp:
+                self._cleanup_temp_dir()
 
             # 重新指向自动保存(路径已切换;服务缓存的是 start() 时的值)。
             self._start_auto_save()

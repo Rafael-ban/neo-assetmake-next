@@ -138,5 +138,111 @@ class SaveAsPreviewMigrationTests(unittest.TestCase):
             self.assertEqual(window.video_preview.current_frame_index, 23)
 
 
+    def test_temporary_project_copies_nested_media_and_script_without_cache(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            source, target = root / "temporary", root / "saved"
+            (source / "media").mkdir(parents=True)
+            (source / "scripts" / "helpers").mkdir(parents=True)
+            (source / ".assetmaker-vs" / "rife-cache").mkdir(parents=True)
+            target.mkdir()
+            media = source / "media" / "loop.mp4"
+            media.write_bytes(b"media")
+            (source / "scripts" / "pipeline.vpy").write_text("# script")
+            (source / "scripts" / "helpers" / "effect.py").write_text("# helper")
+            (source / ".assetmaker-vs" / "rife-cache" / "frame.rgb").write_bytes(b"cache")
+            window = self._window(source, media, temporary=True)
+            window._config.loop.file = str(media)
+            window._config.editor.vs_script.source = "project"
+            window._config.editor.vs_script.path = "scripts/pipeline.vpy"
+
+            self._save_as(window, target / CONFIG_FILENAME)
+
+            self.assertEqual((target / "media" / "loop.mp4").read_bytes(), b"media")
+            self.assertTrue((target / "scripts" / "helpers" / "effect.py").is_file())
+            self.assertFalse((target / ".assetmaker-vs").exists())
+            self.assertEqual(window.video_preview.video_path, str(target / "media" / "loop.mp4"))
+            saved = EPConfig.load_from_file(str(target / CONFIG_FILENAME))
+            self.assertEqual(saved.loop.file, str(target / "media" / "loop.mp4"))
+            self.assertEqual(saved.editor.vs_script.path, "scripts/pipeline.vpy")
+
+    def test_temporary_save_failure_keeps_source_and_original_project_state(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            source, target = root / "temporary", root / "saved"
+            source.mkdir()
+            target.mkdir()
+            media = source / "loop.mp4"
+            media.write_bytes(b"media")
+            window = self._window(source, media, temporary=True)
+            window._config.loop.file = str(media)
+            with mock.patch.object(window._config, "save_to_file", side_effect=OSError("save failed")), mock.patch(
+                "gui.main_window.show_error"
+            ):
+                self._save_as(window, target / CONFIG_FILENAME)
+            self.assertTrue(media.is_file())
+            self.assertEqual(window._temp_dir, str(source))
+            self.assertEqual(window._base_dir, str(source))
+            self.assertEqual(window._config.loop.file, str(media))
+
+    def test_temporary_conflicting_target_preserves_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            source, target = root / "temporary", root / "saved"
+            source.mkdir()
+            target.mkdir()
+            media = source / "loop.mp4"
+            media.write_bytes(b"source")
+            (target / "loop.mp4").write_bytes(b"different")
+            window = self._window(source, media, temporary=True)
+
+            with mock.patch("gui.main_window.show_error"):
+                self._save_as(window, target / CONFIG_FILENAME)
+
+            self.assertTrue(media.is_file())
+            self.assertEqual((target / "loop.mp4").read_bytes(), b"different")
+            self.assertFalse((target / CONFIG_FILENAME).exists())
+            self.assertEqual(window._base_dir, str(source))
+
+
+    def test_temporary_copy_failure_can_retry_without_losing_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            source, target = root / "temporary", root / "saved"
+            source.mkdir()
+            target.mkdir()
+            (source / "first.txt").write_text("first")
+            (source / "second.txt").write_text("second")
+            window = self._window(source, source / "first.txt", temporary=True)
+            real_copy = __import__("shutil").copy2
+            copied = 0
+
+            def fail_second_copy(src, dst):
+                nonlocal copied
+                copied += 1
+                if copied == 2:
+                    raise OSError("copy failed")
+                return real_copy(src, dst)
+
+            with mock.patch("gui.main_window.shutil.copy2", side_effect=fail_second_copy), mock.patch(
+                "gui.main_window.show_error"
+            ):
+                self._save_as(window, target / CONFIG_FILENAME)
+
+            self.assertTrue((source / "first.txt").is_file())
+            self.assertTrue((source / "second.txt").is_file())
+            self.assertEqual(window._base_dir, str(source))
+            self.assertFalse((target / CONFIG_FILENAME).exists())
+            self.assertEqual(len(list(target.glob("*.txt"))), 1)
+
+            self._save_as(window, target / CONFIG_FILENAME)
+
+            self.assertEqual((target / "first.txt").read_text(), "first")
+            self.assertEqual((target / "second.txt").read_text(), "second")
+            self.assertTrue((target / CONFIG_FILENAME).is_file())
+            self.assertFalse(source.exists())
+            self.assertEqual(window._base_dir, str(target))
+
+
 if __name__ == "__main__":
     unittest.main()
