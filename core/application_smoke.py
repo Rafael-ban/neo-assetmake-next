@@ -174,8 +174,9 @@ def _exercise(app_dir, root, progress):
     session = RenderSession(1, "loop", selection, str(job_path),
                             compute_job_sha256(job_path), snapshot.fingerprint)
     # ExportService's existing default config readers and its preflight worker
-    # use the same isolated APPDATA and full snapshot environment as preview.
+    # use the same isolated VS configuration and snapshot environment as preview.
     environment["APPDATA"] = str(root / "isolated appdata")
+    environment["ASSETMAKER_VS_USER_CONFIG_DIR"] = str(root / "isolated vs config")
     with _isolated_environment(environment):
         worker = SyncVSWorkerProcess(app_dir=app_dir, env=environment)
         try:

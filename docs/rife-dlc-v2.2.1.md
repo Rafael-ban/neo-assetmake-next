@@ -15,7 +15,7 @@
 ## 使用外置插件目录
 
 如需使用自备 RIFE DLL，可关闭编辑器后编辑
-`%APPDATA%/ArknightsPassMaker/vapoursynth/vs_runtime.user.json`：
+当前 EXE 或源码根目录下的 `.assetmaker-work/config/vapoursynth/vs_runtime.user.json`：
 
 ```json
 {
@@ -34,7 +34,7 @@ JSON 中反斜杠需写成 `\\`；请用实际存在的 Windows 绝对路径。
 
 旧配置中已经不存在的 旧版 `tools/vs-rife/rife` 目录，仅在当前程序的本地 DLC
 可用时会被忽略；其他手动配置不会被自动覆盖。若报路径错误，请修正实际失效的条目。
-用户配置由同一 Windows 用户的不同程序副本共用，移动或删除外置插件后需要同步修改。
+每份程序使用各自目录中的配置；首次使用会迁移旧 AppData 配置并保留旧文件，新目录已有配置优先。迁移后继续编辑旧 AppData 文件不会影响本程序。移动或删除外置插件后，需要修改实际运行的程序目录中的配置。
 不要将这些配置写入项目 `epconfig.json`，也不要覆盖随包的 `config/vs_runtime.json`。
 
 ## 单独指定模型目录

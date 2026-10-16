@@ -212,7 +212,7 @@ VS 自动帧缓存；工作图仍需要运行内存和显存，不承诺播放�
 完成的帧可复用，未完成写入使用临时文件，重试不会把半帧当作有效结果。
 普通预览 session 的 `.lwi` 索引不是补帧缓存，不要混淆。
 未保存项目使用 `<EXE 或源码根>/.assetmaker-work/projects/project_<unique>/`，
-程序根需要可写。Roaming 中的小型 `vs_runtime.user.json` 用户配置仍保留。
+程序根需要可写。运行配置和脚本信任记录位于程序根 `.assetmaker-work/config/vapoursynth/`。首次使用迁移旧 AppData 文件并保留原件，新目录已有配置优先；迁移后不再持续读取 Roaming 中的共享配置。
 
 测试入口：`tests.test_rife_disk_cache`、`tests.test_preview_worker_lifecycle`、
 `tests.test_export_preview_pause`。发布产物是否包含这些改动，应以构建 commit 判断；更新主程序逻辑需重新构建 EXE。

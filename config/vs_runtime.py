@@ -237,16 +237,10 @@ def default_vs_runtime_path() -> Path:
     return Path(get_app_dir()) / "config" / RUNTIME_CONFIG_FILENAME
 
 
-def default_vs_runtime_user_path() -> Path:
-    """返回固定的可写用户覆盖路径。"""
-    appdata = os.environ.get("APPDATA")
-    root = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-    return (
-        root
-        / "ArknightsPassMaker"
-        / "vapoursynth"
-        / USER_OVERRIDE_FILENAME
-    )
+def default_vs_runtime_user_path(app_dir: str | os.PathLike[str] | None = None) -> Path:
+    """Return the per-application override path without creating files."""
+    from config.vs_user_data import vs_user_config_dir
+    return vs_user_config_dir(app_dir) / USER_OVERRIDE_FILENAME
 
 
 def _read_json(path: Path) -> Any:
@@ -362,6 +356,9 @@ def load_vs_runtime(
 ) -> VSRuntimeConfig:
     """读取随包配置并叠加用户覆盖；仅缺失文件可回落默认值。"""
     use_default_user = shipped_path is None
+    if use_default_user and user_path is None:
+        from config.vs_user_data import migrate_vs_user_data_once
+        migrate_vs_user_data_once()
     shipped = (
         Path(shipped_path)
         if shipped_path is not None

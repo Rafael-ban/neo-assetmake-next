@@ -153,6 +153,9 @@ def migrate_legacy_vsconfig_once(
     marker_path: str | os.PathLike[str] | None = None,
 ) -> MigrationReport:
     """按旧文件 hash 幂等迁移运行字段，并报告被忽略的滤镜字段。"""
+    if user_path is None:
+        from config.vs_user_data import migrate_vs_user_data_once
+        migrate_vs_user_data_once()
     source, source_hash = _source_path_and_hash(legacy_path)
     if source_hash is None:
         return MigrationReport(False, (), (), "")

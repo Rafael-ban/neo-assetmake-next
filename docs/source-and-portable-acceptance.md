@@ -87,7 +87,7 @@ Windows 缺失 runtime 目录时记录一次部署提示，保留 GUI 启动。�
 6. 验收报告必须 success=true、frozen=true、app_dir/executable 指向解压后的目录；worker 取帧、12 帧 360×640 导出、MP4 解码回读与工作目录清理必须通过。
 7. 最后人工用一个实际 MP4 项目检查连续播放、暂停、裁剪、旋转、循环/入场切换、导出及重开同一项目；目标设备显示仍属于独立验收。
 
-新增的 `--smoke-test` 入口运行实际生产 RenderJob/RenderSession、独立 worker IPC 与 ExportService，使用临时中文素材目录和隔离的 APPDATA；不会读取或改写用户 runtime 覆盖配置。
+新增的 `--smoke-test` 入口运行实际生产 RenderJob/RenderSession、独立 worker IPC 与 ExportService，使用临时中文素材目录，并通过 `ASSETMAKER_VS_USER_CONFIG_DIR` 指向隔离的配置目录；自检跳过旧 AppData 配置迁移，不会读取或改写真实用户的运行配置与脚本信任记录。该环境变量用于测试隔离，正常运行无需设置。
 测试请求第 0/11 帧并验证输出元数据，再导出 12 帧 MP4，用 OpenCV 回读帧数、尺寸和非黑画面。超时和异常写阶段报告并非零退出。
 该 PNG 样本覆盖 imwri 和编码链，不证明所有 MP4 解码器、所有滤镜、GPU/AI 算子或完整 GUI 工作流都已通过。
 构建 CI 在上传产物的流程中执行迁移目录真实验收并上传 JSON 报告；最新实际运行结果见下方记录。

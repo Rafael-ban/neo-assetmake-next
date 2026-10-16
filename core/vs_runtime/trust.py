@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,9 +46,8 @@ class ScriptReference:
 
 
 def default_trust_path() -> Path:
-    appdata = os.environ.get("APPDATA")
-    root = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-    return root / "ArknightsPassMaker" / "vapoursynth" / TRUST_FILENAME
+    from config.vs_user_data import vs_user_config_dir
+    return vs_user_config_dir() / TRUST_FILENAME
 
 
 def _canonical(path: str | Path, *, location: str, directory: bool = False) -> Path:
@@ -110,6 +108,9 @@ class ProjectTrustStore:
     """仅记录本机已确认的 ``(canonical script root, bundle hash)``。"""
 
     def __init__(self, path: str | Path | None = None) -> None:
+        if path is None:
+            from config.vs_user_data import migrate_vs_user_data_once
+            migrate_vs_user_data_once()
         self.path = Path(path) if path is not None else default_trust_path()
 
     @staticmethod

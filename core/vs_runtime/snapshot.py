@@ -44,9 +44,12 @@ def resolve_runtime_config(
 ) -> VSRuntimeConfig:
     """预览、预检和导出共用的有效配置；保留有效的手动插件目录。"""
     root = Path(app_dir).resolve()
+    if user_path is None:
+        from config.vs_user_data import migrate_vs_user_data_once
+        migrate_vs_user_data_once(root)
     runtime = load_vs_runtime(
         root / "config" / "vs_runtime.json",
-        default_vs_runtime_user_path() if user_path is None else user_path,
+        default_vs_runtime_user_path(root) if user_path is None else user_path,
     )
     app_rife = root / "tools" / "vs-rife" / "rife" / "librife_windows_x86-64.dll"
     # 只在应用内 DLC 可以替代时忽略不存在的旧路径。存在的手动目录

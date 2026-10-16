@@ -110,6 +110,7 @@ class ApplicationSmokeTests(unittest.TestCase):
             self.assertEqual(job.timeline.end_frame, 12)
             self.assertTrue(Path(job.source.path).is_file())
             self.assertEqual(os.environ["APPDATA"], str(root / "isolated appdata"))
+            self.assertEqual(os.environ["ASSETMAKER_VS_USER_CONFIG_DIR"], str(root / "isolated vs config"))
             self.assertEqual(os.environ["SMOKE_RUNTIME"], "isolated")
             return root / "output"
 
@@ -129,6 +130,7 @@ class ApplicationSmokeTests(unittest.TestCase):
             resolve.assert_called_once_with(ROOT, user_path=root / "不存在 user.json")
             self.assertFalse(resolve.call_args.kwargs["user_path"].exists())
             self.assertEqual(worker_type.call_args.kwargs["env"]["APPDATA"], str(root / "isolated appdata"))
+            self.assertEqual(worker_type.call_args.kwargs["env"]["ASSETMAKER_VS_USER_CONFIG_DIR"], str(root / "isolated vs config"))
         self.assertEqual(dict(os.environ), before)
         self.assertEqual(len(observations), 1)
         session, _job = observations[0]
