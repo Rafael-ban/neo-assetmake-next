@@ -533,7 +533,7 @@ wheels = [
 
 [[package]]
 name = "neo-assetmaker"
-version = "2.2.1"
+version = "2.2.2"
 source = { editable = "." }
 dependencies = [
     { name = "fido2" },
