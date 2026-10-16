@@ -153,12 +153,14 @@ def _run_probe():
         finish_timer.timeout.connect(complete)
         watchdog.timeout.connect(timeout)
         service.export_all = export_all
+        export_dir = fixture.root / "export-output"
+        export_dir.mkdir()
         try:
             with (
                 mock.patch("core.validator.EPConfigValidator", _ValidValidator),
                 mock.patch(
                     "gui.main_window.QFileDialog.getExistingDirectory",
-                    return_value=str(fixture.root),
+                    return_value=str(export_dir),
                 ),
                 mock.patch("core.export_service.ExportService", return_value=service),
             ):
