@@ -502,7 +502,8 @@ class C3PackageTransactionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             final_dir = Path(temp_dir) / "package"
-            old_bytes = _write_old_package(final_dir)
+            final_dir.mkdir()
+            old_bytes = _package_bytes(final_dir)
             failed, completed = [], []
             service = self._service()
             service.export_failed.connect(failed.append)
@@ -534,7 +535,8 @@ class C3PackageTransactionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             final_dir = Path(temp_dir) / "package"
-            old_bytes = _write_old_package(final_dir)
+            final_dir.mkdir()
+            old_bytes = _package_bytes(final_dir)
             failed, completed = [], []
             service = self._service()
             service.export_failed.connect(failed.append)
@@ -620,7 +622,8 @@ class C3PackageTransactionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             final_dir = Path(temp_dir) / "package"
-            old_bytes = _write_old_package(final_dir)
+            final_dir.mkdir()
+            old_bytes = _package_bytes(final_dir)
             failed, completed = [], []
             service = self._service()
             service.export_failed.connect(failed.append)
@@ -659,7 +662,8 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            old_bytes = _write_old_package(final_dir)
+            final_dir.mkdir()
+            old_bytes = _package_bytes(final_dir)
             failed = []
             service = self._service()
             service.export_failed.connect(failed.append)
@@ -702,79 +706,56 @@ class C3PackageTransactionTests(unittest.TestCase):
             self.assertIn(str(stagings[0]), failed[0])
             self.assertFalse(list(root.glob(".package.lock")))
 
-    def test_existing_directory_keeps_unrelated_file_and_subdirectory(self):
+    def test_existing_directory_with_file_and_subdirectory_is_rejected(self):
         from core.export_service import ExportWorker
-
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            final_dir = root / "package"
-            _write_old_package(final_dir)
+            final_dir = Path(temp_dir) / "package"
+            final_dir.mkdir()
             (final_dir / "notes.txt").write_text("keep", encoding="utf-8")
             extra_dir = final_dir / "project-assets"
             extra_dir.mkdir()
             (extra_dir / "source.bin").write_bytes(b"source")
             service = self._service()
-            completed = []
-            service.export_completed.connect(completed.append)
-
-            real_read_bytes = Path.read_bytes
-
-            def read_known_only(path):
-                if path.name in {"notes.txt", "source.bin"}:
-                    raise AssertionError("must not read unrelated content")
-                return real_read_bytes(path)
-
-            with mock.patch.object(
-                ExportWorker, "start",
-                side_effect=lambda: _run_service_worker_synchronously(service),
-            ), mock.patch(
-                "core.export_service.shutil.copy2",
-                side_effect=AssertionError("must not copy"),
-            ), mock.patch.object(Path, "read_bytes", read_known_only):
+            failed = []
+            service.export_failed.connect(failed.append)
+            with mock.patch.object(ExportWorker, "start") as start:
                 service.export_all(
-                    output_dir=str(final_dir),
-                    epconfig=self._config(),
+                    output_dir=str(final_dir), epconfig=self._config(),
                     logo_mat=np.full((16, 16, 3), 200, np.uint8),
                 )
-
-            self.assertTrue(completed)
+            start.assert_not_called()
+            self.assertTrue(failed)
+            self.assertIn("必须为空", failed[0])
             self.assertEqual((final_dir / "notes.txt").read_text(encoding="utf-8"), "keep")
-            self.assertEqual((final_dir / "project-assets" / "source.bin").read_bytes(), b"source")
-            self.assertEqual(sorted(path.name for path in final_dir.iterdir()),
-                             ["epconfig.json", "icon.png", "notes.txt", "project-assets"])
+            self.assertEqual((extra_dir / "source.bin").read_bytes(), b"source")
+            self.assertFalse((final_dir / "epconfig.json").exists())
 
-    def test_unrelated_entries_return_on_promotion_failure(self):
+    def test_file_added_during_final_to_backup_move_is_preserved(self):
         from core.export_service import ExportWorker
-
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            old_bytes = _write_old_package(final_dir)
-            (final_dir / "notes.txt").write_text("keep", encoding="utf-8")
-            old_bytes = _package_bytes(final_dir)
-            real_rename = os.rename
-
-            def fail_publish(source, destination):
-                if (Path(source).name.startswith(".package.staging-")
-                        and Path(destination) == final_dir):
-                    raise PermissionError("publish blocked")
-                return real_rename(source, destination)
-
+            final_dir.mkdir()
             service = self._service()
-            failed = []
+            failed, completed = [], []
             service.export_failed.connect(failed.append)
+            service.export_completed.connect(completed.append)
+            real_rename = os.rename
+            def add_file_before_backup_move(source, destination):
+                if Path(source) == final_dir and Path(destination).name.startswith(".package.backup-"):
+                    (final_dir / "new-file.txt").write_text("keep", encoding="utf-8")
+                return real_rename(source, destination)
             with mock.patch.object(
                 ExportWorker, "start",
                 side_effect=lambda: _run_service_worker_synchronously(service),
-            ), mock.patch("core.export_service.os.rename", side_effect=fail_publish):
+            ), mock.patch("core.export_service.os.rename", side_effect=add_file_before_backup_move):
                 service.export_all(
-                    output_dir=str(final_dir),
-                    epconfig=self._config(),
+                    output_dir=str(final_dir), epconfig=self._config(),
                     logo_mat=np.full((16, 16, 3), 200, np.uint8),
                 )
-
+            self.assertFalse(completed)
             self.assertTrue(failed)
-            self.assertEqual(_package_bytes(final_dir), old_bytes)
+            self.assertEqual((final_dir / "new-file.txt").read_text(encoding="utf-8"), "keep")
             self.assertFalse(list(root.glob(".package.backup-*")))
 
     def test_project_editor_config_is_not_overwritten(self):
@@ -803,30 +784,24 @@ class C3PackageTransactionTests(unittest.TestCase):
             self.assertTrue(failed)
             self.assertEqual(_package_bytes(final_dir), original)
 
-    def test_non_package_directory_keeps_its_unrelated_file(self):
+    def test_application_directory_with_files_is_rejected(self):
         from core.export_service import ExportWorker
-
         with tempfile.TemporaryDirectory() as temp_dir:
-            final_dir = Path(temp_dir) / "user-files"
+            final_dir = Path(temp_dir) / "application"
             final_dir.mkdir()
-            final_dir.joinpath("keep.txt").write_text("do not touch", encoding="utf-8")
-            completed = []
+            (final_dir / "main.exe").write_bytes(b"app")
             service = self._service()
-            service.export_completed.connect(completed.append)
-            with mock.patch.object(
-                ExportWorker, "start",
-                side_effect=lambda: _run_service_worker_synchronously(service),
-            ):
+            failed = []
+            service.export_failed.connect(failed.append)
+            with mock.patch.object(ExportWorker, "start") as start:
                 service.export_all(
-                    output_dir=str(final_dir),
-                    epconfig=self._config(),
+                    output_dir=str(final_dir), epconfig=self._config(),
                     logo_mat=np.full((16, 16, 3), 200, np.uint8),
                 )
-
-            self.assertTrue(completed)
-            self.assertEqual(final_dir.joinpath("keep.txt").read_text(encoding="utf-8"), "do not touch")
-            self.assertTrue((final_dir / "epconfig.json").is_file())
-            self.assertTrue((final_dir / "icon.png").is_file())
+            start.assert_not_called()
+            self.assertTrue(failed)
+            self.assertIn("必须为空", failed[0])
+            self.assertEqual((final_dir / "main.exe").read_bytes(), b"app")
 
     def test_final_directory_symlink_is_rejected_before_worker_start(self):
         """The lexical output link must not be resolved into a replaceable package."""
@@ -965,7 +940,7 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            _write_old_package(final_dir)
+            final_dir.mkdir()
             service = self._service()
             failed = []
             service.export_failed.connect(failed.append)
@@ -977,7 +952,7 @@ class C3PackageTransactionTests(unittest.TestCase):
                     logo_mat=np.full((16, 16, 3), 200, np.uint8),
                 )
 
-            final_dir.joinpath("icon.png").write_bytes(b"external-generation")
+            final_dir.joinpath("new-file.txt").write_bytes(b"external-generation")
             external_bytes = _package_bytes(final_dir)
             _run_service_worker_synchronously(service)
 
@@ -1026,7 +1001,7 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            _write_old_package(final_dir)
+            final_dir.mkdir()
             service = self._service()
             completed, failed = [], []
             service.export_completed.connect(completed.append)
@@ -1076,7 +1051,7 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            _write_old_package(final_dir)
+            final_dir.mkdir()
             service = self._service()
             completed, failed = [], []
             service.export_completed.connect(completed.append)
@@ -1127,7 +1102,7 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            _write_old_package(final_dir)
+            final_dir.mkdir()
             service = self._service()
             completed, failed = [], []
             service.export_completed.connect(completed.append)
@@ -1178,7 +1153,8 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            old_bytes = _write_old_package(final_dir)
+            final_dir.mkdir()
+            old_bytes = _package_bytes(final_dir)
             loop_session = _valid_render_session(root, track="loop")
             intro_session = _valid_render_session(root, track="intro")
             service = self._service()
@@ -1222,7 +1198,7 @@ class C3PackageTransactionTests(unittest.TestCase):
             self.assertFalse(list(root.glob(".package.lock")))
 
     def test_frozen_video_job_is_checked_before_private_work_cleanup(self):
-        """未变更冻结 job 必须允许首次发布及替换已存在的旧包。"""
+        """未变更冻结 job 必须允许首次发布及导出到已有空目录。"""
         from core.export_service import ExportWorker
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1232,7 +1208,7 @@ class C3PackageTransactionTests(unittest.TestCase):
                     root.mkdir()
                     final_dir = root / "package"
                     if existing:
-                        _write_old_package(final_dir)
+                        final_dir.mkdir()
                     session = _valid_render_session(root)
                     source_job = Path(session.job_path)
                     service = self._service()
@@ -1282,7 +1258,8 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            old_bytes = _write_old_package(final_dir)
+            final_dir.mkdir()
+            old_bytes = _package_bytes(final_dir)
             session = _valid_render_session(root)
             service = self._service()
             config = self._config()
@@ -1328,7 +1305,8 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            old_bytes = _write_old_package(final_dir)
+            final_dir.mkdir()
+            old_bytes = _package_bytes(final_dir)
             session = _valid_render_session(root)
             service = self._service()
             config = self._config()
@@ -1378,7 +1356,8 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            old_bytes = _write_old_package(final_dir)
+            final_dir.mkdir()
+            old_bytes = _package_bytes(final_dir)
             session = _valid_render_session(root)
             service = self._service()
             config = self._config()
@@ -1429,7 +1408,8 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            old_bytes = _write_old_package(final_dir)
+            final_dir.mkdir()
+            old_bytes = _package_bytes(final_dir)
             session = _valid_render_session(root)
             preview_job = Path(session.job_path)
             preview_bytes = preview_job.read_bytes()
@@ -1462,7 +1442,8 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            old_bytes = _write_old_package(final_dir)
+            final_dir.mkdir()
+            old_bytes = _package_bytes(final_dir)
             service = self._service()
             failed = []
             service.export_failed.connect(failed.append)
@@ -1494,7 +1475,8 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            old_bytes = _write_old_package(final_dir)
+            final_dir.mkdir()
+            old_bytes = _package_bytes(final_dir)
             service = self._service()
             failed = []
             service.export_failed.connect(failed.append)
@@ -1524,30 +1506,23 @@ class C3PackageTransactionTests(unittest.TestCase):
             self.assertEqual(rename.call_count, 0)
             self.assertEqual(_package_bytes(final_dir), old_bytes)
 
-    def test_successful_package_replaces_stale_old_artifacts(self):
-        """Directory promotion removes artifacts no longer declared by the new package."""
+    def test_existing_export_package_is_rejected_without_overwrite(self):
         from core.export_service import ExportWorker
-
         with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            final_dir = root / "package"
-            _write_old_package(final_dir)
-            final_dir.joinpath("intro.mp4").write_bytes(b"old-intro")
+            final_dir = Path(temp_dir) / "package"
+            old_bytes = _write_old_package(final_dir)
             service = self._service()
-
-            with mock.patch.object(
-                ExportWorker,
-                "start",
-                side_effect=lambda: _run_service_worker_synchronously(service),
-            ):
+            failed = []
+            service.export_failed.connect(failed.append)
+            with mock.patch.object(ExportWorker, "start") as start:
                 service.export_all(
-                    output_dir=str(final_dir),
-                    epconfig=self._config(),
+                    output_dir=str(final_dir), epconfig=self._config(),
                     logo_mat=np.full((16, 16, 3), 200, np.uint8),
                 )
-
-            self.assertFalse((final_dir / "intro.mp4").exists())
-            self.assertEqual(sorted(path.name for path in final_dir.iterdir()), ["epconfig.json", "icon.png"])
+            start.assert_not_called()
+            self.assertTrue(failed)
+            self.assertIn("必须为空", failed[0])
+            self.assertEqual(_package_bytes(final_dir), old_bytes)
 
     def test_backup_cleanup_failure_reports_success_with_warning(self):
         """A post-commit backup cleanup failure preserves recovery material and succeeds."""
@@ -1556,7 +1531,7 @@ class C3PackageTransactionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             final_dir = root / "package"
-            _write_old_package(final_dir)
+            final_dir.mkdir()
             service = self._service()
             completed, failed = [], []
             service.export_completed.connect(completed.append)
@@ -1567,7 +1542,7 @@ class C3PackageTransactionTests(unittest.TestCase):
                 "start",
                 side_effect=lambda: _run_service_worker_synchronously(service),
             ), mock.patch.object(
-                ExportWorker, "_remove_tree", side_effect=OSError("backup cleanup boom")
+                Path, "rmdir", side_effect=OSError("backup cleanup boom")
             ):
                 service.export_all(
                     output_dir=str(final_dir),

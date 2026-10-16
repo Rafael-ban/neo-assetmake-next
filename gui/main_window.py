@@ -1589,6 +1589,12 @@ class MainWindow(QMainWindow):
                 self, "导出目录无效", "不能将素材导出到当前项目目录，请选择其他目录。"
             )
             return
+        from core.export_service import _assert_replaceable_final_dir
+        try:
+            _assert_replaceable_final_dir(Path(dir_path))
+        except (OSError, RuntimeError) as exc:
+            QMessageBox.warning(self, "导出目录无效", str(exc))
+            return
 
         # 暂停信号、准备阶段的错误弹窗也可能重入，须先建立本次导出的边界。
         self._export_in_progress = True

@@ -338,43 +338,15 @@ def _epconfig_references(payload: object) -> set[str]:
 
 
 def _assert_replaceable_final_dir(final_dir: Path) -> None:
-    """Allow unrelated entries while protecting source projects and artifact names."""
+    """Only a missing or empty ordinary directory can receive an export."""
     if final_dir.is_symlink():
         raise RuntimeError(f"导出目标不能是链接或非目录: {final_dir}")
     if not final_dir.exists():
         return
     if _is_reparse_or_symlink(final_dir) or not final_dir.is_dir():
         raise RuntimeError(f"导出目标不能是链接或非目录: {final_dir}")
-    entries = list(final_dir.iterdir())
-    if not entries:
-        return
-    files: set[str] = set()
-    for entry in entries:
-        if _is_reparse_or_symlink(entry):
-            raise RuntimeError(f"拒绝导出到包含链接的目录: {final_dir}")
-        files.add(entry.name)
-    config_path = final_dir / "epconfig.json"
-    if "epconfig.json" not in files:
-        if files & _KNOWN_PACKAGE_ARTIFACTS:
-            raise RuntimeError(f"拒绝覆盖未识别的已有素材: {final_dir}")
-        return
-    try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"拒绝替换无效的旧导出包: {final_dir}") from exc
-    if (
-        not isinstance(payload, dict)
-        or not isinstance(payload.get("version"), int)
-        or not isinstance(payload.get("screen"), str)
-        or not isinstance(payload.get("loop"), dict)
-        or "editor" in payload
-    ):
-        raise RuntimeError(f"拒绝替换无效的旧导出包: {final_dir}")
-    if any(not (final_dir / name).is_file() for name in files & _KNOWN_PACKAGE_ARTIFACTS):
-        raise RuntimeError(f"旧导出素材不是普通文件: {final_dir}")
-    references = _epconfig_references(payload)
-    if not references.issubset(files):
-        raise RuntimeError(f"旧导出包缺少引用的素材: {final_dir}")
+    if any(final_dir.iterdir()):
+        raise RuntimeError(f"导出目录必须为空，拒绝覆盖已有文件: {final_dir}")
 
 
 class ExportWorker(QThread):
@@ -883,6 +855,7 @@ class ExportWorker(QThread):
             self._assert_final_directory(
                 package, package.final_dir_identity, "移动旧包到备份"
             )
+            _assert_replaceable_final_dir(final_dir)
             try:
                 self._rename_dir_no_replace(final_dir, backup_dir)
             except Exception as move_error:
@@ -908,6 +881,7 @@ class ExportWorker(QThread):
                 ) from identity_error
             moved_foreign: list[str] = []
             try:
+                _assert_replaceable_final_dir(backup_dir)
                 for name in package.foreign_entries:
                     self._rename_dir_no_replace(backup_dir / name, staging_dir / name)
                     moved_foreign.append(name)
@@ -943,7 +917,10 @@ class ExportWorker(QThread):
                     ) from publish_error
                 raise RuntimeError(f"发布新包失败，已恢复旧包: {publish_error}") from publish_error
             try:
-                self._remove_tree(package, backup_dir, f".{final_dir.name}.backup-")
+                self._assert_package_path(
+                    package, backup_dir, backup_prefix, package.backup_dir_identity
+                )
+                backup_dir.rmdir()
             except Exception as exc:
                 return (
                     f"旧包备份身份无法证明，未执行清理，保留在 {backup_dir}；"
