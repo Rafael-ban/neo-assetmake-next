@@ -3056,6 +3056,12 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
         self.job = self.root / "job.json"
         _write_job(self.job)
         self.appdata = self.root / "appdata"
+        self.vs_config_dir = self.appdata / "ArknightsPassMaker" / "vapoursynth"
+        config_patch = mock.patch.dict(os.environ, {
+            "ASSETMAKER_VS_USER_CONFIG_DIR": str(self.vs_config_dir),
+        })
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
         self.runtime = load_vs_runtime(
             ROOT / "config" / "vs_runtime.json",
             self.appdata
@@ -3065,7 +3071,7 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
         )
         self.client = SyncVSWorkerProcess(
             app_dir=ROOT,
-            env={**os.environ, "APPDATA": str(self.appdata)},
+            env={**os.environ, "APPDATA": str(self.appdata), "ASSETMAKER_VS_USER_CONFIG_DIR": str(self.vs_config_dir)},
         )
         self.addCleanup(self.client.close)
 
@@ -3343,7 +3349,7 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
             ),
         )
         environment_a = snapshot_a.worker_environment(
-            {**os.environ, "APPDATA": str(self.appdata)}
+            {**os.environ, "APPDATA": str(self.appdata), "ASSETMAKER_VS_USER_CONFIG_DIR": str(self.vs_config_dir)}
         )
         client_a = SyncVSWorkerProcess(app_dir=ROOT, env=environment_a)
         self.addCleanup(client_a.close)
@@ -3365,7 +3371,7 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
 
         client_b = SyncVSWorkerProcess(
             app_dir=ROOT,
-            env=snapshot_b.worker_environment({**os.environ, "APPDATA": str(self.appdata)}),
+            env=snapshot_b.worker_environment({**os.environ, "APPDATA": str(self.appdata), "ASSETMAKER_VS_USER_CONFIG_DIR": str(self.vs_config_dir)}),
         )
         self.addCleanup(client_b.close)
         client_b.start(timeout_ms=15_000)
@@ -3393,7 +3399,7 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
             module.write_text("VALUE = 'B'\n", encoding="utf-8")
             client = SyncVSWorkerProcess(
                 app_dir=ROOT,
-                env=snapshot.worker_environment({**os.environ, "APPDATA": str(self.appdata)}),
+                env=snapshot.worker_environment({**os.environ, "APPDATA": str(self.appdata), "ASSETMAKER_VS_USER_CONFIG_DIR": str(self.vs_config_dir)}),
             )
             self.addCleanup(client.close)
             with self.assertRaises(WorkerCrashedError) as raised:
@@ -3515,7 +3521,7 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
                     env=snapshot.worker_environment(
                         {
                             **os.environ,
-                            "APPDATA": str(self.appdata),
+                            "APPDATA": str(self.appdata), "ASSETMAKER_VS_USER_CONFIG_DIR": str(self.vs_config_dir),
                             "TASK3B_APP_DIR": str(ROOT),
                             "TASK3B_TARGET_EPOCH": "3",
                             "TASK3B_WAIT_ENTERED": str(wait_entered),
@@ -3701,7 +3707,7 @@ class RealVSWorkerLifecycleTests(unittest.TestCase):
 
         ensure_app()
         appdata_patch = mock.patch.dict(
-            os.environ, {"APPDATA": str(self.appdata)}
+            os.environ, {"APPDATA": str(self.appdata), "ASSETMAKER_VS_USER_CONFIG_DIR": str(self.vs_config_dir)}
         )
         appdata_patch.start()
         self.addCleanup(appdata_patch.stop)

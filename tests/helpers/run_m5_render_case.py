@@ -107,7 +107,7 @@ def _preview_export_contract() -> dict[str, object]:
         )
         worker = SyncVSWorkerProcess(
             app_dir=ROOT,
-            env={**os.environ, "APPDATA": str(root / "appdata")},
+            env={**os.environ, "APPDATA": str(root / "appdata"), "ASSETMAKER_VS_USER_CONFIG_DIR": str(root / "session" / "appdata" / "ArknightsPassMaker" / "vapoursynth")},
         )
         try:
             worker.start(timeout_ms=15_000)

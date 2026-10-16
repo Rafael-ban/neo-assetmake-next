@@ -129,7 +129,7 @@ class DefaultPipelineCacheTests(unittest.TestCase):
             with self.subTest(backend="preview worker"):
                 worker = SyncVSWorkerProcess(
                     app_dir=ROOT,
-                    env={**os.environ, "APPDATA": str(appdata)},
+                    env={**os.environ, "APPDATA": str(appdata), "ASSETMAKER_VS_USER_CONFIG_DIR": str(override.parent)},
                 )
                 events = []
                 worker.transport.add_listener(events.append)

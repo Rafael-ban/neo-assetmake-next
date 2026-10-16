@@ -77,6 +77,7 @@ def _fixture_process_environment(layout, app_root: Path) -> dict[str, str]:
         base_environment[name] = str(app_root / "forbidden-search-path")
     environment = sanitize_runtime_process_environment(base_environment, layout)
     environment["APPDATA"] = str(private_appdata)
+    environment["ASSETMAKER_VS_USER_CONFIG_DIR"] = str(private_appdata / "ArknightsPassMaker" / "vapoursynth")
     environment["PYTHONIOENCODING"] = "utf-8"
     environment["PYTHONUTF8"] = "1"
     return environment
@@ -983,6 +984,7 @@ class NativePluginPortableIntegrationTests(unittest.TestCase):
                 expected_fingerprint=fingerprint,
             )
             env["APPDATA"] = fixture_environment["APPDATA"]
+            env["ASSETMAKER_VS_USER_CONFIG_DIR"] = fixture_environment["ASSETMAKER_VS_USER_CONFIG_DIR"]
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
             self.assertEqual(env["VAPOURSYNTH_EXTRA_PLUGIN_PATH"], "")

@@ -260,7 +260,7 @@ class WorkerVSPipeParityTests(unittest.TestCase):
 
                     worker = SyncVSWorkerProcess(
                         app_dir=ROOT,
-                        env={**os.environ, "APPDATA": str(root / "appdata")},
+                        env={**os.environ, "APPDATA": str(root / "appdata"), "ASSETMAKER_VS_USER_CONFIG_DIR": str(root / "appdata" / "ArknightsPassMaker" / "vapoursynth")},
                     )
                     self.addCleanup(worker.close)
                     worker.start(timeout_ms=15_000)

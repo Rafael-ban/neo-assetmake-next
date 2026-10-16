@@ -65,8 +65,8 @@ class ExportPackageIntegrationTests(unittest.TestCase):
             time.sleep(0.01)
         raise AssertionError("真实 ExportService 导出超时")
 
-    def test_real_service_publishes_and_replaces_sealed_video_package(self):
-        """图片 loop 首发，再用真实视频替换为 loop+intro，覆盖中文路径。"""
+    def test_real_service_publishes_sealed_video_packages_to_empty_targets(self):
+        """Publish image then video/intro packages to independent empty targets."""
         from config.epconfig import EPConfig
         from core.export_service import ExportService
         from core.vs_runtime.job import load_render_job, write_render_job
@@ -91,7 +91,7 @@ class ExportPackageIntegrationTests(unittest.TestCase):
                 completed.append(message)
                 terminal_states.append((
                     service._worker,
-                    worker.isRunning(),
+                    worker.isRunning() if worker is not None else None,
                     QThread.currentThread() == service.thread(),
                 ))
 
@@ -109,6 +109,9 @@ class ExportPackageIntegrationTests(unittest.TestCase):
                     end_frame=12,
                     epoch=generation,
                 )
+                # Each export owns an empty target; generation 2 reads the
+                # first published video without replacing its source package.
+                final_dir = root / f"package-{generation}"
                 intro_session = None
                 if generation == 2:
                     intro_job = replace(
@@ -155,9 +158,9 @@ class ExportPackageIntegrationTests(unittest.TestCase):
                 self.assertTrue(Path(session.job_path).is_file())
                 if intro_session:
                     self.assertTrue(Path(intro_session.job_path).is_file())
-                self.assertFalse(list(root.glob(".package.staging-*")))
-                self.assertFalse(list(root.glob(".package.backup-*")))
-                self.assertFalse((root / ".package.lock").exists())
+                self.assertFalse(list(root.glob(f".{final_dir.name}.staging-*")))
+                self.assertFalse(list(root.glob(f".{final_dir.name}.backup-*")))
+                self.assertFalse((root / f".{final_dir.name}.lock").exists())
                 payload = json.loads((final_dir / "epconfig.json").read_text("utf-8"))
                 self.assertEqual(payload["uuid"], f"real-package-{generation}")
                 self.assertEqual(payload["loop"]["file"], "loop.mp4")
@@ -179,12 +182,11 @@ class ExportPackageIntegrationTests(unittest.TestCase):
                             capture.release()
                         self.assertEqual(decoded_frames, 12)
 
-    def test_real_cancellation_and_script_failure_preserve_old_package(self):
-        """真实 worker 预检取消或脚本失败均不发布半包、不覆盖旧包。"""
+    def test_real_cancellation_and_script_failure_leave_empty_target(self):
+        """Cancellation and script errors leave no partial package in an empty target."""
         from config.epconfig import EPConfig
         from core.export_service import ExportService
         from core.vs_runtime.session import compute_script_bundle_hash
-        from tests.test_export_robustness import _package_bytes, _write_old_package
 
         for mode in ("cancel", "script_error"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
@@ -210,7 +212,7 @@ class ExportPackageIntegrationTests(unittest.TestCase):
                         session.selection, bundle_hash=compute_script_bundle_hash(script)
                     ))
                 final_dir = root / "package"
-                old_bytes = _write_old_package(final_dir)
+                final_dir.mkdir()
                 service = ExportService()
                 completed, failed, terminal_states, cancellations = [], [], [], []
                 worker = None
@@ -222,7 +224,7 @@ class ExportPackageIntegrationTests(unittest.TestCase):
 
                 def on_failed(message):
                     failed.append(message)
-                    terminal_states.append((service._worker, worker.isRunning()))
+                    terminal_states.append((service._worker, worker.isRunning() if worker is not None else None))
 
                 service.export_completed.connect(completed.append)
                 service.export_failed.connect(on_failed)
@@ -243,10 +245,10 @@ class ExportPackageIntegrationTests(unittest.TestCase):
                     self.assertIn("cancel", failed[0].lower())
                 else:
                     self.assertIn("injected user script failure", failed[0])
-                self.assertEqual(_package_bytes(final_dir), old_bytes)
-                self.assertFalse(list(root.glob(".package.staging-*")))
-                self.assertFalse(list(root.glob(".package.backup-*")))
-                self.assertFalse((root / ".package.lock").exists())
+                self.assertEqual(list(final_dir.iterdir()), [])
+                self.assertFalse(list(root.glob(f".{final_dir.name}.staging-*")))
+                self.assertFalse(list(root.glob(f".{final_dir.name}.backup-*")))
+                self.assertFalse((root / f".{final_dir.name}.lock").exists())
 
 
 class ExportIntegrationCleanupTests(unittest.TestCase):

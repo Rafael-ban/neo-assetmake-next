@@ -673,7 +673,7 @@ class RealRunnerRuntimeIdentityTests(unittest.TestCase):
             )
             worker = SyncVSWorkerProcess(
                 app_dir=ROOT,
-                env={**os.environ, "APPDATA": str(appdata)},
+                env={**os.environ, "APPDATA": str(appdata), "ASSETMAKER_VS_USER_CONFIG_DIR": str(appdata / "ArknightsPassMaker" / "vapoursynth")},
             )
             self.addCleanup(worker.close)
             worker.start(timeout_ms=15_000)

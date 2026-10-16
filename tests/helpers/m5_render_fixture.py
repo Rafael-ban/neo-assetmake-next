@@ -132,7 +132,7 @@ def preflight_encode_request(
     runtime = _runtime_for(fixture_root)
     worker = SyncVSWorkerProcess(
         app_dir=ROOT,
-        env={**os.environ, "APPDATA": str(fixture_root / "appdata")},
+        env={**os.environ, "APPDATA": str(fixture_root / "appdata"), "ASSETMAKER_VS_USER_CONFIG_DIR": str(fixture_root / "appdata" / "ArknightsPassMaker" / "vapoursynth")},
     )
     try:
         worker.start(timeout_ms=15_000)
