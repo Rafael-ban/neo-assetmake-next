@@ -1086,7 +1086,9 @@ class MainWindow(QMainWindow):
 
     def _init_temp_project(self):
         """创建临时项目，用户可立即开始编辑"""
-        temp_dir = tempfile.mkdtemp(prefix="neo_assetmaker_")
+        projects_dir = Path(self._app_dir) / ".assetmaker-work" / "projects"
+        projects_dir.mkdir(parents=True, exist_ok=True)
+        temp_dir = tempfile.mkdtemp(prefix="project_", dir=projects_dir)
         self._temp_dir = temp_dir
 
         self._config = EPConfig()
@@ -1106,14 +1108,21 @@ class MainWindow(QMainWindow):
         self._reset_undo_history()
 
     def _cleanup_temp_dir(self):
-        """清理临时项目目录"""
-        if self._temp_dir and os.path.exists(self._temp_dir):
+        """清理本窗口创建的临时项目；锁定目录保留到下次清理重试。"""
+        pending = getattr(self, "_pending_temp_cleanup", None)
+        if pending is None:
+            pending = self._pending_temp_cleanup = set()
+        if self._temp_dir:
+            pending.add(self._temp_dir)
+            self._temp_dir = None
+        for directory in tuple(pending):
             try:
-                shutil.rmtree(self._temp_dir)
-                logger.info(f"已清理临时目录: {self._temp_dir}")
-            except Exception as e:
-                logger.warning(f"清理临时目录失败: {e}")
-        self._temp_dir = None
+                if os.path.exists(directory):
+                    shutil.rmtree(directory)
+                pending.discard(directory)
+                logger.info(f"已清理临时目录: {directory}")
+            except OSError as exc:
+                logger.warning(f"清理临时目录失败，保留以便重试: {directory}: {exc}")
 
     def _migrate_temp_to_permanent(self, dest_dir: str) -> None:
         """Copy project files before saving; retain the temp project on failure."""
@@ -4572,8 +4581,6 @@ class MainWindow(QMainWindow):
         """关闭事件"""
         if self._check_save():
             self._save_settings()
-            self._cleanup_temp_dir()
-
             self._shutdown_runtime_resources()
 
             event.accept()
@@ -4615,6 +4622,9 @@ class MainWindow(QMainWindow):
                 self._remote_page.shutdown()
         except Exception as exc:
             logger.debug("remote page shutdown failed: %s", exc)
+
+        # Worker processes must release cache files before removing their project.
+        self._cleanup_temp_dir()
 
     def _on_maximize(self):
         """最大化/还原窗口"""

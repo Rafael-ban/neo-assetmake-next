@@ -66,3 +66,6 @@ bootenv.txt
 tools/innosetup/
 AGENTS.md
 media-tools-v1.0.7z
+
+# 本机未保存项目及其工作缓存
+.assetmaker-work/

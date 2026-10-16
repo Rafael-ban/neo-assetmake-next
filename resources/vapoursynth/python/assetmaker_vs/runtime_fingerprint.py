@@ -306,9 +306,14 @@ def compute_runtime_fingerprint(
                 )
     # Optional RIFE is loaded from the app tree only when required. Bind its
     # actual plugin and model payload to the same worker/VSPipe identity.
-    rife_dir = root / "tools" / "vs-rife" / "rife"
-    rife_dll = rife_dir / "librife_windows_x86-64.dll"
-    if rife_dll.is_file():
+    rife_directories = [("rife-dlc", root / "tools" / "vs-rife" / "rife")]
+    rife_directories.extend(
+        (f"rife-external-{index}", Path(path).resolve())
+        for index, path in enumerate(native_dirs)
+    )
+    for label, rife_dir in rife_directories:
+        if not (rife_dir / "librife_windows_x86-64.dll").is_file():
+            continue
         for relative in (
             "librife_windows_x86-64.dll",
             "models/rife-v4.6_ensembleFalse/flownet.bin",
@@ -316,7 +321,7 @@ def compute_runtime_fingerprint(
         ):
             path = rife_dir / relative
             if path.is_file():
-                _file(digest, f"rife-dlc/{relative}", path)
+                _file(digest, f"{label}/{relative}", path)
     directories.extend(
         (f"native-{index}", Path(path).resolve())
         for index, path in enumerate(native_dirs)

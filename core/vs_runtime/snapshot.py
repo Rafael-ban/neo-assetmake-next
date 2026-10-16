@@ -37,6 +37,36 @@ SNAPSHOT_ENV_KEYS = frozenset({
 })
 
 
+def resolve_runtime_config(
+    app_dir: str | os.PathLike[str],
+    *,
+    user_path: str | os.PathLike[str] | None = None,
+) -> VSRuntimeConfig:
+    """预览、预检和导出共用的有效配置；保留有效的手动插件目录。"""
+    root = Path(app_dir).resolve()
+    runtime = load_vs_runtime(
+        root / "config" / "vs_runtime.json",
+        default_vs_runtime_user_path() if user_path is None else user_path,
+    )
+    app_rife = root / "tools" / "vs-rife" / "rife" / "librife_windows_x86-64.dll"
+    # 只在应用内 DLC 可以替代时忽略不存在的旧路径。存在的手动目录
+    # 是用户明确选择，即使应用内也安装了 DLC，仍保留其加载优先级。
+    native_dirs = tuple(
+        path for path in runtime.plugins.native_plugin_dirs
+        if not (
+            tuple(part.casefold() for part in Path(path).parts[-3:])
+            == ("tools", "vs-rife", "rife")
+            and not Path(path).is_dir()
+            and app_rife.is_file()
+        )
+    )
+    if native_dirs != runtime.plugins.native_plugin_dirs:
+        runtime = replace(
+            runtime, plugins=replace(runtime.plugins, native_plugin_dirs=native_dirs)
+        )
+    return runtime
+
+
 @dataclass(frozen=True)
 class RuntimeSnapshot:
     """一次显式配置应用所使用的完整 worker runtime 身份。"""
@@ -85,27 +115,7 @@ class RuntimeSnapshot:
     ) -> "RuntimeSnapshot":
         """在显式边界读取分发配置及现有用户覆盖并计算资产身份。"""
         root = Path(app_dir).resolve()
-        runtime = load_vs_runtime(
-            root / "config" / "vs_runtime.json",
-            default_vs_runtime_user_path() if user_path is None else user_path,
-        )
-        # Previous RIFE instructions stored an absolute DLC path in user JSON.
-        # The app-local DLC now resolves on demand; drop only those legacy entries
-        # from this in-memory snapshot, leaving every other plugin override intact.
-        app_rife = root / "tools" / "vs-rife" / "rife" / "librife_windows_x86-64.dll"
-        native_dirs = tuple(
-            path for path in runtime.plugins.native_plugin_dirs
-            if not (
-                tuple(part.casefold() for part in Path(path).parts[-3:])
-                == ("tools", "vs-rife", "rife")
-                and (app_rife.is_file() or not Path(path).is_dir())
-            )
-        )
-        if native_dirs != runtime.plugins.native_plugin_dirs:
-            runtime = replace(
-                runtime,
-                plugins=replace(runtime.plugins, native_plugin_dirs=native_dirs),
-            )
+        runtime = resolve_runtime_config(root, user_path=user_path)
         return cls(
             app_dir=str(root),
             runtime=runtime,
@@ -138,4 +148,4 @@ class RuntimeSnapshot:
         return env
 
 
-__all__ = ["RuntimeSnapshot"]
+__all__ = ["RuntimeSnapshot", "resolve_runtime_config"]

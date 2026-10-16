@@ -51,9 +51,11 @@ DLL导入包含VCOMP140.DLL和MSVC v14运行库；基础R79包不包含VCOMP140.
 
 安装版和便携版用户请直接阅读 [RIFE DLC 中文安装说明](../rife-dlc-guide.md)。
 完整 DLC 包含 DLL、模型、许可、独立脚本和清单。当前源码在选用 RIFE 脚本时自动加载
-应用根下的 `tools/vs-rife/rife`，模型使用同目录的 `models/rife-v4.6_ensembleFalse`。
+应用根下的 `tools/vs-rife/rife`。默认模型取实际加载的 `core.rife.plugin_path` DLL
+同目录的 `models/rife-v4.6_ensembleFalse`，手动外置插件目录优先时模型也随 DLL 定位。
 标准安装不再要求配置 `plugins.native_plugin_dirs` 或修改 `RIFE_MODEL_PATH`。
-已发布的 v2.2.1 旧 EXE 仍使用旧加载逻辑，需要重新构建或升级主程序。
+`v2.2.1` 标签曾重复发布，需以构建 commit 判断。已发布 run `38861133446`（`3fcff63`）
+仍有运行配置与模型路径缺陷；当前修复尚未发布，需重建并部署配套 EXE 与 DLC。
 
 以下命令区分三个路径，不能混用：
 
@@ -70,7 +72,7 @@ DLL导入包含VCOMP140.DLL和MSVC v14运行库；基础R79包不包含VCOMP140.
 **从源码运行时安装或修复：**
 
 ```powershell
-$sourceRoot = 'D:\Project_Folder\neo-assetmaker-dev'
+$sourceRoot = 'D:\Project_Folder\neo-assetmake-next'
 Set-Location -LiteralPath $sourceRoot
 uv run python plugin_distribution.py sync --app-dir "$sourceRoot" --manifest "$sourceRoot\resources\packaging\vs-rife.json"
 uv run python plugin_distribution.py verify --app-dir "$sourceRoot" --manifest "$sourceRoot\resources\packaging\vs-rife.json"
@@ -119,8 +121,10 @@ uv run python plugin_distribution.py clean --app-dir "$sourceRoot" --manifest "$
 帧数按 floor(源帧数 × 60 / 源帧率) 取整，尾部误差小于一个 60 fps 帧。
 旧项目仅保存 trim 帧编号，切换脚本后不会自动换算时间，必须重新核对入出点。
 
-模型定位基于 RenderSession 的实际应用根，与 `.vpy` 复制到哪个项目无关。
-只有主动把模型放到其他位置的自定义脚本才需要修改 `RIFE_MODEL_PATH`。
+预览、导出与导出预检解析同一份有效 runtime 配置；导出预检传递完整 snapshot 环境。
+有效手动 `native_plugin_dirs` 保持优先；不存在的 旧版 `tools/vs-rife/rife` 仅在本地 DLC
+可用时忽略，其他手动配置不自动覆盖。默认模型随实际加载的 DLL 定位，与 `.vpy` 位置无关。
+模型单独存放时，可在实际选用的 `.vpy` 中将 `RIFE_MODEL_PATH` 改为绝对模型目录。
 脚本头声明 `rife.RIFE`，因此即使素材会跳过插帧、或 `RIFE_ENABLED=False`，也仍要求插件可用；
 不使用 RIFE 时应选择内置脚本。GPU、模型或插件失败会报告错误，不会静默当作插帧成功。
 
@@ -187,7 +191,7 @@ uv run python plugin_distribution.py clean --app-dir .
 
 ## 补帧结果磁盘缓存与资源回收
 
-当前源码在项目 `.assetmaker-vs/rife-cache/` 保存未压缩的 RGBS float32 帧和颜色属性，
+已保存项目在项目 `.assetmaker-vs/rife-cache/` 保存未压缩的 RGBS float32 帧和颜色属性，
 避免每次命中都执行 gzip 解压。浮点位模式和帧属性保持不变；旧 `.rgb.gz` 帧在命中时
 逐帧原子转换为 `.rgb`，成功后移除旧文件，转换失败时保留原缓存。
 未压缩文件更大，同样预算下可保留的帧数减少；具体比例取决于素材。
@@ -207,6 +211,8 @@ VS 自动帧缓存；工作图仍需要运行内存和显存，不承诺播放�
 通过“操作 → 清除补帧缓存”暂停预览并清理当前项目缓存。清理失败会显示错误；
 完成的帧可复用，未完成写入使用临时文件，重试不会把半帧当作有效结果。
 普通预览 session 的 `.lwi` 索引不是补帧缓存，不要混淆。
+未保存项目使用 `<EXE 或源码根>/.assetmaker-work/projects/project_<unique>/`，
+程序根需要可写。Roaming 中的小型 `vs_runtime.user.json` 用户配置仍保留。
 
 测试入口：`tests.test_rife_disk_cache`、`tests.test_preview_worker_lifecycle`、
-`tests.test_export_preview_pause`。原 v2.2.1 EXE 不具备这些源码改动，需重新构建主程序。
+`tests.test_export_preview_pause`。发布产物是否包含这些改动，应以构建 commit 判断；更新主程序逻辑需重新构建 EXE。

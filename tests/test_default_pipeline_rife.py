@@ -76,7 +76,7 @@ class RifeTemplateTests(unittest.TestCase):
             for node in ast.walk(tree)
         ), "Native plugins must be loaded by the runtime override policy")
 
-    def test_copied_script_uses_supplied_runtime_root_for_models(self):
+    def test_copied_script_models_follow_loaded_dll_not_frozen_lib_or_environment(self):
         tree = ast.parse(PIPELINE.read_text(encoding="utf-8"))
         setting = next(
             node for node in tree.body
@@ -84,30 +84,20 @@ class RifeTemplateTests(unittest.TestCase):
             and node.targets[0].id == "RIFE_MODEL_PATH"
         )
         with TemporaryDirectory() as directory:
-            for name in ("flownet.bin", "flownet.param"):
-                (Path(directory) / name).write_bytes(b"test")
-            runtime_root = Path(directory) / "runtime"
-            helper_root = Path(directory) / "fallback-runtime"
-            helper = helper_root / "resources/vapoursynth/python/assetmaker_vs/job_api.py"
-            for script in (
-                runtime_root / "resources/vapoursynth/rife_pipeline.vpy",
-                Path(directory) / "project/vs/rife_pipeline.vpy",
-                Path(directory) / "external/custom.vpy",
-            ):
-                for environment, expected_root in (
-                    ({"ASSETMAKER_VS_APP_DIR": str(runtime_root)}, runtime_root),
-                    ({}, helper_root),
-                ):
-                    with self.subTest(script=script, environment=environment):
-                        namespace = {
-                            "Path": Path, "os": SimpleNamespace(environ=environment),
-                            "__file__": str(script), "job_api": SimpleNamespace(__file__=str(helper)),
-                        }
-                        exec(compile(ast.Module(body=[setting], type_ignores=[]), str(script), "exec"), namespace)
-                        self.assertEqual(
-                            namespace["RIFE_MODEL_PATH"],
-                            expected_root.resolve() / "tools/vs-rife/rife/models/rife-v4.6_ensembleFalse",
-                        )
+            root = Path(directory).resolve()
+            for plugin_root in (root / "app/tools/vs-rife/rife", root / "external DLC/rife"):
+                for script in (root / "app/resources/rife.vpy", root / "project/custom.vpy"):
+                    namespace = {
+                        "Path": Path,
+                        "core": SimpleNamespace(rife=SimpleNamespace(
+                            plugin_path=str(plugin_root / "librife_windows_x86-64.dll"))),
+                        "os": SimpleNamespace(environ={"ASSETMAKER_VS_APP_DIR": str(root / "wrong")}),
+                        "job_api": SimpleNamespace(__file__=str(root / "app/lib/resources/vapoursynth/python/assetmaker_vs/job_api.pyc")),
+                        "__file__": str(script),
+                    }
+                    exec(compile(ast.Module(body=[setting], type_ignores=[]), str(script), "exec"), namespace)
+                    self.assertEqual(namespace["RIFE_MODEL_PATH"],
+                                     plugin_root / "models/rife-v4.6_ensembleFalse")
 
     def test_common_editor_colour_and_output_stages_match_default(self):
         default = ast.parse((PIPELINE.parent / "default_pipeline.vpy").read_text(encoding="utf-8"))

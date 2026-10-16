@@ -12,14 +12,12 @@ output 1 是旋转后、trim/crop 前的完整编辑画布；output 0 严格按 
 脚本有意保持自包含和可读，便于用户复制到项目或外部目录后定制。
 """
 
-import os
 import hashlib
 from pathlib import Path
 from fractions import Fraction
 
 import vapoursynth as vs
 
-from assetmaker_vs import job_api
 from assetmaker_vs.job_api import load_job
 from assetmaker_vs.rife_cache import cached_rife
 
@@ -38,14 +36,12 @@ FINAL_RESIZE_OPTIONS = {}  # 尺寸缩放保留源格式和位深
 # 旧项目仅保存 trim 帧编号，修改此开关后须重新检查入出点。
 RIFE_ENABLED = True
 RIFE_TARGET_FPS = 60  # 只为低于此帧率的视频插帧；更高帧率保持原样
-# runtime 快照提供实际应用根目录，与当前 .vpy 所在目录无关。
-# 直接 worker 启动未提供快照环境时，从实际导入的便携 job_api 定位资源树。
-# 模型另存于外部目录时，可将 RIFE_MODEL_PATH 改为该目录的绝对 Path。
+# 默认模型随实际加载的 RIFE DLL 定位，预览/导出和手动插件目录保持一致。
+# 模型单独存放时，将整个 RIFE_MODEL_PATH 表达式替换为绝对 Path。
 RIFE_MODEL_PATH = (
-    Path(os.environ["ASSETMAKER_VS_APP_DIR"]).resolve()
-    if os.environ.get("ASSETMAKER_VS_APP_DIR")
-    else Path(job_api.__file__).resolve().parents[4]
-) / "tools" / "vs-rife" / "rife" / "models" / "rife-v4.6_ensembleFalse"
+    Path(core.rife.plugin_path).resolve().parent
+    / "models" / "rife-v4.6_ensembleFalse"
+)
 
 core.max_cache_size = VS_CACHE_SIZE_MB
 job = load_job(assetmaker_job, for_export=False)

@@ -49,6 +49,75 @@ def _session(root: Path, *, bundle_hash: str | None = None, runtime: str = "b" *
 
 
 class ExportSessionTests(unittest.TestCase):
+    def setUp(self):
+        # These tests exercise the orchestration using an isolated portable layout.
+        from tests.test_vs_runtime_layout import _build_r79_fixture
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.app_root = Path(temporary.name).resolve()
+        _build_r79_fixture(self.app_root)
+        self.override = self.app_root / "user.json"
+        for patcher in (
+            mock.patch("core.export_service.get_app_dir", return_value=str(self.app_root)),
+            mock.patch("core.vs_runtime.snapshot.default_vs_runtime_user_path", return_value=self.override),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_preview_preflight_and_encoder_share_effective_runtime_and_environment(self):
+        from core.export_service import ExportWorker
+        from core.media_pipeline import build_vspipe_render_env
+        from core.vs_runtime.snapshot import RuntimeSnapshot
+        from resources.vapoursynth.python.assetmaker_vs.runtime_fingerprint import verify_runtime_from_env
+        from resources.vapoursynth.python.assetmaker_vs.runtime_layout import resolve_runtime_layout
+
+        local = self.app_root / "tools/vs-rife/rife/librife_windows_x86-64.dll"
+        local.parent.mkdir(parents=True)
+        local.write_bytes(b"plugin")
+        missing = str(self.app_root / "old/tools/vs-rife/rife")
+        self.override.write_text(json.dumps({"plugins": {"native_plugin_dirs": [missing]}}), encoding="utf-8")
+        snapshot = RuntimeSnapshot.resolve(self.app_root)
+        session = _session(self.app_root, runtime=snapshot.fingerprint)
+        worker = ExportWorker()
+        metadata = mock.Mock(epoch=session.epoch, mode=session.selection.mode)
+        with mock.patch("core.export_service.SyncVSWorkerProcess") as process_type:
+            process_type.return_value.load.return_value = metadata
+            self.assertIs(worker._preflight_render_session(session), metadata)
+        environment = process_type.call_args.kwargs["env"]
+        self.assertEqual(environment["ASSETMAKER_VS_APP_DIR"], str(self.app_root))
+        self.assertEqual(verify_runtime_from_env(environment).fingerprint, snapshot.fingerprint)
+        self.assertEqual(json.loads(environment["ASSETMAKER_VS_RUNTIME_CONFIG_JSON"])["plugins"]["native_plugin_dirs"], [])
+        runtime = worker._assert_export_identity(session, "VSPipe 前")
+        encoder_env = build_vspipe_render_env(
+            str(resolve_runtime_layout(self.app_root).vspipe_executable),
+            app_dir=str(self.app_root), runtime=runtime, expected_fingerprint=session.runtime_fingerprint,
+        )
+        for key in ("ASSETMAKER_VS_APP_DIR", "ASSETMAKER_VS_RUNTIME_CONFIG_JSON", "ASSETMAKER_VS_RUNTIME_FINGERPRINT"):
+            self.assertEqual(environment[key], encoder_env[key])
+        process_type.return_value.load.assert_called_once_with(session, for_export=True)
+        process_type.return_value.close.assert_called_once()
+
+    def test_metadata_fallback_uses_the_same_runtime_snapshot(self):
+        from types import SimpleNamespace
+        from core.video_processor import probe_video_info
+        from core.vs_runtime.snapshot import RuntimeSnapshot
+        script = self.app_root / "resources/vapoursynth/default_pipeline.vpy"
+        shutil.copyfile(ROOT / "resources/vapoursynth/default_pipeline.vpy", script)
+        source = self.app_root / "source.mp4"
+        source.write_bytes(b"mocked decoder")
+        snapshot = RuntimeSnapshot.resolve(self.app_root)
+        node = SimpleNamespace(width=360, height=640, fps_num=30, fps_den=1, num_frames=3)
+        with mock.patch("core.video_processor.get_app_dir", return_value=str(self.app_root)), mock.patch(
+            "core.video_processor.SyncVSWorkerProcess"
+        ) as process_type:
+            process_type.return_value.load.return_value = SimpleNamespace(mode="compatible", editor=node)
+            info = probe_video_info(str(source))
+        self.assertEqual(info.total_frames, 3)
+        environment = process_type.call_args.kwargs["env"]
+        self.assertEqual(environment["ASSETMAKER_VS_RUNTIME_FINGERPRINT"], snapshot.fingerprint)
+        self.assertEqual(environment["ASSETMAKER_VS_APP_DIR"], str(self.app_root))
+        process_type.return_value.close.assert_called_once()
+
     def test_video_export_task_requires_immutable_render_session(self):
         from core.export_service import ExportTask, ExportType, VideoExportParams
 

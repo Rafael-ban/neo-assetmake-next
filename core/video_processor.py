@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from config.vs_runtime import load_vs_runtime
 from core.vs_runtime.job import (
     CropSpec,
     OutputSpec,
@@ -26,7 +25,7 @@ from core.vs_runtime.session import (
     compute_job_sha256,
     compute_script_bundle_hash,
 )
-from core.vs_runtime.vs_loader import compute_runtime_fingerprint
+from core.vs_runtime.snapshot import RuntimeSnapshot
 from core.vs_runtime.worker_process import SyncVSWorkerProcess
 from utils.file_utils import get_app_dir
 
@@ -104,8 +103,9 @@ def probe_video_info(input_path: str) -> VideoInfo:
     selection = ScriptSelection.from_header(
         script, header, compute_script_bundle_hash(script)
     )
-    runtime = load_vs_runtime()
-    fingerprint = compute_runtime_fingerprint(app_dir, runtime)
+    snapshot = RuntimeSnapshot.resolve(app_dir)
+    runtime = snapshot.runtime
+    fingerprint = snapshot.fingerprint
     with tempfile.TemporaryDirectory(prefix="assetmaker-vs-probe-") as temp:
         cache = Path(temp).resolve()
         job = RenderJob(
@@ -139,7 +139,7 @@ def probe_video_info(input_path: str) -> VideoInfo:
             job_sha256=compute_job_sha256(job_path),
             runtime_fingerprint=fingerprint,
         )
-        worker = SyncVSWorkerProcess(app_dir=app_dir)
+        worker = SyncVSWorkerProcess(app_dir=app_dir, env=snapshot.worker_environment())
         try:
             worker.start(timeout_ms=runtime.worker.startup_timeout_ms)
             metadata = worker.load(

@@ -114,11 +114,12 @@ tools\media\runtime\Lib\site-packages\vapoursynth\vspipe.exe --version
 `verify` 校验、`sync` 修复不完整安装、`clean` 清除该扩展根目录。
 
 RIFE 是可选的 60 fps 插帧 DLC。**完整解压到当前程序目录后，选择 RIFE 脚本即可**；
-当前源码会自动识别随包 DLL 和模型，不再要求编辑 JSON。已发布的 v2.2.1 旧 EXE 需升级才能使用此流程；
+当前源码会自动识别随包 DLL，默认模型跟随实际加载的 DLL，无需编辑 JSON。
 默认“内置脚本”无需 RIFE。安装版、便携版用户请按
 [中文安装与使用说明](docs/rife-dlc-guide.md) 操作，其中有目录示意、界面步骤、报错处理和恢复内置脚本的方法；
-原 v2.2.1 用户使用[旧版专用说明](docs/rife-dlc-v2.2.1.md)。
-DLC 压缩包分别携带 `RIFE-DLC-README.txt` 和 `RIFE-DLC-v2.2.1.txt`，与这两份文档保持一致。
+手动外置插件或模型配置见[手动配置与构建识别](docs/rife-dlc-v2.2.1.md)。
+`v2.2.1` 标签曾重复发布，请按构建 commit 核对；已发布 `3fcff63` 的路径问题修复尚未发布，需重建配套 EXE 与 DLC。
+重新制作 DLC 时，打包工具将这两份文档分别收录为 `RIFE-DLC-README.txt` 和 `RIFE-DLC-v2.2.1.txt`。
 
 源码运行和编译后的 EXE 使用各自的依赖目录。基础构建不会收集源码中的可选插件，
 给编译目录补装也不会更新源码目录或已有便携 ZIP。

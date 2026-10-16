@@ -39,7 +39,7 @@ from core.vs_runtime.session import (
 )
 from core.vs_runtime.vs_loader import compute_runtime_fingerprint
 from core.vs_runtime.worker_process import SyncVSWorkerProcess
-from config.vs_runtime import load_vs_runtime
+from core.vs_runtime.snapshot import RuntimeSnapshot, resolve_runtime_config
 from utils.file_utils import get_app_dir
 
 logger = logging.getLogger(__name__)
@@ -524,12 +524,12 @@ class ExportWorker(QThread):
     @staticmethod
     def _runtime_fingerprint_for_export(app_dir: str, runtime=None) -> str:
         return compute_runtime_fingerprint(
-            app_dir, load_vs_runtime() if runtime is None else runtime
+            app_dir, resolve_runtime_config(app_dir) if runtime is None else runtime
         )
 
     @staticmethod
     def _runtime_for_export():
-        return load_vs_runtime()
+        return resolve_runtime_config(get_app_dir())
 
     def _assert_export_identity(self, session: RenderSession, stage: str):
         """验证 script/job/runtime 仍等于 UI 已冻结 session 的身份。"""
@@ -563,9 +563,11 @@ class ExportWorker(QThread):
     def _preflight_render_session(self, session: RenderSession):
         """在短生命周期 worker 中验证与导出完全相同的 frozen session。"""
         app_dir = str(Path(get_app_dir()).resolve())
-        self._assert_export_identity(session, "预检前")
-
-        process = SyncVSWorkerProcess(app_dir=app_dir)
+        runtime = self._assert_export_identity(session, "预检前")
+        snapshot = RuntimeSnapshot(app_dir, runtime, session.runtime_fingerprint)
+        process = SyncVSWorkerProcess(
+            app_dir=app_dir, env=snapshot.worker_environment()
+        )
         try:
             process.start()
             metadata = process.load(session, for_export=True)

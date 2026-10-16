@@ -82,8 +82,38 @@ class RifeAutoDiscoveryTests(unittest.TestCase):
             plugin.write_bytes(b"plugin-v2")
             self.assertNotEqual(compute_runtime_fingerprint(root, runtime), changed_model)
 
+    def test_existing_manual_dlc_directory_wins_and_models_are_fingerprinted(self):
+        from core.vs_runtime.vs_loader import compute_runtime_fingerprint
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            _build_r79_fixture(root)
+            local = root / "tools/vs-rife/rife"
+            external = root / "manual/tools/vs-rife/rife"
+            for directory in (local, external):
+                directory.mkdir(parents=True)
+                (directory / "librife_windows_x86-64.dll").write_bytes(b"plugin")
+            models = external / "models/rife-v4.6_ensembleFalse"
+            models.mkdir(parents=True)
+            (models / "flownet.bin").write_bytes(b"model-v1")
+            (models / "flownet.param").write_bytes(b"params")
+            runtime = VSRuntimeConfig(plugins=PluginConfig(native_plugin_dirs=(str(external),)))
+            with mock.patch("core.vs_runtime.snapshot.load_vs_runtime", return_value=runtime):
+                snapshot = RuntimeSnapshot.resolve(root)
+            self.assertEqual(snapshot.runtime.plugins.native_plugin_dirs, (str(external),))
+            core = _Core({external: (_Plugin("rife", str(external / "librife_windows_x86-64.dll"), ("RIFE",)),)})
+            state = configure_native_plugins(core, snapshot.runtime.plugins.native_plugin_dirs)
+            updated, handle = activate_rife_plugin(core, state, root, ("rife.RIFE",))
+            self.assertIs(updated, state)
+            self.assertIsNone(handle)
+            self.assertEqual(core.loaded_paths, [external])
+            (models / "flownet.bin").write_bytes(b"model-v2")
+            self.assertNotEqual(snapshot.fingerprint, compute_runtime_fingerprint(root, runtime))
+
     def test_snapshot_drops_only_legacy_rife_override(self):
         with tempfile.TemporaryDirectory() as temporary:
+            plugin = Path(temporary) / "tools/vs-rife/rife/librife_windows_x86-64.dll"
+            plugin.parent.mkdir(parents=True)
+            plugin.write_bytes(b"local-plugin")
             runtime = VSRuntimeConfig(plugins=PluginConfig(
                 native_plugin_dirs=(
                     r"C:\old\tools\vs-rife\rife",
