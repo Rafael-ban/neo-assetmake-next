@@ -36,6 +36,7 @@ class _Preview:
 class SaveAsPreviewMigrationTests(unittest.TestCase):
     def _window(self, source_root, source_media, *, temporary):
         window = MainWindow.__new__(MainWindow)
+        window._pending_temp_cleanup = set()
         window._config = EPConfig()
         window._config.loop.file = source_media.name
         window._config.editor.loop.out_frame = 48
