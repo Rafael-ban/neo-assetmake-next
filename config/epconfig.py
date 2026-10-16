@@ -8,6 +8,7 @@ import uuid as uuid_lib
 import json
 import os
 
+from config.constants import EPCONFIG_VERSION
 from core.file_utils import atomic_write_json
 
 CONFIG_FILENAME = "epconfig.json"
@@ -398,7 +399,7 @@ class EditorState:
 @dataclass
 class EPConfig:
     """epconfig.json 完整数据模型"""
-    version: int = 1
+    version: int = EPCONFIG_VERSION
     uuid: str = field(default_factory=lambda: str(uuid_lib.uuid4()))
     name: str = ""
     description: str = ""
@@ -418,6 +419,13 @@ class EPConfig:
             normalize_paths: 为 True 时将文件路径替换为标准化的导出文件名
                            （如 loop.mp4, icon.png, overlay.png 等）
         """
+        if normalize_paths and (
+            type(self.version) is not int or self.version > EPCONFIG_VERSION
+        ):
+            raise ValueError(
+                f"素材配置版本必须为不大于 {EPCONFIG_VERSION} 的整数，"
+                f"当前为: {self.version!r}"
+            )
         result = {
             "version": self.version,
             "uuid": self.uuid,
@@ -495,7 +503,7 @@ class EPConfig:
         screen = ScreenType.from_string(data.get("screen", "360x640"))
 
         config = cls(
-            version=data.get("version", 1),
+            version=data.get("version", EPCONFIG_VERSION),
             uuid=data.get("uuid", str(uuid_lib.uuid4())),
             name=data.get("name", ""),
             description=data.get("description", ""),

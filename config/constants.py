@@ -10,6 +10,9 @@ APP_NAME = "明日方舟通行证素材工具箱"
 APP_VERSION = "2.2.1"
 APP_VERSION_LABEL = f"{APP_VERSION}（开发预览版）"
 
+# 设备素材配置默认版本及兼容上界，对齐 drm_app_neo 的 PRTS_ASSET_VERSION_NUMBER。
+EPCONFIG_VERSION = 2
+
 # ===== 基础尺寸配置 =====
 SCREEN_WIDTH = 360
 SCREEN_HEIGHT = 640

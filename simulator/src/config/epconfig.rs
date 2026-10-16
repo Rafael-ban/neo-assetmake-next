@@ -323,7 +323,7 @@ pub struct EPConfig {
 }
 
 fn default_version() -> i32 {
-    1
+    2
 }
 
 fn default_uuid() -> String {
@@ -412,8 +412,23 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = EPConfig::default();
-        assert_eq!(config.version, 1);
+        assert_eq!(config.version, 2);
         assert_eq!(config.screen, ScreenType::S360x640);
+    }
+
+    #[test]
+    fn test_config_version_compatibility() {
+        assert_eq!(EPConfig::default().version, 2);
+        let fixture = include_str!("../../../tests/fixtures/epconfig/minimal.json");
+        let mut value: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        for version in [1, 2] {
+            value["version"] = serde_json::json!(version);
+            let config: EPConfig = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(config.version, version);
+        }
+        value.as_object_mut().unwrap().remove("version");
+        let config: EPConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(config.version, 2);
     }
 
     #[test]
@@ -426,10 +441,14 @@ mod tests {
 
     #[test]
     fn test_new_screen_profiles_parse() {
-        assert_eq!(serde_json::from_str::<ScreenType>("\"720x1280\"").unwrap(),
-                   ScreenType::S720x1280);
-        assert_eq!(serde_json::from_str::<ScreenType>("\"800x1280\"").unwrap(),
-                   ScreenType::S800x1280);
+        assert_eq!(
+            serde_json::from_str::<ScreenType>("\"720x1280\"").unwrap(),
+            ScreenType::S720x1280
+        );
+        assert_eq!(
+            serde_json::from_str::<ScreenType>("\"800x1280\"").unwrap(),
+            ScreenType::S800x1280
+        );
         assert!(serde_json::from_str::<ScreenType>("\"720x1080\"").is_err());
     }
 
